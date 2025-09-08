@@ -17,8 +17,12 @@
 #define CEPH_CAPABILITY_H
 
 #include "include/buffer_fwd.h"
+#include "include/ceph_fs.h" // for CEPH_CAP_*
 #include "include/counter.h"
 #include "include/mempool.h"
+#include "include/object.h" // for snapid_t
+#include "include/types.h" // for version_t
+#include "include/utime.h"
 #include "include/xlist.h"
 #include "include/elist.h"
 
@@ -80,7 +84,7 @@ public:
     void encode(ceph::buffer::list &bl) const;
     void decode(ceph::buffer::list::const_iterator &p);
     void dump(ceph::Formatter *f) const;
-    static void generate_test_instances(std::list<Export*>& ls);
+    static std::list<Export> generate_test_instances();
 
     int64_t cap_id = 0;
     int32_t wanted = 0;
@@ -98,7 +102,7 @@ public:
     void encode(ceph::buffer::list &bl) const;
     void decode(ceph::buffer::list::const_iterator &p);
     void dump(ceph::Formatter *f) const;
-    static void generate_test_instances(std::list<Import*>& ls);
+    static std::list<Import> generate_test_instances();
 
     int64_t cap_id = 0;
     ceph_seq_t issue_seq = 0;
@@ -110,7 +114,7 @@ public:
     void encode(ceph::buffer::list& bl) const;
     void decode(ceph::buffer::list::const_iterator& bl);
     void dump(ceph::Formatter *f) const;
-    static void generate_test_instances(std::list<revoke_info*>& ls);
+    static std::list<revoke_info> generate_test_instances();
 
     __u32 before = 0;
     ceph_seq_t seq = 0;
@@ -324,7 +328,7 @@ public:
   void encode(ceph::buffer::list &bl) const;
   void decode(ceph::buffer::list::const_iterator &bl);
   void dump(ceph::Formatter *f) const;
-  static void generate_test_instances(std::list<Capability*>& ls);
+  static std::list<Capability> generate_test_instances();
 
   snapid_t client_follows = 0;
   version_t client_xattr_version = 0;

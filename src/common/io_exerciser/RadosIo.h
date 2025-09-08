@@ -1,6 +1,11 @@
 #pragma once
 
 #include "ObjectModel.h"
+#include "erasure-code/consistency/ConsistencyChecker.h"
+#include "librados/AioCompletionImpl.h"
+#include "common/ceph_mutex.h"
+
+namespace boost::asio { class io_context; }
 
 /* Overview
  *
@@ -25,6 +30,7 @@ class RadosIo : public Model {
   boost::asio::io_context& asio;
   std::unique_ptr<ObjectModel> om;
   std::unique_ptr<ceph::io_exerciser::data_generation::DataGenerator> db;
+  std::unique_ptr<ceph::consistency::ConsistencyChecker> cc;
   std::string pool;
   std::optional<std::vector<int>> cached_shard_order;
   int threads;
@@ -42,7 +48,8 @@ class RadosIo : public Model {
           const std::string& pool, const std::string& oid,
           const std::optional<std::vector<int>>& cached_shard_order,
           uint64_t block_size, int seed, int threads, ceph::mutex& lock,
-          ceph::condition_variable& cond, bool ec_optimizations);
+          ceph::condition_variable& cond, bool is_replicated_pool,
+          bool ec_optimizations);
 
   ~RadosIo();
 

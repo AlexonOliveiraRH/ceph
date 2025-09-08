@@ -25,6 +25,7 @@
 #include "common/cmdparse.h"
 #include "log/Log.h"
 
+#include "messages/MClientRequest.h"
 #include "messages/MClientRequestForward.h"
 #include "messages/MMDSLoadTargets.h"
 #include "messages/MMDSMap.h"
@@ -2551,7 +2552,7 @@ void MDSRankDispatcher::handle_mds_map(
   }
 
   {
-    map<epoch_t,MDSContext::vec >::iterator p = waiting_for_mdsmap.begin();
+    std::map<epoch_t,MDSContext::vec >::iterator p = waiting_for_mdsmap.begin();
     while (p != waiting_for_mdsmap.end() && p->first <= mdsmap->get_epoch()) {
       MDSContext::vec ls;
       ls.swap(p->second);
@@ -4070,6 +4071,7 @@ std::vector<std::string> MDSRankDispatcher::get_tracked_keys()
     "fsid",
     "host",
     "mds_allow_async_dirops",
+    "mds_allow_batched_ops",
     "mds_alternate_name_max",
     "mds_bal_export_pin",
     "mds_bal_fragment_dirs",
@@ -4145,7 +4147,8 @@ std::vector<std::string> MDSRankDispatcher::get_tracked_keys()
     "mds_session_cap_acquisition_throttle",
     "mds_session_max_caps_throttle_ratio",
     "mds_session_metadata_threshold",
-    "mds_symlink_recovery"
+    "mds_symlink_recovery",
+    "mds_use_global_snaprealm_seq_for_subvol"
   });
   static_assert(std::is_sorted(as_sv.begin(), as_sv.end()),
                 "keys are not sorted!");

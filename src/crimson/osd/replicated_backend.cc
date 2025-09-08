@@ -15,6 +15,8 @@
 
 SET_SUBSYS(osd);
 
+namespace crimson::osd {
+
 ReplicatedBackend::ReplicatedBackend(pg_t pgid,
                                      pg_shard_t whoami,
 				     crimson::osd::PG& pg,
@@ -253,7 +255,7 @@ void ReplicatedBackend::got_rep_op_reply(const MOSDRepOpReply& reply)
 seastar::future<> ReplicatedBackend::stop()
 {
   LOG_PREFIX(ReplicatedBackend::stop);
-  INFODPP("cid {}", coll->get_cid());
+  INFODPP("cid {}", dpp, coll->get_cid());
   for (auto& [tid, pending_on] : pending_trans) {
     pending_on.all_committed.set_exception(
 	crimson::common::system_shutdown_exception());
@@ -354,4 +356,6 @@ void ReplicatedBackend::do_pct(const MOSDPGPCT &m)
   LOG_PREFIX(ReplicatedBackend::do_pct);
   DEBUGDPP("{}", dpp, m);
   pg.peering_state.update_pct(m.pg_committed_to);
+}
+
 }

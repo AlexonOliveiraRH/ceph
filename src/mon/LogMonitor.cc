@@ -53,6 +53,7 @@
 #include "messages/MMonCommand.h"
 #include "messages/MLog.h"
 #include "messages/MLogAck.h"
+#include "msg/Messenger.h"
 #include "common/Graylog.h"
 #include "common/Journald.h"
 #include "common/errno.h"
@@ -465,7 +466,7 @@ void LogMonitor::log_external_backlog()
     } else {
       // pre-quincy, we assumed that anything through summary.version was
       // logged externally.
-      assert(r == -ENOENT);
+      ceph_assert(r == -ENOENT);
       external_log_to = summary.version;
       dout(10) << __func__ << " initialized external_log_to = " << external_log_to
 	       << " (summary v " << summary.version << ")" << dendl;

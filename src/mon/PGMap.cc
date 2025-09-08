@@ -57,7 +57,7 @@ void PGMapDigest::encode(bufferlist& bl, uint64_t features) const
 {
   // NOTE: see PGMap::encode_digest
   uint8_t v = 5;
-  assert(HAVE_FEATURE(features, SERVER_NAUTILUS));
+  ceph_assert(HAVE_FEATURE(features, SERVER_NAUTILUS));
   ENCODE_START(v, 1, bl);
   encode(num_pg, bl);
   encode(num_pg_active, bl);
@@ -84,7 +84,7 @@ void PGMapDigest::encode(bufferlist& bl, uint64_t features) const
 void PGMapDigest::decode(bufferlist::const_iterator& p)
 {
   DECODE_START(5, p);
-  assert(struct_v >= 4);
+  ceph_assert(struct_v >= 4);
   decode(num_pg, p);
   decode(num_pg_active, p);
   decode(num_pg_unknown, p);
@@ -194,9 +194,11 @@ void PGMapDigest::dump(ceph::Formatter *f) const
   f->close_section();
 }
 
-void PGMapDigest::generate_test_instances(list<PGMapDigest*>& ls)
+list<PGMapDigest> PGMapDigest::generate_test_instances()
 {
-  ls.push_back(new PGMapDigest);
+  list<PGMapDigest> ls;
+  ls.push_back(PGMapDigest{});
+  return ls;
 }
 
 inline std::string percentify(const float& a) {
@@ -1113,25 +1115,27 @@ void PGMap::Incremental::dump(ceph::Formatter *f) const
   f->close_section();
 }
 
-void PGMap::Incremental::generate_test_instances(list<PGMap::Incremental*>& o)
+list<PGMap::Incremental> PGMap::Incremental::generate_test_instances()
 {
-  o.push_back(new Incremental);
-  o.push_back(new Incremental);
-  o.back()->version = 1;
-  o.back()->stamp = utime_t(123,345);
-  o.push_back(new Incremental);
-  o.back()->version = 2;
-  o.back()->pg_stat_updates[pg_t(1,2)] = pg_stat_t();
-  o.back()->osd_stat_updates[5] = osd_stat_t();
-  o.push_back(new Incremental);
-  o.back()->version = 3;
-  o.back()->osdmap_epoch = 1;
-  o.back()->pg_scan = 2;
-  o.back()->pg_stat_updates[pg_t(4,5)] = pg_stat_t();
-  o.back()->osd_stat_updates[6] = osd_stat_t();
-  o.back()->pg_remove.insert(pg_t(1,2));
-  o.back()->osd_stat_rm.insert(5);
-  o.back()->pool_statfs_updates[std::make_pair(1234,4)] = store_statfs_t();
+  list<PGMap::Incremental> o;
+  o.push_back(Incremental{});
+  o.push_back(Incremental{});
+  o.back().version = 1;
+  o.back().stamp = utime_t(123,345);
+  o.push_back(Incremental{});
+  o.back().version = 2;
+  o.back().pg_stat_updates[pg_t(1,2)] = pg_stat_t();
+  o.back().osd_stat_updates[5] = osd_stat_t();
+  o.push_back(Incremental{});
+  o.back().version = 3;
+  o.back().osdmap_epoch = 1;
+  o.back().pg_scan = 2;
+  o.back().pg_stat_updates[pg_t(4,5)] = pg_stat_t();
+  o.back().osd_stat_updates[6] = osd_stat_t();
+  o.back().pg_remove.insert(pg_t(1,2));
+  o.back().osd_stat_rm.insert(5);
+  o.back().pool_statfs_updates[std::make_pair(1234,4)] = store_statfs_t();
+  return o;
 }
 
 // --
@@ -2257,21 +2261,19 @@ void PGMap::clear_delta()
   stamp_delta = utime_t();
 }
 
-void PGMap::generate_test_instances(list<PGMap*>& o)
+list<PGMap> PGMap::generate_test_instances()
 {
-  o.push_back(new PGMap);
-  list<Incremental*> inc;
-  Incremental::generate_test_instances(inc);
-  delete inc.front();
+  list<PGMap> o;
+  o.push_back(PGMap{});
+  list<Incremental> inc = Incremental::generate_test_instances();
   inc.pop_front();
   while (!inc.empty()) {
-    PGMap *pmp = new PGMap();
-    *pmp = *o.back();
+    PGMap pmp = o.back();
     o.push_back(pmp);
-    o.back()->apply_incremental(NULL, *inc.front());
-    delete inc.front();
+    o.back().apply_incremental(nullptr, inc.front());
     inc.pop_front();
   }
+  return o;
 }
 
 void PGMap::get_filtered_pg_stats(uint64_t state, int64_t poolid, int64_t osdid,
@@ -3313,6 +3315,12 @@ void PGMap::get_health_checks(
         summary += " experiencing stalled read in wal device of BlueFS";
       } else if (asum.first == "DB_DEVICE_STALLED_READ_ALERT") {
         summary += " experiencing stalled read in db device of BlueFS";
+      } else if (asum.first.find("_DISCARD_QUEUE") != std::string::npos) {
+	for (auto str : asum.second.second) {
+	  summary += str;
+	}
+      } else if (asum.first == "BLUESTORE_FREE_FRAGMENTATION") {
+        summary += " experiencing high free space fragmentation of BlueStore";
       }
 
       auto& d = checks->add(asum.first, HEALTH_WARN, summary, asum.second.first);

@@ -111,6 +111,13 @@ options:
   default: 15_min
   services:
   - mon
+- name: mon_nvmeofgw_wrong_map_ignore_sec
+  type: uint
+  level: advanced
+  desc: Period in seconds from MonClient startup to ignore wrong maps from Monitor
+  default: 15
+  services:
+  - mon
 - name: mon_mgr_inactive_grace
   type: int
   level: advanced
@@ -1393,5 +1400,23 @@ options:
   level: advanced
   desc: Period in seconds of nvmeof gateway beacon messages to monitor
   default: 2
+  services:
+  - mon
+- name: enable_availability_tracking
+  type: bool
+  level: advanced
+  desc: Calculate and store availablity score for each pool in the 
+    cluster at regular intervals
+  default: true
+  services :
+  - mon
+  flags:
+  - runtime
+- name: nvmeof_mon_client_connect_panic
+  type: secs
+  level: advanced
+  desc: The duration, expressed in seconds, after which the nvmeof gateway
+    should trigger a panic if it does not receive the initial map from the monitor
+  default: 30
   services:
   - mon

@@ -86,9 +86,6 @@ enum {
   l_bluefs_wal_alloc_lat,
   l_bluefs_db_alloc_lat,
   l_bluefs_slow_alloc_lat,
-  l_bluefs_wal_alloc_max_lat,
-  l_bluefs_db_alloc_max_lat,
-  l_bluefs_slow_alloc_max_lat,
   l_bluefs_last,
 };
 
@@ -98,6 +95,13 @@ public:
 
   virtual ~BlueFSVolumeSelector() {
   }
+
+  /**
+  *  Update config parameters from the config database.
+  *
+  */
+  virtual void update_from_config(CephContext* cct) = 0;
+
   /**
   *  Method to learn a hint (aka logic level discriminator)  specific for
   *  BlueFS log
@@ -434,6 +438,9 @@ public:
     // NOTE: caller must call BlueFS::close_writer()
     ~FileWriter() {
       --file->num_writers;
+      for (unsigned i = 0; i < MAX_BDEV; ++i) {
+        delete iocv[i];
+      }
     }
 
     // note: BlueRocksEnv uses this append exclusively, so it's safe
@@ -547,8 +554,6 @@ private:
     l_bluefs_max_bytes_db,
   };
 
-  ceph::timespan max_alloc_lat[MAX_BDEV] = {ceph::make_timespan(0)};
-
   // cache
   struct {
     ceph::mutex lock = ceph::make_mutex("BlueFS::nodes.lock");
@@ -563,7 +568,7 @@ private:
   struct {
     ceph::mutex lock = ceph::make_mutex("BlueFS::log.lock");
     uint64_t seq_live = 1;   //seq that log is currently writing to; mirrors dirty.seq_live
-    FileWriter *writer = 0;
+    FileWriter *writer = nullptr;
     bluefs_transaction_t t;
     bool uses_envelope_mode = false; // true if any file is in envelope mode
   } log;
@@ -860,10 +865,16 @@ public:
     vselector.reset(s);
   }
   void dump_volume_selector(std::ostream& sout) {
+    ceph_assert(vselector);
     vselector->dump(sout);
+  }
+  void update_volume_selector_from_config() {
+    ceph_assert(vselector);
+    vselector->update_from_config(cct);
   }
   void get_vselector_paths(const std::string& base,
                            BlueFSVolumeSelector::paths& res) const {
+    ceph_assert(vselector);
     return vselector->get_paths(base, res);
   }
 
@@ -950,6 +961,7 @@ public:
     uint64_t _slow_total)
     : wal_total(_wal_total), db_total(_db_total), slow_total(_slow_total) {}
 
+  void update_from_config(CephContext* cct) override {}
   void* get_hint_for_log() const override;
   void* get_hint_by_dir(std::string_view dirname) const override;
 

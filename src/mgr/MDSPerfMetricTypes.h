@@ -8,8 +8,10 @@
 #include <vector>
 #include <iosfwd>
 
+#include "include/cephfs/types.h" // for mds_rank_t
 #include "include/denc.h"
 #include "include/stringify.h"
+#include "include/utime.h"
 #include "common/Formatter.h"
 
 #include "mds/mdstypes.h"
@@ -397,11 +399,13 @@ struct MDSPerfMetricReport {
     }
     f->close_section();
   }
-  static void generate_test_instances(std::list<MDSPerfMetricReport *> &o) {
-    o.push_back(new MDSPerfMetricReport);
-    o.push_back(new MDSPerfMetricReport);
-    o.back()->reports.emplace(MDSPerfMetricQuery(), MDSPerfMetrics());
-    o.back()->rank_metrics_delayed.insert(1);
+  static std::list<MDSPerfMetricReport> generate_test_instances() {
+    std::list<MDSPerfMetricReport> o;
+    o.push_back(MDSPerfMetricReport{});
+    o.push_back(MDSPerfMetricReport{});
+    o.back().reports.emplace(MDSPerfMetricQuery(), MDSPerfMetrics());
+    o.back().rank_metrics_delayed.insert(1);
+    return o;
   }
 };
 

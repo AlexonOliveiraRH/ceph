@@ -115,7 +115,7 @@ struct objs_fix_list_t {
 struct shard_as_auth_t {
   // note: 'not_found' differs from 'not_usable' in that 'not_found'
   // does not carry an error message to be cluster-logged.
-  enum class usable_t : uint8_t { not_usable, not_found, usable };
+  enum class usable_t : uint8_t { not_usable, not_found, usable, not_usable_no_err };
 
   // the ctor used when the shard should not be considered as auth
   explicit shard_as_auth_t(std::string err_msg)
@@ -147,8 +147,9 @@ struct shard_as_auth_t {
   shard_as_auth_t(const object_info_t& anoi,
                   shard_to_scrubmap_t::iterator it,
                   std::string err_msg,
-                  std::optional<uint32_t> data_digest)
-      : possible_auth{usable_t::usable}
+                  std::optional<uint32_t> data_digest,
+                  bool nonprimary_ec)
+      : possible_auth{nonprimary_ec?usable_t::not_usable_no_err:usable_t::usable}
       , error_text{err_msg}
       , oi{anoi}
       , auth_iter{it}
@@ -161,8 +162,6 @@ struct shard_as_auth_t {
   object_info_t oi;
   shard_to_scrubmap_t::iterator auth_iter;
   std::optional<uint32_t> digest;
-  // when used for Crimson, we'll probably want to return 'digest_match' (and
-  // other in/out arguments) via this struct
 };
 
 namespace fmt {
@@ -191,6 +190,11 @@ struct formatter<shard_as_auth_t> {
       }
       if (as_auth.possible_auth == shard_as_auth_t::usable_t::not_found) {
         return fmt::format_to(ctx.out(), "{{shard-not-found}}");
+      }
+      if (as_auth.possible_auth == shard_as_auth_t::usable_t::not_usable_no_err) {
+        return fmt::format_to(ctx.out(),
+                              "{{shard-not-usable-no-err:{}}}",
+                              as_auth.error_text);
       }
       return fmt::format_to(ctx.out(),
                             "{{shard-usable: soid:{} {{txt:{}}} }}",
@@ -221,10 +225,12 @@ struct auth_selection_t {
   bool digest_match{true};        ///< do all (existing) digests match?
 };
 
+namespace fmt {
+
 // note: some scrub tests are sensitive to the specific format of
 // auth_selection_t listing in the logs
 template <>
-struct fmt::formatter<auth_selection_t> {
+struct formatter<auth_selection_t> {
   template <typename ParseContext>
   constexpr auto parse(ParseContext& ctx)
   {
@@ -244,6 +250,19 @@ struct fmt::formatter<auth_selection_t> {
                           aus.digest_match);
   }
 };
+} // namespace fmt
+
+
+/**
+ * the back-end data that is per-object
+ */
+struct object_scrub_data_t {
+  std::set<pg_shard_t> cur_missing;
+  std::set<pg_shard_t> cur_inconsistent;
+  bool fix_digest{false};
+};
+
+
 
 /**
  * the back-end data that is per-chunk
@@ -252,7 +271,7 @@ struct fmt::formatter<auth_selection_t> {
  */
 struct scrub_chunk_t {
 
-  explicit scrub_chunk_t(pg_shard_t i_am) { received_maps[i_am] = ScrubMap{}; }
+  explicit scrub_chunk_t(pg_shard_t i_am, uint32_t ec_digest_sz);
 
   /// the working set of scrub maps: the received maps, plus
   /// Primary's own map.
@@ -273,11 +292,11 @@ struct scrub_chunk_t {
   /// shallow/deep error counters
   error_counters_t m_error_counts;
 
-  // these must be reset for each element:
+  // EC-related:
+  shard_id_map<bufferlist> m_ec_digest_map;
 
-  std::set<pg_shard_t> cur_missing;
-  std::set<pg_shard_t> cur_inconsistent;
-  bool fix_digest{false};
+  /// only one 'large OMAP' warning per chunk
+  bool m_large_omap_warning_issued{false};
 };
 
 
@@ -359,6 +378,7 @@ class ScrubBackend {
   const spg_t m_pg_id;
   std::vector<pg_shard_t> m_acting_but_me;  // primary only
   bool m_is_replicated{true};
+  bool m_is_optimized_ec{false};
   std::string_view m_mode_desc;
   std::string m_formatted_id;
   const PGPool& m_pool;
@@ -370,11 +390,13 @@ class ScrubBackend {
   /// Mapping from object with errors to good peers
   std::map<hobject_t, auth_peers_t> m_auth_peers;
 
+  // EC related:
+  /// size of the EC digest map, calculated based on the EC configuration
+  uint32_t m_ec_digest_map_size{0};
+
   // shorthands:
   ConfigProxy& m_conf;
   LoggerSinkSet& clog;
-
- private:
 
   struct auth_and_obj_errs_t {
     std::list<pg_shard_t> auth_list;
@@ -382,6 +404,9 @@ class ScrubBackend {
   };
 
   std::optional<scrub_chunk_t> this_chunk;
+
+  /// the data collected/processed re the specific object being scrubbed
+  object_scrub_data_t m_current_obj;
 
   /// Maps from objects with errors to missing peers
   HobjToShardSetMapping m_missing;  // used by scrub_process_inconsistent()
@@ -413,7 +438,13 @@ class ScrubBackend {
   /// might return error messages to be cluster-logged
   std::optional<std::string> compare_obj_in_maps(const hobject_t& ho);
 
-  void omap_checks();
+  /**
+   * add the OMAP stats for the handled object to the m_omap_stats info.
+   * Also warn if the object has large omap keys or values.
+   */
+  void collect_omap_stats(
+      const hobject_t& ho,
+      const ScrubMap::object& auth_object);
 
   std::optional<auth_and_obj_errs_t> for_empty_auth_list(
     std::list<pg_shard_t>&& auths,
@@ -435,7 +466,8 @@ class ScrubBackend {
                            shard_info_wrapper& shard_result,
                            inconsistent_obj_wrapper& obj_result,
                            std::stringstream& errorstream,
-                           bool has_snapset);
+                           bool has_snapset,
+                           const pg_shard_t &shard);
 
   void repair_object(const hobject_t& soid,
                      const auth_peers_t& ok_peers,
@@ -485,7 +517,7 @@ class ScrubBackend {
   /**
    * Validate consistency of the object info and snap sets.
    */
-  void scrub_snapshot_metadata(ScrubMap& map);
+  void scrub_snapshot_metadata(ScrubMap& map, const pg_shard_t &srd);
 
   /**
    *  Updates the "global" (i.e. - not 'per-chunk') databases:
@@ -518,7 +550,8 @@ class ScrubBackend {
 
   // accessing the PG backend for this translation service
   uint64_t logical_to_ondisk_size(uint64_t logical_size,
-                                 int8_t shard_id) const;
+                                 shard_id_t shard_id) const;
+  uint32_t generate_zero_buffer_crc(shard_id_t shard_id, int length) const;
 };
 
 namespace fmt {

@@ -16,6 +16,12 @@
 #ifndef JOURNAL_POINTER_H
 #define JOURNAL_POINTER_H
 
+#include <iosfwd>
+#include <list>
+#include <string>
+
+#include "common/Formatter.h"
+#include "include/fs_types.h" // for inodeno_t
 #include "include/encoding.h"
 #include "mdstypes.h"
 
@@ -60,12 +66,14 @@ class JournalPointer {
     f->close_section(); // journal_header
   }
 
-  static void generate_test_instances(std::list<JournalPointer*> &ls)
+  static std::list<JournalPointer> generate_test_instances()
   {
-    ls.push_back(new JournalPointer());
-    ls.push_back(new JournalPointer());
-    ls.back()->front = 0xdeadbeef;
-    ls.back()->back = 0xfeedbead;
+    std::list<JournalPointer> ls;
+    ls.push_back(JournalPointer());
+    ls.push_back(JournalPointer());
+    ls.back().front = 0xdeadbeef;
+    ls.back().back = 0xfeedbead;
+    return ls;
   }
 
   // The currently active journal

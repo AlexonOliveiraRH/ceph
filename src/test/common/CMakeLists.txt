@@ -431,9 +431,8 @@ add_executable(unittest_option test_option.cc)
 target_link_libraries(unittest_option ceph-common GTest::Main)
 add_ceph_unittest(unittest_option)
 
-add_executable(unittest_fault_injector test_fault_injector.cc
-  $<TARGET_OBJECTS:unit-main>)
-target_link_libraries(unittest_fault_injector global)
+add_executable(unittest_fault_injector test_fault_injector.cc)
+target_link_libraries(unittest_fault_injector global GTest::Main)
 add_ceph_unittest(unittest_fault_injector)
 
 add_executable(unittest_blocked_completion test_blocked_completion.cc)
@@ -507,3 +506,6 @@ add_executable(unittest_async_cond test_async_cond.cc)
 target_link_libraries(unittest_async_cond GTest::GTest)
 add_ceph_unittest(unittest_async_cond)
 
+add_executable(unittest_async_redirect_error test_async_redirect_error.cc)
+target_link_libraries(unittest_async_redirect_error GTest::GTest)
+add_ceph_unittest(unittest_async_redirect_error)

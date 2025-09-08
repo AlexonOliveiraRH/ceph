@@ -16,6 +16,8 @@
 #ifndef CEPH_CLIENT_H
 #define CEPH_CLIENT_H
 
+#include <dirent.h>
+
 #include "common/admin_socket.h"
 #include "common/CommandTable.h"
 #include "common/Finisher.h"
@@ -380,6 +382,8 @@ public:
 		     std::vector<std::pair<uint64_t,uint64_t>> *blocks);
   int file_blockdiff_finish(struct scan_state_t *state);
 
+  int get_perf_counters(bufferlist *outbl);
+
   /*
    * Get the next snapshot delta entry.
    *
@@ -476,7 +480,9 @@ public:
                 const UserPerm& perms);
   int flock(int fd, int operation, uint64_t owner);
   int truncate(const char *path, loff_t size, const UserPerm& perms);
-
+  int getlk(int fd, struct flock *fl, uint64_t owner);
+  int setlk(int fd, struct flock *fl, uint64_t owner, int sleep);
+  
   // file ops
   int mknod(const char *path, mode_t mode, const UserPerm& perms, dev_t rdev=0);
 
@@ -599,6 +605,7 @@ public:
   int ll_lookupx(Inode *parent, const char *name, Inode **out,
 			struct ceph_statx *stx, unsigned want, unsigned flags,
 			const UserPerm& perms);
+  void ll_get(Inode *in);
   bool ll_forget(Inode *in, uint64_t count);
   bool ll_put(Inode *in);
   int ll_get_snap_ref(snapid_t snap);
@@ -1386,14 +1393,6 @@ private:
     void finish(int r) override {
       CRF->finish_io(r);
     }
-
-    // For _read_async, we may not finish in one go, so be prepared for multiple
-    // calls to complete. All the handling though is in C_Read_Finisher.
-    void complete(int r) override {
-      finish(r);
-      if (CRF->iofinished)
-        delete this;
-    }
   };
 
   class C_Read_Sync_NonBlocking : public Context {
@@ -1763,9 +1762,9 @@ private:
   void do_readahead(Fh *f, Inode *in, uint64_t off, uint64_t len);
   int64_t _write_success(Fh *fh, utime_t start, uint64_t fpos,
           int64_t offset, uint64_t size, Inode *in);
-  int64_t _write(Fh *fh, int64_t offset, uint64_t size, const char *buf,
-          const struct iovec *iov, int iovcnt, Context *onfinish = nullptr,
-          bool do_fsync = false, bool syncdataonly = false);
+  int64_t _write(Fh *fh, int64_t offset, uint64_t size, bufferlist bl,
+          Context *onfinish = nullptr, bool do_fsync = false,
+          bool syncdataonly = false);
   int64_t _preadv_pwritev_locked(Fh *fh, const struct iovec *iov,
                                  int iovcnt, int64_t offset,
                                  bool write, bool clamp_to_int,
@@ -1867,6 +1866,8 @@ private:
   int _lookup_name(Inode *in, Inode *parent, const UserPerm& perms);
   int _lookup_vino(vinodeno_t ino, const UserPerm& perms, Inode **inode=NULL);
   bool _ll_forget(Inode *in, uint64_t count);
+
+  int _statfs(Inode *in, struct statvfs *stbuf, const UserPerm& perms);
 
   void collect_and_send_metrics();
   void collect_and_send_global_metrics();

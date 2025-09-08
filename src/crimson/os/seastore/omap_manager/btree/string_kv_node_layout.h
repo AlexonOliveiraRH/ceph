@@ -597,11 +597,8 @@ public:
   }
 
   const_iterator find_string_key(std::string_view str) const {
-    auto iter = string_lower_bound(str);
-    if (iter.get_key() == str) {
-      return iter;
-    }
-    return iter_cend();
+    auto it = string_lower_bound(str);
+    return (it != iter_cend() && it.get_key() == str) ? it : iter_cend();
   }
 
   iterator find_string_key(std::string_view str) {
@@ -738,21 +735,14 @@ public:
     set_meta(omap_node_meta_t::merge_from(left.get_meta(), right.get_meta()));
   }
 
-  /**
-   * balance_into_new_nodes
-   *
-   * Takes the contents of left and right and copies them into
-   * replacement_left and replacement_right such that
-   * the size of replacement_left just >= 1/2 of (left + right)
-   */
-  static std::string balance_into_new_nodes(
+  static std::optional<uint32_t> get_balance_pivot_idx(
     const StringKVInnerNodeLayout &left,
-    const StringKVInnerNodeLayout &right,
-    StringKVInnerNodeLayout &replacement_left,
-    StringKVInnerNodeLayout &replacement_right)
+    const StringKVInnerNodeLayout &right)
   {
-    uint32_t left_size = omap_inner_key_t(left.get_node_key_ptr()[left.get_size()-1]).key_off;
-    uint32_t right_size = omap_inner_key_t(right.get_node_key_ptr()[right.get_size()-1]).key_off;
+    uint32_t left_size = omap_inner_key_t(
+      left.get_node_key_ptr()[left.get_size()-1]).key_off;
+    uint32_t right_size = omap_inner_key_t(
+      right.get_node_key_ptr()[right.get_size()-1]).key_off;
     uint32_t total = left_size + right_size;
     uint32_t pivot_size = total / 2;
     uint32_t pivot_idx = 0;
@@ -778,6 +768,30 @@ public:
         }
       }
     }
+    return pivot_idx == left.get_size()
+      ? std::nullopt
+      : std::make_optional<uint32_t>(pivot_idx);
+  }
+
+  /**
+   * balance_into_new_nodes
+   *
+   * Takes the contents of left and right and copies them into
+   * replacement_left and replacement_right such that
+   * the size of replacement_left just >= 1/2 of (left + right)
+   */
+  static std::string balance_into_new_nodes(
+    const StringKVInnerNodeLayout &left,
+    const StringKVInnerNodeLayout &right,
+    uint32_t pivot_idx,
+    StringKVInnerNodeLayout &replacement_left,
+    StringKVInnerNodeLayout &replacement_right)
+  {
+    ceph_assert(!(left.below_min() && right.below_min()));
+    uint32_t left_size = omap_inner_key_t(left.get_node_key_ptr()[left.get_size()-1]).key_off;
+    uint32_t right_size = omap_inner_key_t(right.get_node_key_ptr()[right.get_size()-1]).key_off;
+    uint32_t total = left_size + right_size;
+    uint32_t pivot_size = total / 2;
 
     auto replacement_pivot = pivot_idx >= left.get_size() ?
       right.iter_idx(pivot_idx - left.get_size())->get_key() :
@@ -1165,20 +1179,14 @@ public:
   }
 
   const_iterator string_lower_bound(std::string_view str) const {
-    uint16_t start = 0, end = get_size();
-    while (start != end) {
-      unsigned mid = (start + end) / 2;
-      const_iterator iter(this, mid);
-      std::string s = iter->get_key();
-      if (s < str) {
-        start = ++mid;
-      } else if (s > str) {
-        end = mid;
-      } else {
-        return iter;
-      }
-    }
-    return const_iterator(this, start);
+    auto it = std::lower_bound(boost::make_counting_iterator<uint16_t>(0),
+                               boost::make_counting_iterator<uint16_t>(get_size()),
+                               str,
+                               [this](uint16_t i, std::string_view str) {
+                                 const_iterator iter(this, i);
+                                 return iter->get_key() < str;
+                               });
+    return const_iterator(this, *it);
   }
 
   iterator string_lower_bound(std::string_view str) {
@@ -1187,13 +1195,14 @@ public:
   }
 
   const_iterator string_upper_bound(std::string_view str) const {
-    auto ret = iter_begin();
-    for (; ret != iter_end(); ++ret) {
-      std::string s = ret->get_key();
-      if (s > str)
-        break;
-    }
-    return ret;
+    auto it = std::upper_bound(boost::make_counting_iterator<uint16_t>(0),
+                               boost::make_counting_iterator<uint16_t>(get_size()),
+                               str,
+                               [this](std::string_view str, uint16_t i) {
+                                 const_iterator iter(this, i);
+                                 return str < iter->get_key();
+                               });
+    return const_iterator(this, *it);
   }
 
   iterator string_upper_bound(std::string_view str) {
@@ -1202,14 +1211,10 @@ public:
   }
 
   const_iterator find_string_key(std::string_view str) const {
-    auto ret = iter_begin();
-    for (; ret != iter_end(); ++ret) {
-      std::string s = ret->get_key();
-      if (s == str)
-        break;
-    }
-    return ret;
+    auto it = string_lower_bound(str);
+    return (it != iter_end() && it.get_key() == str) ? it : iter_end();
   }
+
   iterator find_string_key(std::string_view str) {
     const auto &tref = *this;
     return iterator(this, tref.find_string_key(str).index);
@@ -1363,21 +1368,14 @@ public:
     set_meta(omap_node_meta_t::merge_from(left.get_meta(), right.get_meta()));
   }
 
-  /**
-   * balance_into_new_nodes
-   *
-   * Takes the contents of left and right and copies them into
-   * replacement_left and replacement_right such that
-   * the size of replacement_left side just >= 1/2 of the total size (left + right).
-   */
-  static std::string balance_into_new_nodes(
+  static std::optional<uint32_t> get_balance_pivot_idx(
     const StringKVLeafNodeLayout &left,
-    const StringKVLeafNodeLayout &right,
-    StringKVLeafNodeLayout &replacement_left,
-    StringKVLeafNodeLayout &replacement_right)
+    const StringKVLeafNodeLayout &right)
   {
-    uint32_t left_size = omap_leaf_key_t(left.get_node_key_ptr()[left.get_size()-1]).key_off;
-    uint32_t right_size = omap_leaf_key_t(right.get_node_key_ptr()[right.get_size()-1]).key_off;
+    uint32_t left_size = omap_leaf_key_t(
+      left.get_node_key_ptr()[left.get_size()-1]).key_off;
+    uint32_t right_size = omap_leaf_key_t(
+      right.get_node_key_ptr()[right.get_size()-1]).key_off;
     uint32_t total = left_size + right_size;
     uint32_t pivot_size = total / 2;
     uint32_t pivot_idx = 0;
@@ -1403,6 +1401,29 @@ public:
         }
       }
     }
+    return pivot_idx == left.get_size()
+      ? std::nullopt
+      : std::make_optional<uint32_t>(pivot_idx);
+  }
+
+  /**
+   * balance_into_new_nodes
+   *
+   * Takes the contents of left and right and copies them into
+   * replacement_left and replacement_right such that
+   * the size of replacement_left side just >= 1/2 of the total size (left + right).
+   */
+  static std::string balance_into_new_nodes(
+    const StringKVLeafNodeLayout &left,
+    const StringKVLeafNodeLayout &right,
+    uint32_t pivot_idx,
+    StringKVLeafNodeLayout &replacement_left,
+    StringKVLeafNodeLayout &replacement_right)
+  {
+    uint32_t left_size = omap_leaf_key_t(left.get_node_key_ptr()[left.get_size()-1]).key_off;
+    uint32_t right_size = omap_leaf_key_t(right.get_node_key_ptr()[right.get_size()-1]).key_off;
+    uint32_t total = left_size + right_size;
+    uint32_t pivot_size = total / 2;
 
     auto replacement_pivot = pivot_idx >= left.get_size() ?
       right.iter_idx(pivot_idx - left.get_size())->get_key() :

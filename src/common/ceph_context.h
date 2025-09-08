@@ -18,12 +18,12 @@
 #include <atomic>
 #include <map>
 #include <memory>
-#include <mutex>
 #include <set>
 #include <string>
 #include <string_view>
 #include <typeinfo>
 #include <typeindex>
+#include <vector>
 
 #include <boost/intrusive_ptr.hpp>
 
@@ -36,15 +36,19 @@
 #include "msg/msg_types.h"
 #ifdef WITH_CRIMSON
 #include "crimson/common/config_proxy.h"
-#include "crimson/common/perf_counters_collection.h"
 #else
 #include "common/config_proxy.h"
 #include "include/spinlock.h"
-#include "common/perf_counters_collection.h"
 #endif
 
 
 #include "crush/CrushLocation.h"
+
+#ifdef HAVE_BREAKPAD
+namespace google_breakpad {
+  class ExceptionHandler;
+}
+#endif
 
 class AdminSocket;
 class AdminSocketHook;
@@ -143,6 +147,9 @@ public:
 
   ConfigProxy _conf;
   ceph::logging::Log *_log;
+#ifdef HAVE_BREAKPAD
+  std::unique_ptr<google_breakpad::ExceptionHandler> _ex_handler;
+#endif
 
   /* init ceph::crypto */
   void init_crypto();
@@ -203,7 +210,7 @@ public:
 				       bool drop_on_fork,
 				       Args&&... args) {
     static_assert(sizeof(T) <= largest_singleton,
-		  "Please increase largest singleton.");
+		  "Please increase largest_singleton.");
     std::lock_guard lg(associated_objs_lock);
     std::type_index type = typeid(T);
 

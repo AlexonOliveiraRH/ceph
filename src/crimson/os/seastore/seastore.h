@@ -23,6 +23,7 @@
 
 #include "crimson/os/seastore/device.h"
 #include "crimson/os/seastore/transaction.h"
+#include "crimson/os/seastore/transaction_interruptor.h"
 #include "crimson/os/seastore/onode_manager.h"
 #include "crimson/os/seastore/omap_manager.h"
 #include "crimson/os/seastore/collection_manager.h"
@@ -42,7 +43,7 @@ enum class op_type_t : uint8_t {
     GET_ATTRS,
     STAT,
     OMAP_GET_VALUES,
-    OMAP_GET_VALUES2,
+    OMAP_ITERATE,
     MAX
 };
 
@@ -71,9 +72,6 @@ struct col_obj_ranges_t {
 
 class SeaStore final : public FuturizedStore {
 public:
-  using base_ertr = TransactionManager::base_ertr;
-  using base_iertr = TransactionManager::base_iertr;
-
   class MDStore {
   public:
     using write_meta_ertr = base_ertr;
@@ -139,13 +137,12 @@ public:
       const omap_keys_t& keys,
       uint32_t op_flags = 0) final;
 
-    /// Retrieves paged set of values > start (if present)
-    read_errorator::future<omap_values_paged_t> omap_get_values(
-      CollectionRef c,           ///< [in] collection
-      const ghobject_t &oid,     ///< [in] oid
-      const std::optional<std::string> &start, ///< [in] start, empty for begin
-      uint32_t op_flags = 0
-      ) final; ///< @return <done, values> values.empty() iff done
+    read_errorator::future<ObjectStore::omap_iter_ret_t> omap_iterate(
+      CollectionRef c,
+      const ghobject_t &oid,
+      ObjectStore::omap_iter_seek_t start_from,
+      omap_iterate_cb_t callback,
+      uint32_t op_flags = 0) final;
 
     get_attr_errorator::future<bufferlist> omap_get_header(
       CollectionRef c,
@@ -208,7 +205,7 @@ public:
 
     uuid_d get_fsid() const;
 
-    seastar::future<> mkfs_managers();
+    TransactionManager::alloc_extent_ertr::future<> mkfs_managers();
 
     void init_managers();
 
@@ -381,7 +378,8 @@ public:
       uint64_t off,
       uint64_t len) const;
 
-    using tm_iertr = base_iertr;
+    using tm_iertr = base_iertr::extend<
+      crimson::ct_error::value_too_large>;
     using tm_ret = tm_iertr::future<>;
     tm_ret _do_transaction_step(
       internal_context_t &ctx,
@@ -435,6 +433,9 @@ public:
       internal_context_t &ctx,
       Onode &onode);
     tm_ret _create_collection(
+      internal_context_t &ctx,
+      const coll_t& cid, int bits);
+    tm_ret _split_collection(
       internal_context_t &ctx,
       const coll_t& cid, int bits);
     tm_ret _remove_collection(
@@ -492,17 +493,28 @@ public:
       const std::optional<std::string>& start,
       OMapManager::omap_list_config_t config) const;
 
+    using omaptree_iterate_ret = OMapManager::omap_iterate_ret;
+    omaptree_iterate_ret omaptree_iterate(
+      Transaction& t,
+      omap_root_t&& root,
+      ObjectStore::omap_iter_seek_t &start_from,
+      omap_iterate_cb_t callback
+      );
+
     base_iertr::future<omap_values_t> omaptree_get_values(
       Transaction& t,
       omap_root_t&& root,
       const omap_keys_t& keys) const;
 
+    using omap_values_paged_t = std::tuple<bool, omap_values_t>;
     base_iertr::future<omap_values_paged_t> omaptree_get_values(
       Transaction& t,
       omap_root_t&& root,
       const std::optional<std::string>& start) const;
 
-    base_iertr::future<> omaptree_set_keys(
+    using omaptree_set_keys_iertr = base_iertr::extend<
+      crimson::ct_error::value_too_large>;
+    omaptree_set_keys_iertr::future<> omaptree_set_keys(
       Transaction& t,
       omap_root_t&& root,
       Onode& onode,

@@ -1606,7 +1606,9 @@ void PgScrubber::set_op_parameters(ScrubPGPreconds pg_cond)
     state_set(PG_STATE_DEEP_SCRUB);
   }
 
-  m_flags.auto_repair = m_is_deep && pg_cond.can_autorepair;
+  m_flags.auto_repair =
+      m_is_deep && pg_cond.can_autorepair &&
+      ScrubJob::is_autorepair_allowed(m_active_target->urgency());
 
   // m_is_repair is set for all repair cases - for operator-requested
   // repairs, for deep-scrubs initiated automatically after a shallow scrub
@@ -1823,13 +1825,20 @@ void PgScrubber::scrub_finish()
   ceph_assert(m_pg->is_locked());
   ceph_assert(is_queued_or_active());
 
-  // if the repair request comes from auto-repair and large number of errors,
-  // we would like to cancel auto-repair
+  // if the repair request comes from auto-repair and there is a large
+  // number of objects known to be damaged, we cancel the auto-repair
   if (m_is_repair && m_flags.auto_repair &&
+      ScrubJob::is_repairs_count_limited(m_active_target->urgency()) &&
       m_be->authoritative_peers_count() >
-	static_cast<int>(m_pg->cct->_conf->osd_scrub_auto_repair_num_errors)) {
+	  static_cast<int>(
+	      m_pg->cct->_conf->osd_scrub_auto_repair_num_errors)) {
 
-    dout(10) << __func__ << " undoing the repair" << dendl;
+    dout(5) << fmt::format(
+		   "{}: undoing the repair. Damaged objects count ({}) is "
+		   "above configured limit ({})",
+		   __func__, m_be->authoritative_peers_count(),
+		   m_pg->cct->_conf->osd_scrub_auto_repair_num_errors)
+	    << dendl;
     state_clear(PG_STATE_REPAIR);  // not expected to be set, anyway
     m_is_repair = false;
     update_op_mode_text();
@@ -1837,15 +1846,18 @@ void PgScrubber::scrub_finish()
 
   m_be->update_repair_status(m_is_repair);
 
-  // if a regular scrub had errors within the limit, do a deep scrub to auto
-  // repair
+  // if the count of damaged objects found in shallow-scrubbing is not
+  // too high - do a deep scrub to auto repair
   bool do_auto_scrub = false;
   if (m_flags.deep_scrub_on_error && m_be->authoritative_peers_count() &&
       m_be->authoritative_peers_count() <=
 	static_cast<int>(m_pg->cct->_conf->osd_scrub_auto_repair_num_errors)) {
     ceph_assert(!m_is_deep);
     do_auto_scrub = true;
-    dout(15) << __func__ << " Try to auto repair after scrub errors" << dendl;
+    dout(10) << fmt::format("{}: will initiate a deep scrub to fix {} errors",
+                            __func__,
+                            m_be->authoritative_peers_count())
+             << dendl;
   }
 
   m_flags.deep_scrub_on_error = false;
@@ -2372,7 +2384,7 @@ pg_scrubbing_status_t PgScrubber::get_schedule() const
 
     } else {
       int32_t dur_seconds =
-	  duration_cast<seconds>(m_fsm->get_time_scrubbing()).count();
+	  ceil<seconds>(m_fsm->get_time_scrubbing()).count();
       return pg_scrubbing_status_t{
 	  utime_t{},
 	  dur_seconds,
@@ -2565,7 +2577,7 @@ std::chrono::milliseconds PgScrubber::get_scrub_sleep_time() const
 {
   return m_osds->get_scrub_services().scrub_sleep_time(
       ceph_clock_now(),
-      !ScrubJob::observes_allowed_hours(m_active_target->urgency()));
+      ScrubJob::observes_extended_sleep(m_active_target->urgency()));
 }
 
 void PgScrubber::queue_for_scrub_resched(Scrub::scrub_prio_t prio)
@@ -2755,18 +2767,19 @@ void PgScrubber::update_scrub_stats(ceph::coarse_real_clock::time_point now_is)
 
   /// \todo use the date library (either the one included in Arrow or directly)
   /// to get the formatting of the time_points.
-
   if (g_conf()->subsys.should_gather<ceph_subsys_osd, 25>()) {
     // will only create the debug strings if required
-    char buf[50];
-    auto printable_last = fmt::localtime(clock::to_time_t(m_last_stat_upd));
-    strftime(buf, sizeof(buf), "%Y-%m-%dT%T", &printable_last);
-    dout(20) << fmt::format("{}: period: {}/{}-> {} last:{}",
+    std::time_t time = clock::to_time_t(m_last_stat_upd);
+    std::tm tm_local;
+    if (!localtime_r(&time, &tm_local)) {
+      throw fmt::format_error("time_t value out of range");
+    }
+    dout(20) << fmt::format("{}: period: {}/{}-> {} last:{:%FT%T}",
 			    __func__,
 			    period_active,
 			    period_inactive,
 			    period,
-			    buf)
+			    tm_local)
 	     << dendl;
   }
 

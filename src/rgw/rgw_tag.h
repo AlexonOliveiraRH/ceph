@@ -3,9 +3,12 @@
 
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <include/types.h>
 #include <map>
+
+#include "include/encoding.h"
 
 class RGWObjTags
 {
@@ -36,7 +39,7 @@ protected:
   }
 
   void dump(Formatter *f) const;
-  static void generate_test_instances(std::list<RGWObjTags*>& o);
+  static std::list<RGWObjTags> generate_test_instances();
   void add_tag(const std::string& key, const std::string& val="");
   void emplace_tag(std::string&& key, std::string&& val);
   int check_and_add_tag(const std::string& key, const std::string& val="");

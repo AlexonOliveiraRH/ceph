@@ -14,6 +14,9 @@
 #ifndef COMPRESSION_H_INCLUDED
 #define COMPRESSION_H_INCLUDED
 
+#include <map>
+#include <vector>
+
 #include "BlueStore.h"
 #include "Writer.h"
 
@@ -21,6 +24,9 @@ class BlueStore::Estimator {
 public:
   Estimator(BlueStore* bluestore)
   :bluestore(bluestore) {}
+
+  // Each estimator run needs specific WriteContext
+  void set_wctx(const WriteContext* wctx);
 
   // Inform estimator that an extent is a candidate for recompression.
   // Estimator has to calculate (guess) the cost (size) of the referenced data.
@@ -45,8 +51,6 @@ public:
   void get_regions(std::vector<region_t>& regions);
 
   int32_t split_and_compress(
-    CompressorRef compr,
-    uint32_t max_blob_size,
     ceph::buffer::list& data_bl,
     Writer::blob_vec& bd);
 
@@ -57,9 +61,11 @@ private:
   double expected_compression_factor = 0.5;
   double expected_recompression_error = 1.1;
   double expected_pad_expansion = 1.1;
+  const WriteContext* wctx = nullptr;
   uint32_t new_size = 0;              // fresh data to write
   uint32_t uncompressed_size = 0;     // data that was not compressed
-  uint32_t compressed_size = 0;       // data of compressed size
+  uint32_t compressed_size = 0;       // estimated size of compressed data
+  uint32_t compressed_area = 0;       // area that is compressed
   uint32_t compressed_occupied = 0;   // disk size that will be freed
   uint32_t total_uncompressed_size = 0;
   uint32_t total_compressed_size = 0;
@@ -68,6 +74,8 @@ private:
   uint32_t actual_compressed = 0;
   uint32_t actual_compressed_plus_pad = 0;
   std::map<uint32_t, uint32_t> extra_recompress;
+  bool single_compressed_blob = true;
+  const Blob* last_blob = nullptr;
   // Prepare for new write
   void cleanup();
 };

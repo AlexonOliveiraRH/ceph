@@ -457,18 +457,6 @@ void BlueFS::_init_logger()
                 "Average allocation latency for primary/shared device",
                 "bsal",
                 PerfCountersBuilder::PRIO_USEFUL);
-  b.add_time(l_bluefs_wal_alloc_max_lat, "alloc_wal_max_lat",
-             "Max allocation latency for wal device",
-             "awxt",
-             PerfCountersBuilder::PRIO_INTERESTING);
-  b.add_time(l_bluefs_db_alloc_max_lat, "alloc_db_max_lat",
-             "Max allocation latency for db device",
-             "adxt",
-             PerfCountersBuilder::PRIO_INTERESTING);
-  b.add_time(l_bluefs_slow_alloc_max_lat, "alloc_slow_max_lat",
-             "Max allocation latency for primary/shared device",
-             "asxt",
-             PerfCountersBuilder::PRIO_INTERESTING);
 
   logger = b.create_perf_counters();
   cct->get_perfcounters_collection()->add(logger);
@@ -533,7 +521,9 @@ int BlueFS::add_block_device(unsigned id, const string& path, bool trim,
   if (trim) {
     interval_set<uint64_t> whole_device;
     whole_device.insert(0, b->get_size());
-    b->try_discard(whole_device, false);
+    dout(5) << __func__ << " trimming device:" << path << dendl;
+    b->try_discard(whole_device, false, true);
+    dout(5) << __func__ << " trimmed device:" << path << dendl;
   }
 
   dout(1) << __func__ << " bdev " << id << " path " << path
@@ -703,6 +693,7 @@ int BlueFS::mkfs(uuid_d osd_uuid, const bluefs_layout_t& layout)
         _get_block_device_size(BlueFS::BDEV_WAL) * 95 / 100,
         _get_block_device_size(BlueFS::BDEV_DB) * 95 / 100,
         _get_block_device_size(BlueFS::BDEV_SLOW) * 95 / 100));
+    vselector->update_from_config(cct);
   }
 
   _init_logger();
@@ -1070,6 +1061,7 @@ int BlueFS::mount()
         _get_block_device_size(BlueFS::BDEV_WAL) * 95 / 100,
         _get_block_device_size(BlueFS::BDEV_DB) * 95 / 100,
         _get_block_device_size(BlueFS::BDEV_SLOW) * 95 / 100));
+    vselector->update_from_config(cct);
   }
 
   _init_alloc();
@@ -1208,7 +1200,7 @@ int BlueFS::prepare_new_device(int id, const bluefs_layout_t& layout)
       REMOVE_WAL,
       layout);
   } else {
-    assert(false);
+    ceph_assert(false);
   }
   return 0;
 }
@@ -1411,7 +1403,7 @@ int BlueFS::_replay(bool noop, bool to_stdout)
       if (r != (int)super.block_size && cct->_conf->bluefs_replay_recovery) {
 	r += _do_replay_recovery_read(log_reader, pos, read_pos + r, super.block_size - r, &bl);
       }
-      assert(r == (int)super.block_size);
+      ceph_assert(r == (int)super.block_size);
       read_pos += r;
     }
     uint64_t more = 0;
@@ -1948,7 +1940,7 @@ int BlueFS::device_migrate_to_existing(
 
   dout(10) << __func__ << " devs_source " << devs_source
 	   << " dev_target " << dev_target << dendl;
-  assert(dev_target < (int)MAX_BDEV);
+  ceph_assert(dev_target < (int)MAX_BDEV);
 
   int flags = 0;
   flags |= devs_source.count(BDEV_DB) ?
@@ -2093,7 +2085,7 @@ int BlueFS::device_migrate_to_new(
 
   dout(10) << __func__ << " devs_source " << devs_source
 	   << " dev_target " << dev_target << dendl;
-  assert(dev_target == (int)BDEV_NEWDB || dev_target == (int)BDEV_NEWWAL);
+  ceph_assert(dev_target == (int)BDEV_NEWDB || dev_target == (int)BDEV_NEWWAL);
 
   int flags = 0;
 
@@ -4224,10 +4216,12 @@ int BlueFS::truncate(FileWriter *h, uint64_t offset)/*_WF_L*/
         changed_extents = true;
         ++p;
       } else {
-        // cut_off > p->length means that we misaligned the extent
-        ceph_assert(cut_off == p->length);
+        // Usually cut_off == p->length.
+        // Case cut_off > p->length means that we misaligned the extent
+        // or alloc size changed in the meantime.
+        // In both cases just leave extent untouched.
         fnode.allocated = (offset - x_off) + p->length;
-        ++p; // leave extent untouched
+        ++p;
       }
       while (p != fnode.extents.end()) {
         dirty.pending_release[p->bdev].insert(p->offset, p->length);
@@ -4349,25 +4343,13 @@ void BlueFS::_update_allocate_stats(uint8_t id, const ceph::timespan& d)
 {
   switch(id) {
     case BDEV_SLOW:
-      logger->tinc(l_bluefs_slow_alloc_lat, d);
-      if (d > max_alloc_lat[id]) {
-        logger->tset(l_bluefs_slow_alloc_max_lat, utime_t(d));
-        max_alloc_lat[id] = d;
-      }
+      logger->tinc_with_max(l_bluefs_slow_alloc_lat, d);
       break;
     case BDEV_DB:
-      logger->tinc(l_bluefs_db_alloc_lat, d);
-      if (d > max_alloc_lat[id]) {
-        logger->tset(l_bluefs_db_alloc_max_lat, utime_t(d));
-        max_alloc_lat[id] = d;
-      }
+      logger->tinc_with_max(l_bluefs_db_alloc_lat, d);
       break;
     case BDEV_WAL:
-      logger->tinc(l_bluefs_wal_alloc_lat, d);
-      if (d > max_alloc_lat[id]) {
-        logger->tset(l_bluefs_wal_alloc_max_lat, utime_t(d));
-        max_alloc_lat[id] = d;
-      }
+      logger->tinc_with_max(l_bluefs_wal_alloc_lat, d);
       break;
   }
 }
@@ -4693,7 +4675,6 @@ void BlueFS::_drain_writer(FileWriter *h)
     if (bdev[i]) {
       if (h->iocv[i]) {
 	h->iocv[i]->aio_wait();
-	delete h->iocv[i];
       }
     }
   }

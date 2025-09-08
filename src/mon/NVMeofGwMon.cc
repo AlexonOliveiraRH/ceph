@@ -14,6 +14,8 @@
 #include <boost/tokenizer.hpp>
 #include "include/stringify.h"
 #include "NVMeofGwMon.h"
+#include "Monitor.h"
+#include "messages/MMonCommand.h"
 #include "messages/MNVMeofGwBeacon.h"
 #include "messages/MNVMeofGwMap.h"
 
@@ -29,11 +31,21 @@ void NVMeofGwMon::init()
   dout(10) <<  "called " << dendl;
 }
 
+void NVMeofGwMon::cleanup_pending_map()
+{
+  dout(10) << "cleanup pending :" << pending_map  << dendl;
+  pending_map.created_gws.clear();
+  pending_map.fsm_timers.clear();
+  pending_map.gw_epoch.clear();
+  pending_map.epoch = 0;
+}
+
 void NVMeofGwMon::on_restart()
 {
   dout(10) <<  "called " << dendl;
   last_beacon.clear();
   last_tick = ceph::coarse_mono_clock::now();
+  cleanup_pending_map();
   synchronize_last_beacon();
 }
 
@@ -158,7 +170,8 @@ version_t NVMeofGwMon::get_trim_to() const
  * function called during new paxos epochs
  * function called to restore in pending map all data that is not serialized
  * to paxos peons. Othervise it would be overriden in "pending_map = map"
- * currently "allow_failovers_ts" and "last_gw_down_ts" variables restored
+ * currently "allow_failovers_ts", "last_gw_down_ts",
+ * "last_gw_map_epoch_valid" variables are restored
  */
 void NVMeofGwMon::restore_pending_map_info(NVMeofGwMap & tmp_map) {
   std::chrono::system_clock::time_point now = std::chrono::system_clock::now();
@@ -167,6 +180,11 @@ void NVMeofGwMon::restore_pending_map_info(NVMeofGwMap & tmp_map) {
     NvmeGwMonStates& gw_created_map = created_map_pair.second;
     for (auto& gw_created_pair: gw_created_map) {
       auto gw_id = gw_created_pair.first;
+      auto& pending_gws_states = pending_map.created_gws[group_key];
+      auto  gw_state = pending_gws_states.find(gw_id);
+      if (gw_state == pending_gws_states.end()) {
+        continue;
+      }
       if (gw_created_pair.second.allow_failovers_ts > now) {
         // restore not persistent information upon new epochs
         dout(10) << " restore skip-failovers timeout for gw  " << gw_id  << dendl;
@@ -175,6 +193,8 @@ void NVMeofGwMon::restore_pending_map_info(NVMeofGwMap & tmp_map) {
       }
       pending_map.created_gws[group_key][gw_id].last_gw_down_ts =
           gw_created_pair.second.last_gw_down_ts;
+      pending_map.created_gws[group_key][gw_id].last_gw_map_epoch_valid =
+	  gw_created_pair.second.last_gw_map_epoch_valid;
     }
   }
 }
@@ -423,8 +443,10 @@ bool NVMeofGwMon::preprocess_command(MonOpRequestRef op)
       if (map.created_gws[group_key].size()) {
         time_t seconds_since_1970 = time(NULL);
         uint32_t index = ((seconds_since_1970/60) %
-             map.created_gws[group_key].size()) + 1;
-        f->dump_unsigned("rebalance_ana_group", index);
+             map.created_gws[group_key].size());
+        auto it = map.created_gws[group_key].begin();
+        std::advance(it, index);
+        f->dump_unsigned("rebalance_ana_group", it->second.ana_grp_id + 1);
       }
     }
     f->dump_unsigned("num gws", map.created_gws[group_key].size());
@@ -680,8 +702,7 @@ bool NVMeofGwMon::prepare_beacon(MonOpRequestRef op)
 	false) {
 	pending_map.created_gws[group_key][gw_id].performed_full_startup = true;
 	pending_map.gw_performed_startup(gw_id, group_key, gw_propose);
-	pending_map.created_gws[group_key][gw_id].addr_vect =
-	    entity_addrvec_t(con->get_peer_addr());
+	pending_map.set_addr_vect(gw_id, group_key, con->get_peer_addr());
       }
       LastBeacon lb = {gw_id, group_key};
       last_beacon[lb] = now; //Update last beacon
@@ -730,8 +751,7 @@ bool NVMeofGwMon::prepare_beacon(MonOpRequestRef op)
     dout(4) << "Warning: entity addr need to set for GW client " << gw_id
       << " was " <<  pending_map.created_gws[group_key][gw_id].addr_vect
       << " now " << entity_addrvec_t(con->get_peer_addr()) << dendl;
-    pending_map.created_gws[group_key][gw_id].addr_vect =
-      entity_addrvec_t(con->get_peer_addr());
+    pending_map.set_addr_vect(gw_id, group_key, con->get_peer_addr());
     gw_propose = true;
   }
   // deep copy the whole nonce map of this GW
@@ -806,12 +826,13 @@ bool NVMeofGwMon::prepare_beacon(MonOpRequestRef op)
     send_ack = true;
     if (apply_ack_logic) {
       dout(20) << "ack sent: beacon index "
-       << pending_map.created_gws[group_key][gw_id].beacon_index
-       << " gw " << gw_id <<dendl;
+      << pending_map.created_gws[group_key][gw_id].beacon_index
+      << " gw " << gw_id << " epoch-filter  " << epoch_filter_enabled
+      << " propose " << propose << " gw-propose " << gw_propose << dendl;
     }
   }
   if (send_ack && ((!gw_propose && epoch_filter_enabled) ||
-                    (propose && !epoch_filter_enabled) ||
+                    (!propose && !epoch_filter_enabled) ||
                     (avail == gw_availability_t::GW_CREATED)) ) {
           /* always send beacon ack to gw in Created state,
            * it should be temporary state

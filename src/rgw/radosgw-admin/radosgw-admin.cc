@@ -2,7 +2,7 @@
 // vim: ts=8 sw=2 smarttab ft=cpp
 
 /*
- * Copyright (C) 2025 IBM 
+ * Copyright (C) 2025 IBM
  */
 
 #include <cerrno>
@@ -49,6 +49,8 @@ extern "C" {
 #include "radosgw-admin/orphan.h"
 #include "radosgw-admin/sync_checkpoint.h"
 
+#include "rgw/async_utils.h"
+
 #include "rgw_user.h"
 #include "rgw_otp.h"
 #include "rgw_rados.h"
@@ -78,7 +80,7 @@ extern "C" {
 #include "rgw_data_access.h"
 #include "rgw_account.h"
 #include "rgw_bucket_logging.h"
-
+#include "rgw_dedup_cluster.h"
 #include "services/svc_sync_modules.h"
 #include "services/svc_cls.h"
 #include "services/svc_bilog_rados.h"
@@ -124,6 +126,7 @@ static const DoutPrefixProvider* dpp() {
   } while (0)
 
 using namespace std;
+using rgw::run_coro;
 
 inline int posix_errortrans(int r)
 {
@@ -151,6 +154,12 @@ void usage()
   cout << "  user policy list attached        list attached managed policies\n";
   cout << "  caps add                         add user capabilities\n";
   cout << "  caps rm                          remove user capabilities\n";
+  cout << "  dedup stats                      Display dedup statistics from the last run\n";
+  cout << "  dedup estimate                   Runs dedup in estimate mode (no changes will be made)\n";
+  cout << "  dedup restart                    Restart dedup\n";
+  cout << "  dedup abort                      Abort dedup\n";
+  cout << "  dedup pause                      Pause dedup\n";
+  cout << "  dedup resume                     Resume paused dedup\n";
   cout << "  subuser create                   create a new subuser\n" ;
   cout << "  subuser modify                   modify subuser\n";
   cout << "  subuser rm                       remove subuser\n";
@@ -742,6 +751,12 @@ enum class OPT {
   QUOTA_SET,
   QUOTA_ENABLE,
   QUOTA_DISABLE,
+  DEDUP_STATS,
+  DEDUP_ESTIMATE,
+  DEDUP_ABORT,
+  DEDUP_RESTART,
+  DEDUP_PAUSE,
+  DEDUP_RESUME,
   GC_LIST,
   GC_PROCESS,
   LC_LIST,
@@ -989,6 +1004,12 @@ static SimpleCmd::Commands all_cmds = {
   { "ratelimit set", OPT::RATELIMIT_SET },
   { "ratelimit enable", OPT::RATELIMIT_ENABLE },
   { "ratelimit disable", OPT::RATELIMIT_DISABLE },
+  { "dedup stats", OPT::DEDUP_STATS },
+  { "dedup estimate", OPT::DEDUP_ESTIMATE },
+  { "dedup abort", OPT::DEDUP_ABORT },
+  { "dedup restart", OPT::DEDUP_RESTART },
+  { "dedup pause", OPT::DEDUP_PAUSE },
+  { "dedup resume", OPT::DEDUP_RESUME },
   { "gc list", OPT::GC_LIST },
   { "gc process", OPT::GC_PROCESS },
   { "lc list", OPT::LC_LIST },
@@ -1971,7 +1992,7 @@ static int commit_period(rgw::sal::ConfigStore* cfgstore,
                          RGWPeriod& period, string remote, const string& url,
                          std::optional<string> opt_region,
                          const string& access, const string& secret,
-                         bool force)
+                         bool force, rgw::SiteConfig* site)
 {
   auto& master_zone = period.get_master_zone().id;
   if (master_zone.empty()) {
@@ -1991,7 +2012,7 @@ static int commit_period(rgw::sal::ConfigStore* cfgstore,
     // the master zone can commit locally
     ret = rgw::commit_period(dpp(), null_yield, cfgstore, driver,
                              realm, realm_writer, current_period,
-                             period, cerr, force);
+                             period, cerr, force, *site);
     if (ret < 0) {
       cerr << "failed to commit period: " << cpp_strerror(-ret) << std::endl;
     }
@@ -2078,7 +2099,7 @@ static int update_period(rgw::sal::ConfigStore* cfgstore,
                          const string& remote, const string& url,
                          std::optional<string> opt_region,
                          const string& access, const string& secret,
-                         Formatter *formatter, bool force)
+                         Formatter *formatter, bool force, rgw::SiteConfig* site)
 {
   RGWRealm realm;
   std::unique_ptr<rgw::sal::RealmWriter> realm_writer;
@@ -2116,7 +2137,7 @@ static int update_period(rgw::sal::ConfigStore* cfgstore,
   }
   if (commit) {
     ret = commit_period(cfgstore, realm, *realm_writer, period, remote, url,
-                        opt_region, access, secret, force);
+                        opt_region, access, secret, force, site);
     if (ret < 0) {
       cerr << "failed to commit period: " << cpp_strerror(-ret) << std::endl;
       return ret;
@@ -3512,27 +3533,6 @@ void init_realm_param(CephContext *cct, string& var, std::optional<string>& opt_
   }
 }
 
-int run_coro(asio::awaitable<void> coro, std::string_view name) {
-  try {
-    // Blocking in startup code, not ideal, but won't hurt anything.
-    std::exception_ptr eptr
-      = asio::co_spawn(static_cast<rgw::sal::RadosStore*>(driver)->get_io_context(),
-		       std::move(coro),
-		       async::use_blocked);
-    if (eptr) {
-      std::rethrow_exception(eptr);
-    }
-  } catch (boost::system::system_error& e) {
-    ldpp_dout(dpp(), -1) << name << ": failed: " << e.what() << dendl;
-    return ceph::from_error_code(e.code());
-  } catch (std::exception& e) {
-    ldpp_dout(dpp(), -1) << name << ": failed: " << e.what() << dendl;
-    return -EIO;
-  }
-  return 0;
-}
-
-
 // This has an uncaught exception. Even if the exception is caught, the program
 // would need to be terminated, so the warning is simply suppressed.
 // coverity[root_function:SUPPRESS]
@@ -4509,6 +4509,12 @@ int main(int argc, const char **argv)
 			 OPT::BI_LIST,
 			 OPT::OLH_GET,
 			 OPT::OLH_READLOG,
+			 OPT::DEDUP_STATS,
+			 OPT::DEDUP_ESTIMATE,
+			 OPT::DEDUP_ABORT,     // TBD - not READ-ONLY
+			 OPT::DEDUP_RESTART,   // TBD - not READ-ONLY
+			 OPT::DEDUP_PAUSE,
+			 OPT::DEDUP_RESUME,
 			 OPT::GC_LIST,
 			 OPT::LC_LIST,
 			 OPT::ORPHANS_LIST_JOBS,
@@ -4612,12 +4618,13 @@ int main(int argc, const char **argv)
 					false,
 					false,
 					false,
+					false,
                                         false,
 					false, // No background tasks!
                                         null_yield,
 					cfgstore.get(),
 					need_cache && g_conf()->rgw_cache_enabled,
-					need_gc);
+					need_gc, true /* admin */);
     }
     if (!driver) {
       cerr << "couldn't init storage provider" << std::endl;
@@ -4867,7 +4874,7 @@ int main(int argc, const char **argv)
         int ret = update_period(cfgstore.get(), realm_id, realm_name,
                                 period_epoch, commit, remote, url,
                                 opt_region, access_key, secret_key,
-                                formatter.get(), yes_i_really_mean_it);
+                                formatter.get(), yes_i_really_mean_it, site.get());
 	if (ret < 0) {
 	  return -ret;
 	}
@@ -5314,7 +5321,7 @@ int main(int argc, const char **argv)
 	} else {
           ret = writer->write(dpp(), null_yield, realm);
 	  if (ret < 0) {
-	    cerr << "ERROR: couldn't driver realm info: " << cpp_strerror(-ret) << std::endl;
+	    cerr << "ERROR: couldn't write realm info: " << cpp_strerror(-ret) << std::endl;
 	    return 1;
 	  }
 	}
@@ -7017,7 +7024,7 @@ int main(int argc, const char **argv)
       int ret = update_period(cfgstore.get(), realm_id, realm_name,
                               period_epoch, commit, remote, url,
                               opt_region, access_key, secret_key,
-                              formatter.get(), yes_i_really_mean_it);
+                              formatter.get(), yes_i_really_mean_it, site.get());
       if (ret < 0) {
 	return -ret;
       }
@@ -7046,7 +7053,7 @@ int main(int argc, const char **argv)
       }
       ret = commit_period(cfgstore.get(), realm, *realm_writer, period,
                           remote, url, opt_region, access_key, secret_key,
-                          yes_i_really_mean_it);
+                          yes_i_really_mean_it, site.get());
       if (ret < 0) {
         cerr << "failed to commit period: " << cpp_strerror(-ret) << std::endl;
         return -ret;
@@ -7789,27 +7796,19 @@ int main(int argc, const char **argv)
     if (ret < 0) {
       return -ret;
     }
-    const auto& bucket_attrs = bucket->get_attrs();
-    auto iter = bucket_attrs.find(RGW_ATTR_BUCKET_LOGGING);
-    if (iter == bucket_attrs.end()) {
-      cerr << "WARNING: no logging configured on bucket" << std::endl;
+
+    rgw::bucketlogging::configuration configuration;
+    std::unique_ptr<rgw::sal::Bucket> target_bucket;
+    ret =  rgw::bucketlogging::get_target_and_conf_from_source(dpp(), driver, bucket.get(), tenant, configuration, target_bucket, null_yield);
+    if (ret < 0 && ret != -ENODATA) {
+      cerr << "ERROR: failed to get target bucket and logging conf from source bucket '"
+        << bucket_name << "': " << cpp_strerror(-ret) << std::endl;
+      return -ret;
+    } else if (ret == -ENODATA) {
+      cerr << "ERROR: bucket '" << bucket_name << "' does not have logging enabled" << std::endl;
       return 0;
     }
-    rgw::bucketlogging::configuration configuration;
-    try {
-      configuration.enabled = true;
-      decode(configuration, iter->second);
-    } catch (buffer::error& err) {
-      cerr << "ERROR: failed to decode logging attribute '" << RGW_ATTR_BUCKET_LOGGING
-        << "'. error: " << err.what() << std::endl;
-      return  EINVAL;
-    }
-    std::unique_ptr<rgw::sal::Bucket> target_bucket;
-    ret = init_bucket(tenant, configuration.target_bucket, "", &target_bucket);
-    if (ret < 0) {
-      cerr << "ERROR: failed to get target logging bucket '" << configuration.target_bucket << "'" << std::endl;
-      return -ret;
-    }
+
     std::string obj_name;
     RGWObjVersionTracker objv_tracker;
     ret = target_bucket->get_logging_object_name(obj_name, configuration.target_prefix, null_yield, dpp(), &objv_tracker);
@@ -7817,11 +7816,18 @@ int main(int argc, const char **argv)
       cerr << "ERROR: failed to get pending logging object name from target bucket '" << configuration.target_bucket << "'" << std::endl;
       return -ret;
     }
-    const auto old_obj = obj_name;
-    ret = rgw::bucketlogging::rollover_logging_object(configuration, target_bucket, obj_name, dpp(), null_yield, true, &objv_tracker);
+    std::string old_obj;
+    const auto region = driver->get_zone()->get_zonegroup().get_api_name();
+    ret = rgw::bucketlogging::rollover_logging_object(configuration, target_bucket, obj_name, dpp(), region, bucket, null_yield, true, &objv_tracker, &old_obj);
     if (ret < 0) {
-      cerr << "ERROR: failed to flush pending logging object '" << old_obj
-        << "' to target bucket '" << configuration.target_bucket << "'" << std::endl;
+      if (ret == -ENOENT) {
+        cerr << "WARNING: no pending logging object '" << obj_name << "'. nothing to flush";
+        ret = 0;
+      } else {
+        cerr << "ERROR: failed flush pending logging object '" << obj_name << "'";
+      }
+      cerr << " to target bucket '" << configuration.target_bucket << "'. "
+        << " last committed object is '" << old_obj << "'" << std::endl;
       return -ret;
     }
     cout << "flushed pending logging object '" << old_obj
@@ -9165,6 +9171,71 @@ next:
 	return 1;
       }
       RGWBucketAdminOp::remove_bucket(driver, *site, bucket_op, null_yield, dpp(), bypass_gc, false, false);
+    }
+  }
+
+  if (opt_cmd == OPT::DEDUP_STATS    ||
+      opt_cmd == OPT::DEDUP_ESTIMATE ||
+      opt_cmd == OPT::DEDUP_ABORT    ||
+      opt_cmd == OPT::DEDUP_PAUSE    ||
+      opt_cmd == OPT::DEDUP_RESUME   ||
+      opt_cmd == OPT::DEDUP_RESTART) {
+
+    using namespace rgw::dedup;
+    rgw::sal::RadosStore *store = dynamic_cast<rgw::sal::RadosStore*>(driver);
+    if (!store) {
+      cerr << "ERROR: this command can only work when the cluster has a RADOS "
+	   << "backing store." << std::endl;
+      return EPERM;
+    }
+
+    if (opt_cmd == OPT::DEDUP_STATS) {
+      int ret = cluster::collect_all_shard_stats(store, formatter.get(), dpp());
+      if (ret == 0) {
+	formatter->flush(cout);
+      }
+      else {
+	cerr << "ERROR: Failed reading stat counters" << std::endl;
+      }
+      return ret;
+    }
+
+    if (opt_cmd == OPT::DEDUP_ABORT || opt_cmd == OPT::DEDUP_PAUSE || opt_cmd == OPT::DEDUP_RESUME) {
+      urgent_msg_t urgent_msg;
+      if (opt_cmd == OPT::DEDUP_ABORT) {
+	urgent_msg = URGENT_MSG_ABORT;
+      }
+      else if (opt_cmd == OPT::DEDUP_PAUSE) {
+	urgent_msg = URGENT_MSG_PASUE;
+      }
+      else {
+	urgent_msg = URGENT_MSG_RESUME;
+      }
+      return cluster::dedup_control(store, dpp(), urgent_msg);
+    }
+
+    if (opt_cmd == OPT::DEDUP_RESTART || opt_cmd == OPT::DEDUP_ESTIMATE) {
+      dedup_req_type_t dedup_type = dedup_req_type_t::DEDUP_TYPE_NONE;
+      if (opt_cmd == OPT::DEDUP_ESTIMATE) {
+	dedup_type = dedup_req_type_t::DEDUP_TYPE_ESTIMATE;
+      }
+      else {
+	dedup_type = dedup_req_type_t::DEDUP_TYPE_FULL;
+#ifndef FULL_DEDUP_SUPPORT
+	std::cerr << "Only dedup estimate is supported!" << std::endl;
+	return EPERM;
+#endif
+      }
+
+      int ret = cluster::dedup_restart_scan(store, dedup_type, dpp());
+      if (ret == 0) {
+	std::cout << "Dedup was restarted successfully" << std::endl;
+      }
+      else {
+	std::cerr << "Dedup failed to restart" << std::endl;
+	std::cerr << "Error is: " << ret << "::" << cpp_strerror(ret) << std::endl;
+      }
+      return ret;
     }
   }
 
@@ -10906,10 +10977,13 @@ next:
     if (specified_shard_id) {
       shard = shard_id;
     }
-    ret = run_coro(datalog->admin_sem_list(shard, max_entries, marker,
+    std::string err;
+    ret = run_coro(dpp(), context_pool,
+		   datalog->admin_sem_list(shard, max_entries, marker,
 					   cout, *formatter),
-		   "datalog seamphore list");
+		   &err);
     if (ret < 0) {
+      std::cerr << "datalog semaphore list: " << err << std::endl;
       return ret;
     }
   }
@@ -10919,18 +10993,21 @@ next:
       std::cerr << "Specify the semaphore key with --marker." << std::endl;
       return -EINVAL;
     }
+    std::string errstr;
     auto datalog = static_cast<rgw::sal::RadosStore*>(driver)
       ->svc()->datalog_rados;
-    ret = run_coro(datalog->admin_sem_reset(marker, count.value_or(0)),
-		   "datalog seamphore reset");
+    ret = rgw::run_coro(dpp(), context_pool,
+			datalog->admin_sem_reset(marker, count.value_or(0)),
+			&errstr);
     if (ret < 0) {
+      std::cerr << "datalog semaphore reset: " << errstr << std::endl;
       return ret;
     }
   }
 
   if (opt_cmd == OPT::DATALOG_LIST) {
     formatter->open_array_section("entries");
-    bool truncated;
+    bool truncated = false;
     int count = 0;
     if (max_entries < 0)
       max_entries = 1000;
@@ -10958,19 +11035,28 @@ next:
     auto datalog_svc = static_cast<rgw::sal::RadosStore*>(driver)->svc()->datalog_rados;
     RGWDataChangesLogMarker log_marker;
 
+    std::string errstr;
     do {
       std::vector<rgw_data_change_log_entry> entries;
       if (specified_shard_id) {
-        ret = datalog_svc->list_entries(dpp(), shard_id, max_entries - count,
-					entries, marker,
-					&marker, &truncated,
-					null_yield);
+	ret = run_coro(
+	  dpp(),
+	  context_pool,
+	  datalog_svc->list_entries(dpp(), shard_id, max_entries - count,
+				    marker),
+	  std::tie(entries, marker, truncated),
+	  &errstr);
       } else {
-        ret = datalog_svc->list_entries(dpp(), max_entries - count, entries,
-					log_marker, &truncated, null_yield);
+	ret = run_coro(
+	  dpp(),
+	  context_pool,
+	  datalog_svc->list_entries(dpp(), max_entries - count, log_marker),
+	  std::tie(entries, log_marker, truncated),
+	  &errstr);
       }
       if (ret < 0) {
-        cerr << "ERROR: datalog_svc->list_entries(): " << cpp_strerror(-ret) << std::endl;
+        cerr << "ERROR: datalog_svc->list_entries(): " << errstr << ": "
+	     << cpp_strerror(-ret) << std::endl;
         return -ret;
       }
 
@@ -10997,9 +11083,18 @@ next:
     for (; i < g_ceph_context->_conf->rgw_data_log_num_shards; i++) {
       vector<cls::log::entry> entries;
 
+      std::string errstr;
       RGWDataChangesLogInfo info;
-      static_cast<rgw::sal::RadosStore*>(driver)->svc()->
-	datalog_rados->get_info(dpp(), i, &info, null_yield);
+
+      int r = run_coro(dpp(), context_pool,
+		       static_cast<rgw::sal::RadosStore*>(driver)->svc()->
+		       datalog_rados->get_info(dpp(), i),
+		       info, &errstr);
+
+      if (r < 0) {
+	std::cerr << "datalog status: " << errstr << std::endl;
+	return -r;
+      }
 
       ::encode_json("info", info, formatter.get());
 
@@ -11061,11 +11156,14 @@ next:
       return EINVAL;
     }
 
+    std::string errstr;
     auto datalog = static_cast<rgw::sal::RadosStore*>(driver)->svc()->datalog_rados;
-    ret = datalog->trim_entries(dpp(), shard_id, marker, null_yield);
+    ret = run_coro(dpp(), context_pool,
+		   datalog->trim_entries(dpp(), shard_id, marker),
+		   &errstr);
 
     if (ret < 0 && ret != -ENODATA) {
-      cerr << "ERROR: trim_entries(): " << cpp_strerror(-ret) << std::endl;
+      cerr << "ERROR: trim_entries(): " << errstr << std::endl;
       return -ret;
     }
   }
@@ -11076,9 +11174,12 @@ next:
       return -EINVAL;
     }
     auto datalog = static_cast<rgw::sal::RadosStore*>(driver)->svc()->datalog_rados;
-    ret = datalog->change_format(dpp(), *opt_log_type, null_yield);
+    std::string errstr;
+    ret = run_coro(dpp(), context_pool,
+		   datalog->change_format(dpp(), *opt_log_type),
+		   &errstr);
     if (ret < 0) {
-      cerr << "ERROR: change_format(): " << cpp_strerror(-ret) << std::endl;
+      cerr << "ERROR: change_format(): " << errstr << std::endl;
       return -ret;
     }
   }
@@ -11086,10 +11187,13 @@ next:
   if (opt_cmd == OPT::DATALOG_PRUNE) {
     auto datalog = static_cast<rgw::sal::RadosStore*>(driver)->svc()->datalog_rados;
     std::optional<uint64_t> through;
-    ret = datalog->trim_generations(dpp(), through, null_yield);
+    std::string errstr;
+    ret = run_coro(dpp(), context_pool,
+		   datalog->trim_generations(dpp(), through),
+		   &errstr);
 
     if (ret < 0) {
-      cerr << "ERROR: trim_generations(): " << cpp_strerror(-ret) << std::endl;
+      cerr << "ERROR: trim_generations(): " << errstr << std::endl;
       return -ret;
     }
 

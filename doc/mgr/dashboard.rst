@@ -43,8 +43,8 @@ The dashboard provides the following features:
   after the first login or after a configurable time period. See
   :ref:`dashboard-user-role-management` for details.
 * **Single Sign-On (SSO)**: The dashboard supports authentication
-  via an external identity provider using the SAML 2.0 protocol. See
-  :ref:`dashboard-sso-support` for details.
+   via an external identity provider using the SAML 2.0 protocol or thse OAuth2 protocol. See
+   :ref:dashboard-saml2-sso-support and :ref:dashboard-oauth2-sso-support for details.
 * **SSL/TLS support**: All HTTP communication between the web browser and the
   dashboard is secured via SSL. A self-signed certificate can be created with
   a built-in command, but it's also possible to import custom certificates
@@ -128,16 +128,6 @@ such as the overall cluster status, performance, and capacity. It provides real-
 updates on any changes in the cluster and allows quick access to other sections of the dashboard.
 
 .. image:: dashboard-landing-page.png
-
-
-.. note::
-  You can change the landing page to the previous version from:
-  ``Cluster >> Manager Modules >> Dashboard >> Edit``.
-  Editing the ``FEATURE_TOGGLE_DASHBOARD`` option will change the landing page, from one view to another.
-
-  Note that the previous version of the landing page will be disabled in future releases.
-
-.. _dashboard-landing-page-details:
 
 Details
 """""""
@@ -711,10 +701,10 @@ If no value is set for that option, it will simply fall back to the value of the
 GRAFANA_API_URL option. If set, it will instruct the browser to use this URL to
 access Grafana.
 
-.. _dashboard-sso-support:
+.. _dashboard-saml2-sso-support:
 
-Enabling Single Sign-On (SSO)
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Enabling SAML2 Single Sign-On (SSO)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 The Ceph Dashboard supports external authentication of users via the
 `SAML 2.0 <https://en.wikipedia.org/wiki/SAML_2.0>`_ protocol. You need to
@@ -774,6 +764,50 @@ To enable SSO:
 .. prompt:: bash #
 
    ceph dashboard sso enable saml2
+
+.. _dashboard-oauth2-sso-support:
+
+Enabling OAuth2 Single Sign-On (SSO)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The Ceph Dashboard supports external authentication of users via the
+`OAuth <https://en.wikipedia.org/wiki/OAuth>`_ protocol. You need to
+have :ref:`cephadm` enabled as your orchestrator with an active
+:ref:`deploy-cephadm-mgmt-gateway` and :ref:`deploy-cephadm-oauth2-proxy` services.
+
+From the IDP of choice, Keycloak is the current recomendation and tested solution,
+configure the IDP's client used in the `oauth2-proxy` service configuration to validate the following redirect URLs
+for login_url: `https://<host_name>|<IP_address>/oauth2/callback` and
+the following logout_url: `https://<host_name>|<IP_address>/ /oauth2/sign_out`
+
+Again, from the IDP, we will need a user with a valid role, this user will be the one to perform
+authorization against, we can create a role like: 'administator' to give admin level access to the user.
+
+Make certain that the ``enable_auth`` flag has been included in the ``ceph orch
+apply mgmt-gateway`` command and that it has been set to ``true`` by running a
+command of the following form:
+
+.. prompt:: bash $
+
+   ceph orch apply mgmt-gateway --enable_auth=true --placement=<ceph-node-02>
+
+To disable SSO:
+
+.. prompt:: bash $
+
+   ceph dashboard sso disable
+
+To check if SSO is enabled:
+
+.. prompt:: bash $
+
+   ceph dashboard sso status
+
+To enable SSO:
+
+.. prompt:: bash $
+
+   ceph dashboard sso enable oauth2
 
 .. _dashboard-alerting:
 
@@ -1582,21 +1616,20 @@ debugging.
 
      .. prompt:: bash #
 
-        bin/ceph config set mgr mgr/dashboard/log_level debug
+        ceph config set mgr mgr/dashboard/log_level debug
 
 3. High log levels can result in considerable log volume, which can
-easily fill up your filesystem. Set a calendar reminder for an hour, a day,
-or a week in the future to revert this temporary logging increase.  This looks
-something like this:
+easily fill up your filesystem or central log store. Set a calendar reminder for an hour, a day,
+or a week in the future to revert a temporary logging increase. Any current, non-default setting
+may be shown with the below command:
 
    .. prompt:: bash #
 
-      ceph config log
+      ceph config dump | grep mgr/dashboard/log_level
 
    ::
-
       ...
-      --- 11 --- 2020-11-07 11:11:11.960659 --- mgr.x/dashboard/log_level = debug ---
+      mgr advanced  mgr/dashboard/log_level debug
       ...
     
    .. prompt:: bash #

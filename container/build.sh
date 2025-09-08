@@ -120,8 +120,9 @@ podman build --pull=newer --squash -f $CFILE -t build.sh.output \
     --build-arg CEPH_REF=${BRANCH:-main} \
     --build-arg OSD_FLAVOR=${FLAVOR:-default} \
     --build-arg CI_CONTAINER=${CI_CONTAINER:-default} \
+    --build-arg CUSTOM_CEPH_REPO_URL="${CUSTOM_CEPH_REPO_URL}" \
     --secret=id=prerelease_creds,src=./prerelease.secret.txt \
-    2>&1 
+    2>&1
 
 rm ./prerelease.secret.txt
 
@@ -174,7 +175,7 @@ if [[ ${CI_CONTAINER} == "true" ]] ; then
     podman tag ${image_id} ${branch_repo_tag}
     podman tag ${image_id} ${sha1_repo_tag}
 
-    if [[ ${FLAVOR} == "crimson" && ${ARCH} == "x86_64" ]] ; then
+    if [[ (${FLAVOR} == "crimson-debug" || ${FLAVOR} == "crimson-release") && ${ARCH} == "x86_64" ]] ; then
         sha1_flavor_repo_tag=${sha1_repo_tag}-${FLAVOR}
         podman tag ${image_id} ${sha1_flavor_repo_tag}
         if [[ -z "${NO_PUSH}" ]] ; then

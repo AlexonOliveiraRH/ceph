@@ -6,7 +6,9 @@ import { Observable, of as observableOf } from 'rxjs';
 import { catchError, mapTo } from 'rxjs/operators';
 import { CephServiceSpec } from '../models/service.interface';
 
-export const MAX_NAMESPACE = 1024;
+export const MAX_NAMESPACE = 4096;
+
+export type GatewayGroup = CephServiceSpec;
 
 export type GroupsComboboxItem = {
   content: string;
@@ -28,6 +30,7 @@ export type NamespaceCreateRequest = NvmeofRequest & {
   rbd_image_name: string;
   rbd_pool: string;
   rbd_image_size?: number;
+  create_image: boolean;
 };
 
 export type NamespaceUpdateRequest = NvmeofRequest & {
@@ -71,7 +74,7 @@ export class NvmeofService {
 
   // Gateway groups
   listGatewayGroups() {
-    return this.http.get(`${API_PATH}/gateway/group`);
+    return this.http.get<GatewayGroup[][]>(`${API_PATH}/gateway/group`);
   }
 
   // Gateways
@@ -157,7 +160,8 @@ export class NvmeofService {
         observe: 'response',
         params: {
           gw_group: group,
-          trsvcid
+          trsvcid,
+          force: 'true'
         }
       }
     );

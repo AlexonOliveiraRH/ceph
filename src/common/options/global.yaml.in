@@ -433,6 +433,14 @@ options:
   flags:
   - startup
   with_legacy: true
+- name: breakpad
+  type: bool
+  level: advanced
+  desc: setup breakpad crash handler
+  default: false
+  flags:
+  - startup
+  with_legacy: true
 - name: crash_dir
   type: str
   level: advanced
@@ -814,14 +822,13 @@ options:
   desc: Crypto accelerator library to use
   default: crypto_isal
   with_legacy: true
-- name: openssl_engine_opts
+- name: openssl_conf
   type: str
   level: advanced
-  desc: Use engine for specific openssl algorithm
-  long_desc: 'Pass opts in this way: engine_id=engine1,dynamic_path=/some/path/engine1.so,default_algorithms=DIGESTS:engine_id=engine2,dynamic_path=/some/path/engine2.so,default_algorithms=CIPHERS,other_ctrl=other_value'
+  desc: Use openssl_conf for specific openssl algorithm
+  long_desc: 'Pass opts in this way: openssl_conf=/path/to/openssl.conf'
   flags:
   - startup
-  with_legacy: true
 - name: mempool_debug
   type: bool
   level: dev
@@ -4121,7 +4128,7 @@ options:
   default: false
   with_legacy: true
 - name: bdev_enable_discard
-  desc: send discards to the block device
+  desc: enable OSD devices trimming during in runtime
   type: bool
   level: advanced
   default: false
@@ -4130,6 +4137,7 @@ options:
   - runtime
   see_also:
   - bdev_async_discard_threads
+  - bluestore_discard_on_mkfs
 - name: bdev_async_discard_threads
   desc: number of discard threads used to issue discards to the device
   type: uint
@@ -4158,6 +4166,16 @@ options:
   - runtime
   see_also:
   - bdev_async_discard_threads
+- name: bdev_max_discard_length
+  desc: maximum length of a single discard request
+  type: uint
+  level: advanced
+  default: 2147483648
+  with_legacy: true
+  flags:
+  - runtime
+  see_also:
+  - bdev_enable_discard
 - name: bdev_flock_retry_interval
   type: float
   level: advanced
@@ -4887,6 +4905,14 @@ options:
   desc: Preallocated buffer for inline shards
   default: 256
   with_legacy: true
+- name: bluestore_debug_extent_map_encode_check
+  type: bool
+  level: dev
+  desc: Check correctness of extents in encode_some
+  default: false
+  with_legacy: false
+  flags:
+  - startup
 - name: bluestore_cache_trim_interval
   type: float
   level: advanced
@@ -5306,6 +5332,16 @@ options:
   desc: Run deep fsck after mkfs
   default: false
   with_legacy: true
+- name: bluestore_discard_on_mkfs
+  desc: trim OSD devices after deployment
+  type: bool
+  level: advanced
+  default: true
+  with_legacy: false
+  flags:
+  - create
+  see_also:
+  - bdev_enable_discard
 - name: bluestore_sync_submit_transaction
   type: bool
   level: dev
@@ -5585,7 +5621,7 @@ options:
 - name: bluestore_slow_ops_warn_threshold
   type: uint
   level: advanced
-  desc: Set the minimum number of BluesStore slow ops before raising a health warning state
+  desc: Set the minimum number of BlueStore slow ops before raising a health warning state
   default: 1
   with_legacy: true
   see_also:
@@ -6731,6 +6767,27 @@ options:
   level: advanced
   desc: A configurable number for stalled read warning to be appeared if number of stalled read occurence pass `bdev_stalled_read_warn_threshold` in `bdev_stalled_read_warn_lifetime` seconds
   default: 1
+  with_legacy: true
+- name: bdev_discard_max_bytes
+  type: size
+  level: advanced
+  desc: Discard queue size in bytes that triggers health warning
+  long_desc: This parameter sets a threshold for the discard queue size (in bytes), triggering a health
+    warning when the queue exceeds the specified limit. This is particularly useful for devices with
+    slow discard operations, as a large backlog in the queue can block disk space that is marked as free
+    but not yet available for allocation, impacting system performance and storage efficiency.
+    `bdev_async_discard_max_pending` is measured in items, not bytes, so its value does not directly
+    correspond to the discard queue size in bytes.
+  default: 10_G
+  with_legacy: true
+  see_also:
+  - bdev_async_discard_max_pending
+- name: bdev_debug_discard_sleep
+  type: uint
+  level: dev
+  desc: A debugging tool to simulate slow discard operations by introducing a delay of
+    `bdev_debug_discard_sleep` milliseconds
+  default: 0
   with_legacy: true
 - name: bluestore_cleaner_sleep_interval
   type: float

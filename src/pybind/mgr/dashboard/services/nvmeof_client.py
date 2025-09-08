@@ -1,13 +1,24 @@
+# pylint: disable=unexpected-keyword-arg
+
 import functools
 import logging
-from typing import Any, Callable, Dict, Generator, List, NamedTuple, Optional, Type
+from typing import Annotated, Any, Callable, Dict, Generator, List, \
+    NamedTuple, Optional, Type, get_args, get_origin
 
 from ..exceptions import DashboardException
-from .nvmeof_conf import NvmeofGatewaysConfig
+from .nvmeof_conf import NvmeofGatewaysConfig, is_mtls_enabled
 
 logger = logging.getLogger("nvmeof_client")
 
 try:
+    # if the protobuf version is newer than what we generated with
+    # proto file import will fail (because of differences between what's
+    # available in centos and ubuntu).
+    # this "hack" should be removed once we update both the
+    # distros; centos and ubuntu.
+    import os
+    os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
+
     import grpc  # type: ignore
     import grpc._channel  # type: ignore
     from google.protobuf.json_format import MessageToDict  # type: ignore
@@ -26,11 +37,12 @@ else:
             logger.info("Initiating nvmeof gateway connection...")
             try:
                 if not gw_group:
-                    service_name, self.gateway_addr = NvmeofGatewaysConfig.get_service_info()
+                    res = NvmeofGatewaysConfig.get_service_info()
                 else:
-                    service_name, self.gateway_addr = NvmeofGatewaysConfig.get_service_info(
-                        gw_group
-                    )
+                    res = NvmeofGatewaysConfig.get_service_info(gw_group)
+                if res is None:
+                    raise DashboardException("Gateway group does not exists")
+                service_name, self.gateway_addr = res
             except TypeError as e:
                 raise DashboardException(
                     f'Unable to retrieve the gateway info: {e}'
@@ -52,16 +64,14 @@ else:
                 if matched_gateway:
                     self.gateway_addr = matched_gateway.get('service_url')
                     logger.debug("Gateway address set to: %s", self.gateway_addr)
-
-            root_ca_cert = NvmeofGatewaysConfig.get_root_ca_cert(service_name)
-            if root_ca_cert:
+            enable_auth = is_mtls_enabled(service_name)
+            if enable_auth:
                 client_key = NvmeofGatewaysConfig.get_client_key(service_name)
                 client_cert = NvmeofGatewaysConfig.get_client_cert(service_name)
-
-            if root_ca_cert and client_key and client_cert:
+                server_cert = NvmeofGatewaysConfig.get_server_cert(service_name)
                 logger.info('Securely connecting to: %s', self.gateway_addr)
                 credentials = grpc.ssl_channel_credentials(
-                    root_certificates=root_ca_cert,
+                    root_certificates=server_cert,
                     private_key=client_key,
                     certificate_chain=client_cert,
                 )
@@ -151,10 +161,13 @@ else:
 
     def _lazily_create_namedtuple(data: Any, target_type: Type[NamedTuple],
                                   depth: int, max_depth: int) -> Generator:
+        # pylint: disable=protected-access
         """ Lazily create NamedTuple from a dict """
         field_values = {}
         for field, field_type in zip(target_type._fields,
                                      target_type.__annotations__.values()):
+            if get_origin(field_type) == Annotated:
+                field_type = get_args(field_type)[0]
             # these conditions are complex since we need to navigate between dicts,
             # empty dicts and objects
             if isinstance(data, dict) and data.get(field) is not None:
@@ -170,8 +183,7 @@ else:
                 except StopIteration:
                     return
             else:
-                # If the field is missing assign None
-                field_values[field] = None
+                field_values[field] = target_type._field_defaults.get(field)
 
         namedtuple_instance = target_type(**field_values)  # type: ignore
         yield namedtuple_instance
@@ -220,7 +232,7 @@ else:
             def wrapper(*args, **kwargs) -> Model:
                 message = func(*args, **kwargs)
                 msg_dict = MessageToDict(message, including_default_value_fields=True,
-                                         preserving_proto_field_name=True)
+                                         preserving_proto_field_name=True)  # type: ignore
 
                 result = namedtuple_to_dict(obj_to_namedtuple(msg_dict, model))
                 if finalize:

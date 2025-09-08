@@ -22,11 +22,13 @@
 #include <string>
 #include <ranges>
 #include <string_view>
+#include <vector>
 
 #include <errno.h>
 
 #include "include/types.h"
 #include "include/ceph_features.h"
+#include "include/cephfs/types.h" // for mds_gid_t, mds_rank_t, MAX_MDS
 #include "include/health.h"
 #include "include/CompatSet.h"
 #include "include/common_fwd.h"
@@ -35,7 +37,7 @@
 #include "common/ceph_releases.h"
 #include "common/config.h"
 
-#include "mds/mdstypes.h"
+#include "mds/mdstypes.h" // feature_bitset_t
 
 namespace ceph { class Formatter; }
 
@@ -150,7 +152,7 @@ public:
     // The long form name for use in cluster log messages`
     std::string human_name() const;
 
-    static void generate_test_instances(std::list<mds_info_t*>& ls);
+    static std::list<mds_info_t> generate_test_instances();
 
     mds_gid_t global_id = MDS_GID_NONE;
     std::string name;
@@ -584,7 +586,7 @@ public:
 
   void dump(ceph::Formatter *f) const;
   void dump_flags_state(Formatter *f) const;
-  static void generate_test_instances(std::list<MDSMap*>& ls);
+  static std::list<MDSMap> generate_test_instances();
 
   static bool state_transition_valid(DaemonState prev, DaemonState next);
 

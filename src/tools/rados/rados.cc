@@ -24,6 +24,7 @@
  using namespace libradosstriper;
 #endif
 
+#include "common/Clock.h" // for ceph_clock_now()
 #include "common/config.h"
 #include "common/ceph_argparse.h"
 #include "global/global_init.h"
@@ -60,7 +61,7 @@
 #include "PoolDump.h"
 #include "RadosImport.h"
 
-#include "osd/ECUtil.h"
+#include "osd/ECUtilL.h" // For hinfo in legacy EC
 #include "objclass/objclass.h"
 #include "cls/refcount/cls_refcount_ops.h"
 
@@ -1643,10 +1644,10 @@ static void dump_shard(const shard_info_t& shard,
        || inc.union_shards.has_hinfo_corrupted()
        || inc.has_hinfo_inconsistency()) &&
        !shard.has_hinfo_missing()) {
-    map<std::string, ceph::bufferlist>::iterator k = (const_cast<shard_info_t&>(shard)).attrs.find(ECUtil::get_hinfo_key());
+    map<std::string, ceph::bufferlist>::iterator k = (const_cast<shard_info_t&>(shard)).attrs.find(ECLegacy::ECUtilL::get_hinfo_key());
     ceph_assert(k != shard.attrs.end()); // Can't be missing
     if (!shard.has_hinfo_corrupted()) {
-      ECUtil::HashInfo hi;
+      ECLegacy::ECUtilL::HashInfo hi;
       bufferlist bl;
       auto bliter = k->second.cbegin();
       decode(hi, bliter);  // Can't be corrupted
@@ -2533,7 +2534,8 @@ static int rados_tool_common(const std::map < std::string, std::string > &opts,
 #endif // WITH_LIBRADOSSTRIPER
           if (pgid) {
             uint32_t ps;
-            if (io_ctx.get_object_pg_hash_position2(i->get_oid(), &ps) || pgid->ps() != ps) {
+            if (const auto& key = i->get_locator().size() ? i->get_locator() : i->get_oid();
+		io_ctx.get_object_pg_hash_position2(key, &ps) || pgid->ps() != ps) {
               break;
 	    }
           }

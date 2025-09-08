@@ -21,6 +21,7 @@
 
 #include "common/config_fwd.h"
 #include "common/ceph_releases.h"
+#include "include/types.h" // for epoch_t
 #include "include/uuid.h" // for uuid_d
 
 #include "mon/mon_types.h" // for mon_feature_t
@@ -89,14 +90,9 @@ struct mon_info_t {
   void decode(ceph::buffer::list::const_iterator& p);
   void print(std::ostream& out) const;
   void dump(ceph::Formatter *f) const;
-  static void generate_test_instances(std::list<mon_info_t*>& ls);
+  static std::list<mon_info_t> generate_test_instances();
 };
 WRITE_CLASS_ENCODER_FEATURES(mon_info_t)
-
-inline std::ostream& operator<<(std::ostream& out, const mon_info_t& mon) {
-  mon.print(out);
-  return out;
-}
 
 class MonMap {
  public:
@@ -490,7 +486,7 @@ public:
 
   void check_health(health_check_map_t *checks) const;
 
-  static void generate_test_instances(std::list<MonMap*>& o);
+  static std::list<MonMap> generate_test_instances();
 protected:
   /**
    * build a monmap from a list of entity_addrvec_t's

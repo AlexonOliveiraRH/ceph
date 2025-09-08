@@ -39,6 +39,8 @@ NVMeofGwMonitorClient::NVMeofGwMonitorClient(int argc, const char **argv) :
   osdmap_epoch(0),
   gwmap_epoch(0),
   last_map_time(std::chrono::steady_clock::now()),
+  reset_timestamp(std::chrono::steady_clock::now()),
+  start_time(last_map_time),
   monc{g_ceph_context, poolctx},
   client_messenger(Messenger::create(g_ceph_context, "async", entity_name_t::CLIENT(-1), "client", getpid())),
   objecter{g_ceph_context, client_messenger.get(), &monc, poolctx},
@@ -262,10 +264,27 @@ void NVMeofGwMonitorClient::disconnect_panic()
   }
 }
 
+void NVMeofGwMonitorClient::connect_panic()
+{
+  // Return immediately if the gateway was assigned group ID by the monitor
+  if (set_group_id) {
+    return;
+  }
+  // If the gateway has not been assigned a group ID, panic after timeout
+  auto connect_panic_duration = g_conf().get_val<std::chrono::seconds>("nvmeof_mon_client_connect_panic").count();
+  auto now = std::chrono::steady_clock::now();
+  auto elapsed_seconds = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
+  if (elapsed_seconds > connect_panic_duration) {
+    dout(4) << "Triggering a panic: did not receive initial map from monitor, elapsed " << elapsed_seconds << ", configured connect panic duration " << connect_panic_duration << " seconds." << dendl;
+    throw std::runtime_error("Did not receive initial map from monitor (connect panic).");
+  }
+}
+
 void NVMeofGwMonitorClient::tick()
 {
   dout(10) << dendl;
 
+  connect_panic();
   disconnect_panic();
   send_beacon();
   first_beacon = false;
@@ -304,18 +323,32 @@ void NVMeofGwMonitorClient::shutdown()
 
 void NVMeofGwMonitorClient::handle_nvmeof_gw_map(ceph::ref_t<MNVMeofGwMap> nmap)
 {
-  last_map_time = std::chrono::steady_clock::now(); // record time of last monitor message
+  auto now = std::chrono::steady_clock::now();
+  last_map_time = now; // record time of last monitor message
 
   auto &new_map = nmap->get_map();
   gwmap_epoch = nmap->get_gwmap_epoch();
   auto group_key = std::make_pair(pool, group);
   dout(10) << "handle nvmeof gw map: " << new_map << dendl;
-
+  uint64_t reset_elapsed_seconds =
+      std::chrono::duration_cast<std::chrono::seconds>(now - reset_timestamp).count();
   NvmeGwClientState old_gw_state;
+  uint64_t ignore_wrong_map_interval_sec =
+       g_conf().get_val<uint64_t>("mon_nvmeofgw_wrong_map_ignore_sec");
   auto got_old_gw_state = get_gw_state("old map", map, group_key, name, old_gw_state); 
   NvmeGwClientState new_gw_state;
   auto got_new_gw_state = get_gw_state("new map", new_map, group_key, name, new_gw_state); 
 
+  /*It is possible that wrong second map would be sent by monitor in rear cases when several GWs doing reboot
+  * and entity_address of the monitor client changes. So Monitor may send the unicast map to the wrong destination
+  * since this "old" address still appears in its map. It is asynchronous process in the monitor, better to protect
+  * from this scenario by silently ignoring the wrong map. This can happen just in the first several seconds after restart
+  */
+  if ( (reset_elapsed_seconds < ignore_wrong_map_interval_sec) &&
+        !got_new_gw_state && got_old_gw_state) {
+    dout(4) << "Wrong map received, Ignore it" << dendl;
+    return;
+  }
   // ensure that the gateway state has not vanished
   ceph_assert(got_new_gw_state || !got_old_gw_state);
 
@@ -324,7 +357,7 @@ void NVMeofGwMonitorClient::handle_nvmeof_gw_map(ceph::ref_t<MNVMeofGwMap> nmap)
       dout(10) << "Can not find new gw state" << dendl;
       return;
     }
-    bool set_group_id = false;
+    ceph_assert(!set_group_id);
     while (!set_group_id) {
       NVMeofGwMonitorGroupClient monitor_group_client(
           grpc::CreateChannel(monitor_address, gw_creds()));

@@ -34,8 +34,7 @@ namespace Scrub {
  *
  * 'after_repair' - triggered immediately after a recovery process
  *   ('m_after_repair_scrub_required' was set).
- *   This type of scrub is always deep.
- *   (note: this urgency level is not implemented in this commit)
+ *   This type of scrub is always deep, and never auto-repairs.
  *
  * 'repairing' - the target is currently being deep-scrubbed with the repair
  *   flag set. Triggered by a previous shallow scrub that ended with errors.
@@ -211,7 +210,7 @@ struct formatter<Scrub::SchedEntry> {
   auto format(const Scrub::SchedEntry& st, FormatContext& ctx) const
   {
     return fmt::format_to(
-	ctx.out(), "{}/{},nb:{:s},({},tr:{:s})", st.pgid,
+	ctx.out(), "{}/{},nb:{:s},({},tr:{:s})", st.pgid.pgid,
 	(st.level == scrub_level_t::deep ? "dp" : "sh"), st.schedule.not_before,
 	st.urgency, st.schedule.scheduled_at);
   }

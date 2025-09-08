@@ -87,7 +87,8 @@ using ceph::crypto::MD5;
 #define RGW_ATTR_LC		RGW_ATTR_PREFIX "lc"
 #define RGW_ATTR_CORS		RGW_ATTR_PREFIX "cors"
 #define RGW_ATTR_ETAG RGW_ATTR_PREFIX "etag"
-#define RGW_ATTR_CKSUM    	RGW_ATTR_PREFIX "cksum"
+#define RGW_ATTR_CKSUM          RGW_ATTR_PREFIX "cksum"
+#define RGW_ATTR_SHA256         RGW_ATTR_PREFIX "x-amz-content-sha256"
 #define RGW_ATTR_BUCKETS	RGW_ATTR_PREFIX "buckets"
 #define RGW_ATTR_META_PREFIX	RGW_ATTR_PREFIX RGW_AMZ_META_PREFIX
 #define RGW_ATTR_CONTENT_TYPE	RGW_ATTR_PREFIX "content_type"
@@ -102,6 +103,7 @@ using ceph::crypto::MD5;
 #define RGW_ATTR_SHADOW_OBJ    	RGW_ATTR_PREFIX "shadow_name"
 #define RGW_ATTR_MANIFEST    	RGW_ATTR_PREFIX "manifest"
 #define RGW_ATTR_USER_MANIFEST  RGW_ATTR_PREFIX "user_manifest"
+#define RGW_ATTR_SHARE_MANIFEST RGW_ATTR_PREFIX "shared_manifest"
 #define RGW_ATTR_AMZ_WEBSITE_REDIRECT_LOCATION	RGW_ATTR_PREFIX RGW_AMZ_WEBSITE_REDIRECT_LOCATION
 #define RGW_ATTR_SLO_MANIFEST   RGW_ATTR_PREFIX "slo_manifest"
 /* Information whether an object is SLO or not must be exposed to
@@ -110,6 +112,7 @@ using ceph::crypto::MD5;
 #define RGW_ATTR_X_ROBOTS_TAG	RGW_ATTR_PREFIX "x-robots-tag"
 #define RGW_ATTR_STORAGE_CLASS  RGW_ATTR_PREFIX "storage_class"
 #define RGW_ATTR_BUCKET_LOGGING RGW_ATTR_PREFIX "logging"
+#define RGW_ATTR_BUCKET_LOGGING_MTIME RGW_ATTR_PREFIX "logging-mtime"
 #define RGW_ATTR_BUCKET_LOGGING_SOURCES RGW_ATTR_PREFIX "logging-sources"
 
 /* S3 Object Lock*/
@@ -796,7 +799,7 @@ struct RGWUserInfo
     DECODE_FINISH(bl);
   }
   void dump(Formatter *f) const;
-  static void generate_test_instances(std::list<RGWUserInfo*>& o);
+  static std::list<RGWUserInfo> generate_test_instances();
 
   void decode_json(JSONObj *obj);
 };
@@ -862,7 +865,7 @@ struct RGWAccountInfo {
 
   void dump(Formatter* f) const;
   void decode_json(JSONObj* obj);
-  static void generate_test_instances(std::list<RGWAccountInfo*>& o);
+  static std::list<RGWAccountInfo> generate_test_instances();
 };
 WRITE_CLASS_ENCODER(RGWAccountInfo)
 
@@ -896,7 +899,7 @@ struct RGWGroupInfo {
 
   void dump(Formatter* f) const;
   void decode_json(JSONObj* obj);
-  static void generate_test_instances(std::list<RGWGroupInfo*>& o);
+  static std::list<RGWGroupInfo> generate_test_instances();
 };
 WRITE_CLASS_ENCODER(RGWGroupInfo)
 
@@ -1106,7 +1109,7 @@ struct RGWBucketInfo {
   void encode(bufferlist& bl) const;
   void decode(bufferlist::const_iterator& bl);
   void dump(Formatter *f) const;
-  static void generate_test_instances(std::list<RGWBucketInfo*>& o);
+  static std::list<RGWBucketInfo> generate_test_instances();
 
   void decode_json(JSONObj *obj);
 
@@ -1203,7 +1206,7 @@ struct RGWBucketEntryPoint
 
   void dump(Formatter *f) const;
   void decode_json(JSONObj *obj);
-  static void generate_test_instances(std::list<RGWBucketEntryPoint*>& o);
+  static std::list<RGWBucketEntryPoint> generate_test_instances();
 };
 WRITE_CLASS_ENCODER(RGWBucketEntryPoint)
 
@@ -1252,7 +1255,7 @@ struct req_info {
   meta_map_t crypt_attribute_map;
 
   std::string host;
-  const char *method;
+  const char *method = nullptr;
   std::string script_uri;
   std::string request_uri;
   std::string request_uri_aws4;
@@ -1386,6 +1389,7 @@ struct req_state : DoutPrefixProvider {
 
   std::string canned_acl;
   bool has_acl_header{false};
+  bool granted_by_acl{false};
   bool local_source{false}; /* source is local */
 
   int prot_flags{0};
@@ -1530,7 +1534,7 @@ struct RGWBucketEnt {
     DECODE_FINISH(bl);
   }
   void dump(Formatter *f) const;
-  static void generate_test_instances(std::list<RGWBucketEnt*>& o);
+  static std::list<RGWBucketEnt> generate_test_instances();
 };
 WRITE_CLASS_ENCODER(RGWBucketEnt)
 
@@ -1596,11 +1600,13 @@ struct multipart_upload_info
     dest_placement.dump(f);
   }
 
-  static void generate_test_instances(std::list<multipart_upload_info*>& o) {
-    o.push_back(new multipart_upload_info);
-    o.push_back(new multipart_upload_info);
-    o.back()->dest_placement.name = "dest_placement";
-    o.back()->dest_placement.storage_class = "dest_storage_class";
+  static std::list<multipart_upload_info> generate_test_instances() {
+    std::list<multipart_upload_info> o;
+    o.push_back(multipart_upload_info{});
+    o.push_back(multipart_upload_info{});
+    o.back().dest_placement.name = "dest_placement";
+    o.back().dest_placement.storage_class = "dest_storage_class";
+    return o;
   }
 };
 WRITE_CLASS_ENCODER(multipart_upload_info)
@@ -1754,7 +1760,7 @@ bool verify_bucket_permission_no_policy(
   const perm_state_base * const s,
   const RGWAccessControlPolicy& user_acl,
   const RGWAccessControlPolicy& bucket_acl,
-  const int perm);
+  const int perm, bool* granted_by_acl = nullptr);
 
 bool verify_user_permission_no_policy(const DoutPrefixProvider* dpp,
                                       struct perm_state_base * const s,
@@ -1766,7 +1772,8 @@ bool verify_object_permission_no_policy(const DoutPrefixProvider* dpp,
 					const RGWAccessControlPolicy& user_acl,
 					const RGWAccessControlPolicy& bucket_acl,
 					const RGWAccessControlPolicy& object_acl,
-					const int perm);
+					const int perm,
+                                        bool *granted_by_acl = nullptr);
 
 // determine whether a request is allowed or denied within an account
 rgw::IAM::Effect evaluate_iam_policies(
@@ -1795,7 +1802,7 @@ bool verify_bucket_permission(const DoutPrefixProvider* dpp,
 			      const boost::optional<rgw::IAM::Policy>& bucket_policy,
                               const std::vector<rgw::IAM::Policy>& identity_policies,
                               const std::vector<rgw::IAM::Policy>& session_policies,
-                              const uint64_t op);
+                              const uint64_t op, bool *granted_by_acl = nullptr);
 bool verify_bucket_permission(
   const DoutPrefixProvider* dpp,
   req_state * const s,

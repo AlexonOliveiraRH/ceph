@@ -31,6 +31,7 @@
 #include "include/str_list.h"
 #include "include/stringify.h"
 #include "include/object.h"
+#include "log/Log.h"
 #include "messages/MMonMap.h"
 #include "msg/Messenger.h"
 #include "include/ceph_assert.h"
@@ -1314,21 +1315,21 @@ extern "C" int ceph_chmodat(struct ceph_mount_info *cmount, int dirfd, const cha
 }
 
 extern "C" int ceph_chown(struct ceph_mount_info *cmount, const char *path,
-			  int uid, int gid)
+			  uid_t uid, gid_t gid)
 {
   if (!cmount->is_mounted())
     return -ENOTCONN;
   return cmount->get_client()->chown(path, uid, gid, cmount->default_perms);
 }
 extern "C" int ceph_fchown(struct ceph_mount_info *cmount, int fd,
-			   int uid, int gid)
+			   uid_t uid, gid_t gid)
 {
   if (!cmount->is_mounted())
     return -ENOTCONN;
   return cmount->get_client()->fchown(fd, uid, gid, cmount->default_perms);
 }
 extern "C" int ceph_lchown(struct ceph_mount_info *cmount, const char *path,
-			   int uid, int gid)
+			   uid_t uid, gid_t gid)
 {
   if (!cmount->is_mounted())
     return -ENOTCONN;
@@ -1403,6 +1404,22 @@ extern "C" int ceph_flock(struct ceph_mount_info *cmount, int fd, int operation,
   if (!cmount->is_mounted())
     return -ENOTCONN;
   return cmount->get_client()->flock(fd, operation, owner);
+}
+
+extern "C" int ceph_getlk(struct ceph_mount_info *cmount, int fd, struct flock *fl,
+			  uint64_t owner)
+{
+  if (!cmount->is_mounted())
+    return -ENOTCONN;
+  return cmount->get_client()->getlk(fd, fl, owner);
+}
+
+extern "C" int ceph_setlk(struct ceph_mount_info *cmount, int fd, struct flock *fl,
+			  uint64_t owner, int sleep)
+{
+  if (!cmount->is_mounted())
+    return -ENOTCONN;
+  return cmount->get_client()->setlk(fd, fl, owner, sleep);
 }
 
 extern "C" int ceph_truncate(struct ceph_mount_info *cmount, const char *path,
@@ -2042,6 +2059,11 @@ extern "C" int ceph_ll_lookup(struct ceph_mount_info *cmount,
 					    flags, *perms);
 }
 
+extern "C" void ceph_ll_get(class ceph_mount_info *cmount, Inode *in)
+{
+  cmount->get_client()->ll_get(in);
+}
+
 extern "C" int ceph_ll_put(class ceph_mount_info *cmount, Inode *in)
 {
   return (cmount->get_client()->ll_put(in));
@@ -2539,4 +2561,15 @@ extern "C" void ceph_free_snap_info_buffer(struct snap_info *snap_info) {
     free((void *)snap_info->snap_metadata[i].key); // malloc'd memory is key+value composite
   }
   free(snap_info->snap_metadata);
+}
+
+extern "C" int ceph_get_perf_counters(struct ceph_mount_info *cmount, char **perf_dump) {
+  bufferlist outbl;
+  int r = cmount->get_client()->get_perf_counters(&outbl);
+  if (r != 0) {
+    return r;
+  }
+
+  do_out_buffer(outbl, perf_dump, NULL);
+  return outbl.length();
 }

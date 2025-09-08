@@ -17,6 +17,8 @@
 #include "common/Formatter.h"
 #include "include/denc.h"
 
+#include <dirent.h> // for DT_DIR
+
 void Anchor::encode(bufferlist &bl) const
 {
   ENCODE_START(2, 1, bl);
@@ -50,14 +52,16 @@ void Anchor::dump(Formatter *f) const
   f->dump_unsigned("d_type", d_type);
 }
 
-void Anchor::generate_test_instances(std::list<Anchor*>& ls)
+std::list<Anchor> Anchor::generate_test_instances()
 {
-  ls.push_back(new Anchor);
-  ls.push_back(new Anchor);
-  ls.back()->ino = 1;
-  ls.back()->dirino = 2;
-  ls.back()->d_name = "hello";
-  ls.back()->d_type = DT_DIR;
+  std::list<Anchor> ls;
+  ls.push_back(Anchor{});
+  ls.push_back(Anchor{});
+  ls.back().ino = 1;
+  ls.back().dirino = 2;
+  ls.back().d_name = "hello";
+  ls.back().d_type = DT_DIR;
+  return ls;
 }
 
 std::ostream& operator<<(std::ostream& out, const Anchor &a)

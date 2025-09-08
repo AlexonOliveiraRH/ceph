@@ -630,6 +630,7 @@ void SessionMapStore::decode_legacy(bufferlist::const_iterator& p)
 void Session::dump(Formatter *f, bool cap_dump) const
 {
   f->dump_int("id", info.inst.name.num());
+  f->dump_object("auth_name", info.auth_name);
   f->dump_object("entity", info.inst);
   f->dump_string("state", get_state_name());
   f->dump_int("num_leases", leases.size());
@@ -699,10 +700,12 @@ Session* SessionMapStore::get_or_add_session(const entity_inst_t& i) {
   return s;
 }
 
-void SessionMapStore::generate_test_instances(std::list<SessionMapStore*>& ls)
+std::list<SessionMapStore> SessionMapStore::generate_test_instances()
 {
+  std::list<SessionMapStore> ls;
   // pretty boring for now
-  ls.push_back(new SessionMapStore());
+  ls.push_back(SessionMapStore());
+  return ls;
 }
 
 void SessionMap::wipe()
@@ -1086,7 +1089,7 @@ void Session::decode(bufferlist::const_iterator &p)
   _update_human_name();
 }
 
-int Session::check_access(CInode *in, unsigned mask,
+int Session::check_access(std::string_view fs_name, CInode *in, unsigned mask,
 			  int caller_uid, int caller_gid,
 			  const vector<uint64_t> *caller_gid_list,
 			  int new_uid, int new_gid)
@@ -1137,7 +1140,7 @@ int Session::check_access(CInode *in, unsigned mask,
     return -EIO;
   }
 
-  if (!auth_caps.is_capable(path, inode->uid, inode->gid, inode->mode,
+  if (!auth_caps.is_capable(fs_name, path, inode->uid, inode->gid, inode->mode,
 			    caller_uid, caller_gid, caller_gid_list, mask,
 			    new_uid, new_gid,
 			    info.inst.addr)) {
@@ -1148,9 +1151,11 @@ int Session::check_access(CInode *in, unsigned mask,
 
 // track total and per session load
 void SessionMap::hit_session(Session *session) {
-  uint64_t sessions = get_session_count_in_state(Session::STATE_OPEN) +
+  uint64_t sessions = get_session_count_in_state(Session::STATE_OPENING) +
+                      get_session_count_in_state(Session::STATE_OPEN) +
                       get_session_count_in_state(Session::STATE_STALE) +
-                      get_session_count_in_state(Session::STATE_CLOSING);
+                      get_session_count_in_state(Session::STATE_CLOSING) +
+                      get_session_count_in_state(Session::STATE_KILLING);
   ceph_assert(sessions != 0);
 
   double total_load = total_load_avg.hit();

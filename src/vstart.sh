@@ -279,6 +279,7 @@ options:
 	--crimson-alien-num-cores: number of cpus to use for alien threads
 	--crimson-alienstore-physical-only: use only one cpu per physical core for alienstore
 	--crimson-balance-cpu: distribute the Seastar reactors uniformly across OSDs (osd) or NUMA (socket)
+	--crimson-poll-mode: enable poll-mode (100% cpu usage)
 	--osds-per-host: populate crush_location as each host holds the specified number of osds if set
 	--require-osd-and-client-version: if supplied, do set-require-min-compat-client and require-osd-release to specified value
 	--use-crush-tunables: if supplied, set tunables to specified value
@@ -385,6 +386,10 @@ crimson_reactor_physical_only=0
 crimson_alien_num_cores=0
 crimson_alienstore_physical_only=0
 crimson_balance_cpu="" # "osd", "socket"
+crimson_poll_mode=false
+
+# default value for the benchmark option
+run_benchmark=0
 
 while [ $# -ge 1 ]; do
 case $1 in
@@ -442,6 +447,10 @@ case $1 in
         ;;
     --osd-args)
         extra_osd_args="$2"
+        if [ "$extra_osd_args" == "--run-benchmark" ]; then
+            run_benchmark=1
+            extra_osd_args=""
+        fi
         shift
         ;;
     --msgr1)
@@ -634,6 +643,10 @@ case $1 in
         crimson_balance_cpu=$2
         shift
         ;;
+    --crimson-poll-mode)
+        crimson_poll_mode=true
+        shift
+        ;;
     --bluestore-spdk)
         [ -z "$2" ] && usage_exit
         IFS=',' read -r -a bluestore_spdk_dev <<< "$2"
@@ -787,6 +800,10 @@ do_rgw_dbstore_conf() {
     if [ $CEPH_NUM_RGW -gt 1 ]; then
         echo "dbstore is not distributed so only works with CEPH_NUM_RGW=1"
         exit 1
+    fi
+
+    if [ "$new" -eq 1 ]; then
+        prun rm -rf "$CEPH_DEV_DIR/rgw/dbstore"
     fi
 
     prun mkdir -p "$CEPH_DEV_DIR/rgw/dbstore"
@@ -965,15 +982,15 @@ $CCLIENTDEBUG
         ; rgw lc debug interval = 10
         $(format_conf "${extra_conf}")
 EOF
-    if [ "$rgw_store" == "dbstore" ] ; then
-        do_rgw_dbstore_conf
-    elif [ "$rgw_store" == "posix" ] ; then
+    #if [ "$rgw_store" == "dbstore" ] ; then
+        #do_rgw_dbstore_conf
+    if [ "$rgw_store" == "posix" ] ; then
         # use dbstore as the backend and posix as the filter
         do_rgw_dbstore_conf
         posix_dir="$CEPH_DEV_DIR/rgw/posix"
         prun mkdir -p $posix_dir/root $posix_dir/lmdb
         wconf <<EOF
-        rgw filter = posix
+        rgw backend store = posix
         rgw posix base path = $posix_dir/root
         rgw posix database root = $posix_dir/lmdb
 
@@ -1016,17 +1033,7 @@ $BLUESTORE_OPTS
 
         ; kstore
         kstore fsck on mount = true
-EOF
-    if [ "$crimson" -eq 1 ]; then
-        wconf <<EOF
-        crimson osd objectstore = $objectstore
-EOF
-    else
-        wconf <<EOF
         osd objectstore = $objectstore
-EOF
-    fi
-    wconf <<EOF
 $SEASTORE_OPTS
 $COSDSHORT
         $(format_conf "${extra_conf}")
@@ -1210,12 +1217,12 @@ do_balance_cpu() {
 
     local reactor_interval=${cpu_table[${osd}]}
     if ! [ "${reactor_interval}" == "" ]; then
-        local cmd="$CEPH_BIN/ceph -c $conf_fn config set osd.$osd crimson_seastar_cpu_cores ${reactor_interval}"
+        local cmd="$CEPH_BIN/ceph -c $conf_fn config set osd.$osd crimson_cpu_set ${reactor_interval}"
         echo $cmd
         $cmd
     else
         echo "No cpu_table entry for osd $osd, setting crimson_seastar_num_reactors"
-        local cmd="$CEPH_BIN/ceph -c $conf_fn config set osd.$osd crimson_seastar_num_threads $crimson_smp"
+        local cmd="$CEPH_BIN/ceph -c $conf_fn config set osd.$osd crimson_cpu_num $crimson_smp"
         echo $cmd
         $cmd
         return
@@ -1224,7 +1231,7 @@ do_balance_cpu() {
 
     local alienstore_interval=${cpu_table[${alienstore_idx}]}
     if [ ! "${alienstore_interval}" == "" ]; then
-        local cmd="$CEPH_BIN/ceph -c $conf_fn config set osd.$osd crimson_alien_thread_cpu_cores ${alienstore_interval}"
+        local cmd="$CEPH_BIN/ceph -c $conf_fn config set osd.$osd crimson_bluestore_cpu_set ${alienstore_interval}"
         echo $cmd
         $cmd
     else
@@ -1254,6 +1261,10 @@ start_osd() {
     do
 	if [ "$ceph_osd" == "crimson-osd" ]; then
         do_balance_cpu $osd
+        if $crimson_poll_mode; then
+            echo "$CEPH_BIN/ceph -c $conf_fn config set osd.$osd crimson_poll_mode true"
+            $CEPH_BIN/ceph -c $conf_fn config set "osd.$osd" crimson_poll_mode true
+        fi
     fi
 	if [ "$new" -eq 1 -o $inc_osd_num -gt 0 ]; then
             wconf <<EOF
@@ -1322,6 +1333,26 @@ EOF
 [osd.$osd]
         key = $OSD_SECRET
 EOF
+        fi
+        # Run the osd benchmark if requested
+        if [ "$run_benchmark" -eq 1 ]; then
+            echo "running $SUDO $CEPH_BIN/$ceph_osd --run-benchmark -i $osd $ARGS"
+            osd_bench_result=$($SUDO $CEPH_BIN/$ceph_osd --run-benchmark -i $osd $ARGS)
+            echo "osd_bench_result: $osd_bench_result"
+            local run_status=$(echo "$osd_bench_result" | jq -r '.status')
+            if [ "$run_status" == "0" ]; then
+                local iops=$(echo "$osd_bench_result" | jq -r '.iops')
+                local is_rotational=$(echo "$osd_bench_result" | jq -r '.is_rotational')
+                if [ "$is_rotational" -eq 1 ]; then
+                    wconf <<EOF
+        osd mclock max capacity iops hdd = $iops
+EOF
+                else
+                    wconf <<EOF
+        osd mclock max capacity iops ssd = $iops
+EOF
+                fi
+            fi
         fi
         echo start osd.$osd
         local osd_pid
@@ -1783,8 +1814,8 @@ if [ "$ceph_osd" == "crimson-osd" ]; then
     fi
     if [ "$objectstore" == "bluestore" ]; then
         if [ $crimson_alien_num_threads -gt 0 ]; then
-            echo "$CEPH_BIN/ceph -c $conf_fn config set osd crimson_alien_op_num_threads $crimson_alien_num_threads"
-            $CEPH_BIN/ceph -c $conf_fn config set osd crimson_alien_op_num_threads "$crimson_alien_num_threads"
+            echo "$CEPH_BIN/ceph -c $conf_fn config set osd crimson_bluestore_num_threads $crimson_alien_num_threads"
+            $CEPH_BIN/ceph -c $conf_fn config set osd crimson_bluestore_num_threads "$crimson_alien_num_threads"
         fi
     fi
 fi

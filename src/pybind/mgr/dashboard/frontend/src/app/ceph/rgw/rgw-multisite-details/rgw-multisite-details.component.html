@@ -8,7 +8,7 @@
                   class="align-items-center"
                   actionName="Enable"
                   (action)="enableRgwModule()">
-      In order to access the import/export/Setup Multi-site Replication feature, the rgw module must be enabled.
+      In order to access the import/export feature, the rgw module must be enabled.
   </cd-alert-panel>
   <cd-alert-panel   *ngIf="restartGatewayMessage"
                     type="warning"
@@ -18,37 +18,25 @@
        routerLink="/services">
        Cluster->Services</a>
   </cd-alert-panel>
-  <cd-table-actions class="btn-group mb-4 me-2"
-                    [permission]="permissions.rgw"
-                    [selection]="selection"
-                    [tableActions]="multisiteReplicationActions">
-  </cd-table-actions>
-  <cd-table-actions *ngIf="showMigrateAndReplicationActions"
-                    class="btn-group mb-4 me-2 secondary"
-                    [permission]="permissions.rgw"
-                    [btnColor]="'light'"
-                    [selection]="selection"
-                    [tableActions]="migrateTableAction">
-  </cd-table-actions>
-  <cd-table-actions *ngIf="!showMigrateAndReplicationActions"
-                    class="btn-group mb-4 me-2"
-                    [permission]="permissions.rgw"
-                    [selection]="selection"
-                    [tableActions]="createTableActions"
-                    [primaryDropDown]="true">
-  </cd-table-actions>
-  <cd-table-actions class="btn-group mb-4 me-2"
-                    [permission]="permissions.rgw"
-                    [btnColor]="'light'"
-                    [selection]="selection"
-                    [tableActions]="importAction">
-  </cd-table-actions>
-  <cd-table-actions class="btn-group mb-4 me-2"
-                    [permission]="permissions.rgw"
-                    [btnColor]="'light'"
-                    [selection]="selection"
-                    [tableActions]="exportAction">
-  </cd-table-actions>
+  <div [cdsStack]="'horizontal'"
+       [gap]="4">
+    <cd-table-actions [permission]="permissions.rgw"
+                      [selection]="selection"
+                      [tableActions]="multisiteReplicationActions">
+    </cd-table-actions>
+    <cd-table-actions *ngIf="showMigrateAndReplicationActions"
+                      [permission]="permissions.rgw"
+                      [selection]="selection"
+                      [tableActions]="migrateTableAction">
+    </cd-table-actions>
+    <cd-table-actions [permission]="permissions.rgw"
+                      [selection]="selection"
+                      [tableActions]="createTableActions"
+                      dropDownOnly="Actions"
+                      [dropDownOnlyBtnColor]="'tertiary'"
+                      [dropDownOnlyOffset]="{ x: 45, y: 0 }">
+    </cd-table-actions>
+  </div>
 </div>
 <div class="card">
   <div class="card-header"
@@ -81,12 +69,23 @@
               <span *ngIf="node?.data?.name"
                     class="me-3">
                 <span *ngIf="(node?.data?.show_warning)">
-                  <i  class="text-danger"
-                      i18n-title
-                      [title]="node?.data?.warning_message"
-                      [ngClass]="icons.danger"></i>
+                  <svg [cdsIcon]="icons.danger"
+                       [size]="icons.size16"
+                       [title]="node?.data?.warning_message"
+                       class="cds-danger-color"></svg>
                 </span>
-                <i [ngClass]="node?.data?.icon"></i>
+                <svg  *ngIf="node?.data?.icon === 'scales'"
+                      [cdsIcon]="icons.reweight"
+                      [size]="icons.size20"
+                      ></svg>
+                <svg *ngIf="node?.data?.icon === 'cube'"
+                     [cdsIcon]="icons.deploy"
+                     [size]="icons.size20"
+                     ></svg>
+                <svg *ngIf="node?.data?.icon === 'fa fa-cubes'"
+                     [cdsIcon]="icons.parentChild"
+                     [size]="icons.size20"
+                     ></svg>
                 {{ node?.data?.name }}
               </span>
               <span class="badge badge-success me-2"
@@ -109,7 +108,9 @@
                         class="btn btn-light dropdown-toggle-split ms-1"
                         (click)="openModal(node, true)"
                         [disabled]="getDisable() || node?.data?.secondary_zone">
-                  <i [ngClass]="[icons.edit]"></i>
+                  <svg [cdsIcon]="icons.edit"
+                       [size]="icons.size16"
+                       class="cds-info-color"></svg>
                 </button>
               </div>
               <ng-container *ngIf="isDeleteDisabled(node) as nodeDeleteData">
@@ -119,7 +120,9 @@
                           class="btn btn-light ms-1"
                           [disabled]="nodeDeleteData.isDisabled || node?.data?.secondary_zone"
                           (click)="delete(node)">
-                    <i [ngClass]="[icons.destroy]"></i>
+                    <svg [cdsIcon]="icons.destroy"
+                         [size]="icons.size16"
+                         class="cds-info-color"></svg>
                   </button>
                 </div>
               </ng-container>

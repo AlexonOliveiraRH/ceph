@@ -5,6 +5,8 @@
 
 #include <memory>
 
+#include "rgw_auth_registry.h"
+
 class ActiveRateLimiter;
 class OpsLogSink;
 class RGWREST;
@@ -16,6 +18,9 @@ namespace rgw::auth {
   class StrategyRegistry;
 }
 namespace rgw::lua {
+  class Background;
+}
+namespace rgw::dedup {
   class Background;
 }
 namespace rgw::sal {

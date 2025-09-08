@@ -15,7 +15,10 @@
 #ifndef CEPH_MMDSBEACON_H
 #define CEPH_MMDSBEACON_H
 
+#include <map>
+#include <string>
 #include <string_view>
+#include <vector>
 
 #include "msg/Message.h"
 #include "messages/PaxosServiceMessage.h"
@@ -170,12 +173,14 @@ struct MDSHealthMetric
     f->close_section();
   }
 
-  static void generate_test_instances(std::list<MDSHealthMetric*>& ls) {
-    ls.push_back(new MDSHealthMetric());
-    ls.back()->type = MDS_HEALTH_CACHE_OVERSIZED;
-    ls.push_back(new MDSHealthMetric(MDS_HEALTH_TRIM, HEALTH_WARN, "MDS is behind on trimming"));
-    ls.back()->metadata["mds"] = "a";
-    ls.back()->metadata["num"] = "1";
+  static std::list<MDSHealthMetric> generate_test_instances() {
+    std::list<MDSHealthMetric> ls;
+    ls.push_back(MDSHealthMetric());
+    ls.back().type = MDS_HEALTH_CACHE_OVERSIZED;
+    ls.push_back(MDSHealthMetric(MDS_HEALTH_TRIM, HEALTH_WARN, "MDS is behind on trimming"));
+    ls.back().metadata["mds"] = "a";
+    ls.back().metadata["num"] = "1";
+    return ls;
   }
 
   bool operator==(MDSHealthMetric const &other) const
@@ -220,11 +225,13 @@ struct MDSHealth
     f->close_section();
   }
 
-  static void generate_test_instances(std::list<MDSHealth*>& ls) {
-    ls.push_back(new MDSHealth);
-    ls.push_back(new MDSHealth);
-    ls.back()->metrics.push_back(MDSHealthMetric(MDS_HEALTH_TRIM, HEALTH_WARN,
+  static std::list<MDSHealth> generate_test_instances() {
+    std::list<MDSHealth> ls;
+    ls.push_back(MDSHealth{});
+    ls.push_back(MDSHealth{});
+    ls.back().metrics.push_back(MDSHealthMetric(MDS_HEALTH_TRIM, HEALTH_WARN,
              "MDS is behind on trimming"));
+    return ls;
   }
 
   bool operator==(MDSHealth const &other) const

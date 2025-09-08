@@ -472,7 +472,7 @@ function TEST_just_deep_scrubs() {
     echo "Pool: $poolname : $poolid"
 
     TESTDATA="testdata.$$"
-    local objects=15
+    local objects=90
     dd if=/dev/urandom of=$TESTDATA bs=1032 count=1
     for i in `seq 1 $objects`
     do
@@ -483,6 +483,7 @@ function TEST_just_deep_scrubs() {
     # set both 'no scrub' & 'no deep-scrub', then request a deep-scrub.
     # we do not expect to see the scrub scheduled.
 
+    ceph tell osd.* config set osd_scrub_retry_after_noscrub 2
     ceph osd set noscrub || return 1
     ceph osd set nodeep-scrub || return 1
     sleep 6 # the 'noscrub' command takes a long time to reach the OSDs
@@ -501,6 +502,10 @@ function TEST_just_deep_scrubs() {
     ceph tell $pgid schedule-deep-scrub
 
     sleep 5 # 5s is the 'pg dump' interval
+
+    ceph pg dump pgs --format=json-pretty | jq -r '.pg_stats[] | "\(.pgid) \(.stat_sum.num_objects)"'
+    echo "Objects # in pg $pgid: " $(ceph pg $pgid query --format=json-pretty | jq -r '.info.stats.stat_sum.num_objects')
+
     declare -A sc_data_2
     extract_published_sch $pgid $now_is $now_is sc_data_2
     echo "test counter @ should show no change: " ${sc_data_2['query_scrub_seq']}
@@ -509,10 +514,14 @@ function TEST_just_deep_scrubs() {
 
     # unset the 'no deep-scrub'. Deep scrubbing should start now.
     ceph osd unset nodeep-scrub || return 1
-    sleep 5
+    sleep 8
     declare -A expct_qry_duration=( ['query_last_duration']="0" ['query_last_duration_neg']="not0" )
     sc_data_2=()
+    extract_published_sch $pgid $now_is $now_is sc_data_2
     echo "test counter @ should be higher than before the unset: " ${sc_data_2['query_scrub_seq']}
+
+    declare -A expct_qry_duration=( ['query_last_duration']="0" ['query_last_duration_neg']="not0" )
+    sc_data_2=()
     wait_any_cond $pgid 10 $saved_last_stamp expct_qry_duration "WaitingAfterScrub " sc_data_2 || return 1
     perf_counters $dir ${cluster_conf['osds_num']}
 }
@@ -521,7 +530,7 @@ function TEST_dump_scrub_schedule() {
     local dir=$1
     local poolname=test
     local OSDS=3
-    local objects=15
+    local objects=90
 
     TESTDATA="testdata.$$"
 

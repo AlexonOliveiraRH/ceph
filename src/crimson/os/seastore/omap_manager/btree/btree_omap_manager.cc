@@ -171,7 +171,10 @@ BtreeOMapManager::omap_set_key(
   const ceph::bufferlist &value)
 {
   LOG_PREFIX(BtreeOMapManager::omap_set_key);
-  DEBUGT("{} -> {}", t, key, value);
+  DEBUGT("{} -> 0x{:x} value", t, key, value.length());
+  // #FIXME: heap buffer overflow during logging if value is long (e.g. 1020B)
+  // https://tracker.ceph.com/issues/71524
+  // DEBUGT("{} -> {}", t, key, value);
   return get_omap_root(
     get_omap_context(t, omap_root),
     omap_root
@@ -262,6 +265,26 @@ BtreeOMapManager::omap_rm_key_range(
 	return omap_rm_key(omap_root, t, key);
       });
     });
+  });
+}
+
+BtreeOMapManager::omap_iterate_ret
+BtreeOMapManager::omap_iterate(
+  const omap_root_t &omap_root,
+  Transaction &t,
+  ObjectStore::omap_iter_seek_t &start_from,
+  omap_iterate_cb_t callback)
+{
+  LOG_PREFIX(BtreeOMapManager::omap_iterate);
+  DEBUGT("{}, {}", t, omap_root, start_from);
+  return get_omap_root(
+    get_omap_context(t, omap_root),
+    omap_root
+  ).si_then([this, &t, &start_from, callback, &omap_root](auto extent) {
+    return extent->iterate(
+      get_omap_context(t, omap_root),
+      start_from,
+      callback);
   });
 }
 

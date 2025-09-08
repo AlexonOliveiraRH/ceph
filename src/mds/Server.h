@@ -31,6 +31,8 @@
 #include "common/perf_counters_collection.h"
 #endif
 
+#include "LogSegmentRef.h"
+
 #include <boost/intrusive_ptr.hpp>
 
 #include <map>
@@ -117,11 +119,16 @@ enum {
   l_mdss_req_symlink_latency,
   l_mdss_req_unlink_latency,
   l_mdss_cap_revoke_eviction,
+  l_mdss_cache_trim_throttle,
+  l_mdss_session_recall_throttle,
+  l_mdss_session_recall_throttle2o,
+  l_mdss_global_recall_throttle,
   l_mdss_cap_acquisition_throttle,
   l_mdss_req_getvxattr_latency,
   l_mdss_req_file_blockdiff_latency,
   l_mdss_last,
 };
+
 
 class Server {
 public:
@@ -157,7 +164,7 @@ public:
   void handle_client_session(const cref_t<MClientSession> &m);
   void _session_logged(Session *session, uint64_t state_seq, bool open, version_t pv,
 		       const interval_set<inodeno_t>& inos_to_free, version_t piv,
-		       const interval_set<inodeno_t>& inos_to_purge, LogSegment *ls);
+		       const interval_set<inodeno_t>& inos_to_purge, LogSegmentRef const& ls);
   version_t prepare_force_open_sessions(std::map<client_t,entity_inst_t> &cm,
 					std::map<client_t,client_metadata_t>& cmm,
 					std::map<client_t,std::pair<Session*,uint64_t> >& smap);
@@ -603,6 +610,7 @@ private:
   unsigned delegate_inos_pct = 0;
   uint64_t dir_max_entries = 0;
   int64_t bal_fragment_size_max = 0;
+  bool allow_batched_ops = true;
 
   double inject_rename_corrupt_dentry_first = 0.0;
 
