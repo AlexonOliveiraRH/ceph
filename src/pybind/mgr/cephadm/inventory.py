@@ -27,7 +27,7 @@ from cephadm.services.cephadmservice import CephadmDaemonDeploySpec
 from mgr_util import parse_combined_pem_file
 
 from .utils import resolve_ip, SpecialHostLabels
-from .migrations import queue_migrate_nfs_spec, queue_migrate_rgw_spec, queue_migrate_rgw_ssl_spec
+from .migrations import queue_migrate_nfs_spec, queue_migrate_rgw_spec
 
 if TYPE_CHECKING:
     from .module import CephadmOrchestrator
@@ -308,12 +308,6 @@ class SpecStore():
                         and j['spec'].get('service_type') == 'rgw'
                 ):
                     queue_migrate_rgw_spec(self.mgr, j)
-
-                if (
-                        (self.mgr.migration_current or 0) < 8
-                        and j['spec'].get('service_type') == 'rgw'
-                ):
-                    queue_migrate_rgw_ssl_spec(self.mgr, j)
 
                 spec = ServiceSpec.from_json(j['spec'])
                 created = str_to_datetime(cast(str, j['created']))
@@ -1526,7 +1520,7 @@ class HostCache():
         ):
             return True
         created = self.mgr.spec_store.get_created(spec)
-        if not created or created > self.last_device_change[host]:
+        if not created or created > self.osdspec_last_applied[host][spec.service_name()]:
             return True
         return self.osdspec_last_applied[host][spec.service_name()] < self.last_device_change[host]
 

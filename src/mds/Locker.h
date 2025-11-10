@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*- 
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*- 
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -262,6 +263,7 @@ protected:
   void file_update_finish(CInode *in, MutationRef& mut, unsigned flags,
 			  client_t client, const ref_t<MClientCaps> &ack);
 
+  void maybe_set_subvolume_id(const CInode* head_in, ref_t<MClientCaps>& ack);
   xlist<ScatterLock*> updated_scatterlocks;
 
   // Maintain a global list to quickly find if any caps are late revoking

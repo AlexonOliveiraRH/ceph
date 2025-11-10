@@ -1,7 +1,8 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab ft=cpp
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab ft=cpp
 
 #include "common/Clock.h" // for ceph_clock_now()
+#include "common/JSONFormatter.h"
 #include "include/function2.hpp"
 #include "rgw_acl_s3.h"
 #include "rgw_tag_s3.h"
@@ -97,6 +98,7 @@ static void dump_multipart_index_results(std::list<rgw_obj_index_key>& objs,
 
 void check_bad_owner_bucket_mapping(rgw::sal::Driver* driver,
                                     const rgw_owner& owner,
+                                    const std::string& owner_name,
                                     const std::string& tenant,
                                     bool fix, optional_yield y,
                                     const DoutPrefixProvider *dpp)
@@ -127,7 +129,7 @@ void check_bad_owner_bucket_mapping(rgw::sal::Driver* driver,
             << " got " << bucket << std::endl;
         if (fix) {
           cout << "fixing" << std::endl;
-	  r = bucket->chown(dpp, owner, y);
+          r = bucket->chown(dpp, owner, owner_name, y);
           if (r < 0) {
             cerr << "failed to fix bucket: " << cpp_strerror(-r) << std::endl;
           }
@@ -3668,7 +3670,7 @@ list<RGWBucketEntryPoint> RGWBucketEntryPoint::generate_test_instances()
   bp.creation_time = ceph::real_clock::from_ceph_timespec({ceph_le32(2), ceph_le32(3)});
 
   o.push_back(std::move(bp));
-  o.push_back(RGWBucketEntryPoint{});
+  o.emplace_back();
 
   return o;
 }

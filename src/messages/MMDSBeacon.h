@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*- 
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*- 
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -227,8 +228,8 @@ struct MDSHealth
 
   static std::list<MDSHealth> generate_test_instances() {
     std::list<MDSHealth> ls;
-    ls.push_back(MDSHealth{});
-    ls.push_back(MDSHealth{});
+    ls.emplace_back();
+    ls.emplace_back();
     ls.back().metrics.push_back(MDSHealthMetric(MDS_HEALTH_TRIM, HEALTH_WARN,
              "MDS is behind on trimming"));
     return ls;

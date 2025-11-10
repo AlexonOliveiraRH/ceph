@@ -9,7 +9,7 @@ import requests
 from mgr_module import HandleCommandResult
 from .service_registry import register_cephadm_service
 from cephadm.services.service_registry import service_registry
-from cephadm.tlsobject_types import CertKeyPair
+from cephadm.tlsobject_types import TLSCredentials
 
 from orchestrator import DaemonDescription
 from ceph.deployment.service_spec import AlertManagerSpec, GrafanaSpec, ServiceSpec, \
@@ -144,7 +144,7 @@ class GrafanaService(CephadmService):
 
         return ''
 
-    def get_grafana_certificates(self, daemon_spec: CephadmDaemonDeploySpec) -> CertKeyPair:
+    def get_grafana_certificates(self, daemon_spec: CephadmDaemonDeploySpec) -> TLSCredentials:
         host_ips = [self.mgr.inventory.get_addr(daemon_spec.host)]
         host_fqdns = [self.mgr.get_fqdn(daemon_spec.host), 'grafana_servers']
         return self.get_certificates(daemon_spec, host_ips, host_fqdns)
@@ -286,7 +286,7 @@ class AlertmanagerService(CephadmService):
     def needs_monitoring(self) -> bool:
         return True
 
-    def get_alertmanager_certificates(self, daemon_spec: CephadmDaemonDeploySpec) -> CertKeyPair:
+    def get_alertmanager_certificates(self, daemon_spec: CephadmDaemonDeploySpec) -> TLSCredentials:
         host_ips = [self.mgr.inventory.get_addr(daemon_spec.host)]
         host_fqdns = [self.mgr.get_fqdn(daemon_spec.host), 'alertmanager_servers']
         return self.get_certificates(daemon_spec, host_ips, host_fqdns)
@@ -492,7 +492,7 @@ class PrometheusService(CephadmService):
             # we shouldn't get here (mon will tell the mgr to respawn), but no
             # harm done if we do.
 
-    def get_prometheus_certificates(self, daemon_spec: CephadmDaemonDeploySpec) -> CertKeyPair:
+    def get_prometheus_certificates(self, daemon_spec: CephadmDaemonDeploySpec) -> TLSCredentials:
         host_ips = [self.mgr.inventory.get_addr(daemon_spec.host)]
         host_fqdns = [self.mgr.get_fqdn(daemon_spec.host), 'prometheus_servers']
         return self.get_certificates(daemon_spec, host_ips, host_fqdns)
@@ -824,6 +824,43 @@ class LokiService(CephadmService):
                 "loki.yml": yml
             }
         }, sorted(deps)
+
+
+@register_cephadm_service
+class AlloyService(CephadmService):
+    TYPE = 'alloy'
+    DEFAULT_SERVICE_PORT = 9080
+
+    @classmethod
+    def get_dependencies(cls, mgr: "CephadmOrchestrator",
+                         spec: Optional[ServiceSpec] = None,
+                         daemon_type: Optional[str] = None) -> List[str]:
+        return sorted(mgr.cache.get_daemons_by_types(['loki']))
+
+    def prepare_create(self, daemon_spec: CephadmDaemonDeploySpec) -> CephadmDaemonDeploySpec:
+        assert self.TYPE == daemon_spec.daemon_type
+        daemon_spec.final_config, daemon_spec.deps = self.generate_config(daemon_spec)
+        return daemon_spec
+
+    def generate_config(self, daemon_spec: CephadmDaemonDeploySpec) -> Tuple[Dict[str, Any], List[str]]:
+        assert self.TYPE == daemon_spec.daemon_type
+        daemons = self.mgr.cache.get_daemons_by_service('loki')
+        loki_host = ''
+        for i, dd in enumerate(daemons):
+            assert dd.hostname is not None
+            if i == 0:
+                loki_host = dd.ip if dd.ip else self.mgr.get_fqdn(dd.hostname)
+
+        context = {
+            'client_hostname': loki_host,
+        }
+
+        alloy_config = self.mgr.template.render('services/alloy.j2', context)
+        return {
+            "files": {
+                "config.alloy": alloy_config
+            }
+        }, self.get_dependencies(self.mgr)
 
 
 @register_cephadm_service

@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -16,9 +17,11 @@
 #include "osdc/Journaler.h"
 
 #include <typeinfo>
+#include "common/DecayCounter.h"
 #include "common/debug.h"
 #include "common/errno.h"
 #include "common/fair_mutex.h"
+#include "common/JSONFormatterFile.h"
 #include "common/likely.h"
 #include "common/Timer.h"
 #include "common/async/blocked_completion.h"
@@ -34,6 +37,7 @@
 
 #include "mgr/MgrClient.h"
 
+#include "Beacon.h"
 #include "MDCache.h"
 #include "MDLog.h"
 #include "MDSDaemon.h"
@@ -689,7 +693,7 @@ void MDSRank::set_mdsmap_multimds_snaps_allowed()
   dout(0) << __func__ << ": sending mon command: " << cmd[0] << dendl;
 
   C_MDS_MonCommand *fin = new C_MDS_MonCommand(this, cmd[0]);
-  monc->start_mon_command(cmd, {}, nullptr, &fin->outs, new C_IO_Wrapper(this, fin));
+  monc->start_mon_command(std::move(cmd), {}, nullptr, &fin->outs, new C_IO_Wrapper(this, fin));
 
   already_sent = true;
 }
@@ -898,6 +902,15 @@ MDSTableServer *MDSRank::get_table_server(int t)
   }
 }
 
+MDSMap::DaemonState MDSRank::get_want_state() const
+{
+  return beacon.get_want_state();
+}
+
+uint64_t MDSRank::get_global_id() const {
+  return monc->get_global_id();
+}
+
 void MDSRank::suicide()
 {
   if (suicide_hook) {
@@ -941,6 +954,11 @@ void MDSRank::damaged_unlocked()
 {
   std::lock_guard l(mds_lock);
   damaged();
+}
+
+double MDSRank::last_cleared_laggy() const
+{
+  return beacon.last_cleared_laggy();
 }
 
 void MDSRank::handle_write_error(int err)
@@ -2032,8 +2050,9 @@ void MDSRank::rejoin_done()
 
   // funny case: is our cache empty?  no subtrees?
   if (!mdcache->is_subtrees()) {
-    if (whoami == 0) {
-      // The root should always have a subtree!
+    if (whoami == 0 && mdlog->get_num_events() > 1) {
+      // The root should always have a subtree except when
+      // the mdlog contains only the ELid event
       clog->error() << "No subtrees found for root MDS rank!";
       damaged();
       ceph_assert(mdcache->is_subtrees());
@@ -3970,7 +3989,7 @@ bool MDSRank::evict_client(int64_t session_id,
     }
   };
 
-  auto apply_blocklist = [this, cmd](std::function<void ()> fn){
+  auto apply_blocklist = [this, &cmd](std::function<void ()> fn){
     ceph_assert(ceph_mutex_is_locked_by_me(mds_lock));
 
     Context *on_blocklist_done = new LambdaContext([this, fn](int r) {
@@ -3990,7 +4009,7 @@ bool MDSRank::evict_client(int64_t session_id,
     });
 
     dout(4) << "Sending mon blocklist command: " << cmd[0] << dendl;
-    monc->start_mon_command(cmd, {}, nullptr, nullptr, on_blocklist_done);
+    monc->start_mon_command(std::move(cmd), {}, nullptr, nullptr, on_blocklist_done);
   };
 
   if (wait) {
@@ -4055,6 +4074,15 @@ void MDSRank::command_cache_drop(uint64_t timeout, Formatter *f, Context *on_fin
 epoch_t MDSRank::get_osd_epoch() const
 {
   return objecter->with_osdmap(std::mem_fn(&OSDMap::get_epoch));
+}
+
+std::string MDSRank::get_path(inodeno_t ino) {
+  std::lock_guard locker(mds_lock);
+  CInode* inode = mdcache->get_inode(ino);
+  if (!inode) return {};
+  std::string res;
+  inode->make_path_string(res);
+  return res;
 }
 
 std::vector<std::string> MDSRankDispatcher::get_tracked_keys()

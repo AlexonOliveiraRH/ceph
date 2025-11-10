@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*- 
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*- 
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -73,8 +74,8 @@ struct SnapPayload {
   }
   static std::list<SnapPayload> generate_test_instances() {
     std::list<SnapPayload> o;
-    o.push_back(SnapPayload{});
-    o.push_back(SnapPayload{});
+    o.emplace_back();
+    o.emplace_back();
     o.back().metadata["key1"] = "val1";
     o.back().metadata["key2"] = "val2";
     return o;
@@ -130,8 +131,8 @@ public:
 
     static std::list<Release> generate_test_instances() {
       std::list<Release> ls;
-      ls.push_back(Release{});
-      ls.push_back(Release{});
+      ls.emplace_back();
+      ls.emplace_back();
       ls.back().item.dname_len = 4;
       ls.back().dname = "test";
       return ls;

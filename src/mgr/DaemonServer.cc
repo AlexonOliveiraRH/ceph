@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -44,6 +45,7 @@
 #include "messages/MOSDScrub2.h"
 #include "messages/MOSDForceRecovery.h"
 #include "common/errno.h"
+#include "common/JSONFormatter.h"
 #include "common/pick_address.h"
 #include "common/TextTable.h"
 #include "crush/CrushWrapper.h"
@@ -2488,7 +2490,7 @@ bool DaemonServer::_handle_command(
 	"}";
       op->mark_start_mon_command();
       auto on_finish = new ReplyOnFinish(cmdctx, op);
-      monc->start_mon_command({cmd}, json, nullptr, nullptr, on_finish);
+      monc->start_mon_command({cmd}, std::move(json), nullptr, nullptr, on_finish);
     }
     return true;
   } else if (prefix == "device rm-life-expectancy") {
@@ -2521,7 +2523,7 @@ bool DaemonServer::_handle_command(
       }
       op->mark_start_mon_command();
       auto on_finish = new ReplyOnFinish(cmdctx, op);
-      monc->start_mon_command({cmd}, json, nullptr, nullptr, on_finish);
+      monc->start_mon_command({std::move(cmd)}, std::move(json), nullptr, nullptr, on_finish);
     } else {
       cmdctx->reply(0, ss);
     }
