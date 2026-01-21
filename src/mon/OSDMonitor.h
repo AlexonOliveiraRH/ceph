@@ -32,6 +32,7 @@
 #include "common/simple_cache.hpp"
 #include "common/PriorityCache.h"
 #include "msg/Messenger.h"
+#include "common/prime.h"
 
 #include "osd/OSDMap.h"
 #include "osd/OSDMapMapping.h"
@@ -745,6 +746,7 @@ public:
   int enable_pool_ec_optimizations(pg_pool_t &pool,
                                    std::stringstream *ss,
                                    bool enable);
+  void enable_pool_ec_direct_reads(pg_pool_t &p);
   int prepare_command_pool_set(const cmdmap_t& cmdmap,
                                std::stringstream& ss);
 

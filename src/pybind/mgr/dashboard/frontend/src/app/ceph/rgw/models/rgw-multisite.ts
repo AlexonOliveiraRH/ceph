@@ -22,6 +22,10 @@ export class RgwZonegroup {
   enabled_features: string[];
 }
 
+export interface RgwZonegroupMeta extends RgwZonegroup {
+  parent: string;
+}
+
 export class RgwZone {
   id: string;
   name: string;
@@ -71,4 +75,9 @@ export enum FlowType {
 export interface Zone {
   added: string[];
   removed: string[];
+}
+
+export interface RgwRealmToken {
+  realm: string;
+  token: string;
 }

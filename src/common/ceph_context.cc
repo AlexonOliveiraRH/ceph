@@ -658,7 +658,7 @@ int CephContext::_do_command(
       } else {
         // Output all
         f->open_array_section("options");
-        for (const auto &option : ceph_options) {
+        for (const auto &option : get_ceph_options()) {
           f->dump_object("option", option);
         }
         f->close_section();
@@ -1081,6 +1081,19 @@ CryptoHandler *CephContext::get_crypto_handler(int type)
     return _crypto_aes;
   default:
     return NULL;
+  }
+}
+
+void CephContext::drop_temp_messenger_obj()
+{
+  auto i = associated_objs.begin();
+  while (i != associated_objs.end()) {
+    if (i->first.first.find("AsyncMessenger::NetworkStack") != std::string::npos) {
+      i = associated_objs.erase(i);
+      break;
+    } else {
+      ++i;
+    }
   }
 }
 

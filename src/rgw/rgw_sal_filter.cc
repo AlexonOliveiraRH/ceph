@@ -1045,6 +1045,7 @@ int FilterObject::copy_object(const ACLOwner& owner,
 			      std::string* etag,
 			      void (*progress_cb)(off_t, void *),
 			      void* progress_data,
+			      rgw::sal::DataProcessorFactory* dp_factory,
 			      const DoutPrefixProvider* dpp,
 			      optional_yield y)
 {
@@ -1056,7 +1057,7 @@ int FilterObject::copy_object(const ACLOwner& owner,
 			   mod_ptr, unmod_ptr, high_precision_time, if_match,
 			   if_nomatch, attrs_mod, copy_if_newer, attrs,
 			   category, olh_epoch, delete_at, version_id, tag,
-			   etag, progress_cb, progress_data, dpp, y);
+			   etag, progress_cb, progress_data, dp_factory, dpp, y);
 }
 
 RGWAccessControlPolicy& FilterObject::get_acl()
@@ -1150,11 +1151,12 @@ int FilterObject::restore_obj_from_cloud(Bucket* bucket,
 		          CephContext* cct,
 		          std::optional<uint64_t> days,
 			  bool& in_progress,
+		          uint64_t& size,
 		          const DoutPrefixProvider* dpp,
 		          optional_yield y)
 {
   return next->restore_obj_from_cloud(nextBucket(bucket), nextPlacementTier(tier),
-           cct, days, in_progress, dpp, y);
+           cct, days, in_progress, size, dpp, y);
 }
 
 bool FilterObject::placement_rules_match(rgw_placement_rule& r1, rgw_placement_rule& r2)

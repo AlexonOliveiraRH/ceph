@@ -35,7 +35,7 @@
 %bcond_with rbd_rwl_cache
 %endif
 %if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler}
-%if 0%{?rhel} < 9 || 0%{?openEuler}
+%if (0%{?rhel} && 0%{?rhel} < 9) || 0%{?openEuler}
 %bcond_with system_pmdk
 %else
 %ifarch s390x aarch64
@@ -91,7 +91,7 @@
 %bcond_with lua_packages
 %endif
 %endif
-%bcond_with crimson
+%bcond_without crimson
 %if 0%{?suse_version} || 0%{?openEuler}
 %bcond_with jaeger
 %else
@@ -150,7 +150,7 @@
 %{!?python3_pkgversion: %global python3_pkgversion 3}
 %{!?python3_version_nodots: %global python3_version_nodots 3}
 %{!?python3_version: %global python3_version 3}
-%if 0%{?rhel} < 10
+%if 0%{?rhel} && 0%{?rhel} < 10
 %{!?gts_version: %global gts_version 13}
 %endif
 
@@ -674,7 +674,7 @@ Requires:       python%{python3_pkgversion}-cherrypy
 Requires:       python%{python3_pkgversion}-routes
 %if 0%{?weak_deps}
 Recommends:     python%{python3_pkgversion}-saml
-%if 0%{?fedora} || 0%{?rhel} <= 8
+%if 0%{?fedora} || (0%{?rhel} && 0%{?rhel} <= 8)
 Recommends:     python%{python3_pkgversion}-grpcio
 Recommends:     python%{python3_pkgversion}-grpcio-tools
 %endif
@@ -729,7 +729,7 @@ Requires:       python%{python3_pkgversion}-PyYAML
 %endif
 # RHEL8 has python 3.6 and that lacks dataclasses in the stdlib, so pull in the
 # backport dataclasses module instead.
-%if 0%{?rhel} <= 8
+%if 0%{?rhel} && 0%{?rhel} <= 8
 Requires:       python%{python3_pkgversion}-dataclasses
 %endif
 %if 0%{?weak_deps}
@@ -912,28 +912,44 @@ Summary:	Ceph Object Storage Daemon
 Group:		System/Filesystems
 %endif
 Requires:	ceph-base = %{_epoch_prefix}%{version}-%{release}
+Requires:	ceph-osd-classic = %{_epoch_prefix}%{version}-%{release}
+%if 0%{with crimson}
+Requires: 	ceph-osd-crimson = %{_epoch_prefix}%{version}-%{release}
+%endif
 Requires:	sudo
 Requires:	libstoragemgmt
-%if 0%{with crimson}
-Requires:	protobuf
-%endif
 %if 0%{?weak_deps}
 Recommends:	ceph-volume = %{_epoch_prefix}%{version}-%{release}
 %endif
 %description osd
 ceph-osd is the object storage daemon for the Ceph distributed file
+system.  It provides components shared between classic and crimson OSD
+implementations. It requires either the classic or crimson OSD
+to provide the core OSD daemon.
+
+%package osd-classic
+Summary:	Ceph Object Storage Daemon (classic)
+%if 0%{?suse_version}
+Group:		System/Filesystems
+%endif
+Requires:   ceph-osd = %{_epoch_prefix}%{version}-%{release}
+Obsoletes:  ceph-osd < %{_epoch_prefix}%{version}-%{release}
+%description osd-classic
+classic-osd is the object storage daemon for the Ceph distributed file
 system.  It is responsible for storing objects on a local file system
 and providing access to them over the network.
 
 %if 0%{with crimson}
-%package crimson-osd
+%package osd-crimson
 Summary:	Ceph Object Storage Daemon (crimson)
 %if 0%{?suse_version}
 Group:		System/Filesystems
 %endif
 Requires:	ceph-osd = %{_epoch_prefix}%{version}-%{release}
+Obsoletes:	ceph-osd < %{_epoch_prefix}%{version}-%{release}
 Requires:	binutils
-%description crimson-osd
+Requires:	protobuf
+%description osd-crimson
 crimson-osd is the object storage daemon for the Ceph distributed file
 system.  It is responsible for storing objects on a local file system
 and providing access to them over the network.
@@ -1563,10 +1579,9 @@ rm -f %{buildroot}/%{_sysconfdir}/init.d/ceph
 popd
 
 %if 0%{with crimson}
-# package crimson-osd with the name of ceph-osd
-install -m 0755 %{buildroot}%{_bindir}/crimson-osd %{buildroot}%{_bindir}/ceph-osd
-install -m 0755 %{buildroot}%{_bindir}/crimson-objectstore-tool %{buildroot}%{_bindir}/ceph-objectstore-tool
+mv %{buildroot}%{_bindir}/crimson-osd %{buildroot}%{_bindir}/ceph-osd-crimson
 %endif
+mv %{buildroot}%{_bindir}/ceph-osd %{buildroot}%{_bindir}/ceph-osd-classic
 
 install -m 0644 -D src/etc-rbdmap %{buildroot}%{_sysconfdir}/ceph/rbdmap
 %if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler}
@@ -2279,17 +2294,12 @@ fi
 
 %files osd
 %{_bindir}/ceph-clsinfo
-%{_bindir}/ceph-bluestore-tool
 %{_bindir}/ceph-erasure-code-tool
-%{_bindir}/ceph-objectstore-tool
-%{_bindir}/ceph-osd
 %{_libexecdir}/ceph/ceph-osd-prestart.sh
 %{_mandir}/man8/ceph-clsinfo.8*
 %{_mandir}/man8/ceph-osd.8*
-%{_mandir}/man8/ceph-bluestore-tool.8*
 %{_unitdir}/ceph-osd@.service
 %{_unitdir}/ceph-osd.target
-%attr(750,ceph,ceph) %dir %{_localstatedir}/lib/ceph/osd
 %config(noreplace) %{_sysctldir}/90-ceph-osd.conf
 
 %post osd
@@ -2328,11 +2338,36 @@ if [ $1 -ge 1 ] ; then
   fi
 fi
 
+%files osd-classic
+%{_bindir}/ceph-bluestore-tool
+%{_bindir}/ceph-objectstore-tool
+%{_bindir}/ceph-osd-classic
+%{_mandir}/man8/ceph-bluestore-tool.8*
+%attr(750,ceph,ceph) %dir %{_localstatedir}/lib/ceph/osd
+
 %if 0%{with crimson}
-%files crimson-osd
-%{_bindir}/crimson-osd
+%files osd-crimson
+%{_bindir}/ceph-osd-crimson
 %{_bindir}/crimson-objectstore-tool
+
+%posttrans osd-crimson
+%{_sbindir}/update-alternatives --install %{_bindir}/ceph-osd ceph-osd \
+    %{_bindir}/ceph-osd-crimson 50
+
+%preun osd-crimson
+if [ $1 -eq 0 ]; then
+    ${_sbindir}/update-alternatives --remove ceph-osd %{_bindir}/ceph-osd-crimson
+fi
 %endif
+
+%posttrans osd-classic
+%{_sbindir}/update-alternatives --install %{_bindir}/ceph-osd ceph-osd \
+    %{_bindir}/ceph-osd-classic 100
+
+%preun osd-classic
+if [ $1 -eq 0 ]; then
+    ${_sbindir}/update-alternatives --remove ceph-osd %{_bindir}/ceph-osd-classic
+fi
 
 %files volume
 %{_sbindir}/ceph-volume

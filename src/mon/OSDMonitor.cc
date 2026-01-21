@@ -66,6 +66,7 @@
 #include "common/PriorityCache.h"
 #include "common/strtol.h"
 #include "common/numa.h"
+#include "common/prime.h"
 
 #include "common/config.h"
 #include "common/errno.h"
@@ -8357,6 +8358,8 @@ int OSDMonitor::prepare_new_pool(string& name,
     enable_pool_ec_optimizations(*pi, nullptr, true);
   }
 
+  enable_pool_ec_direct_reads(*pi);
+
   pending_inc.new_pool_names[pool] = name;
   return 0;
 }
@@ -8449,6 +8452,29 @@ int OSDMonitor::enable_pool_ec_optimizations(pg_pool_t &p,
     }
   }
   return 0;
+}
+
+void OSDMonitor::enable_pool_ec_direct_reads(pg_pool_t &p) {
+  if (p.is_erasure()) {
+    ErasureCodeInterfaceRef erasure_code;
+    stringstream tmp;
+    int err = get_erasure_code(p.erasure_code_profile, &erasure_code, &tmp);
+
+    // Once this feature is finished, we will replace this with upgrade code.
+    // The upgrade code will enable the split read flag once all OSDs are at
+    // Umbrella. For now, if the plugin does not support direct reads, we just
+    // disable it.  All plugins and techniques should be capable of supporting
+    // direct reads, but we put in place this capability to reduce the test
+    // matrix for less important plugins/techniques.
+    //
+    // To enable direct reads in development, set the osd_pool_default_flags to
+    // 1<<20 = 0x100000 = 1048576
+    if (err != 0 || !p.allows_ecoptimizations() ||
+          (erasure_code->get_supported_optimizations() &
+            ErasureCodeInterface::FLAG_EC_PLUGIN_DIRECT_READS) == 0) {
+      p.flags &= ~pg_pool_t::FLAG_CLIENT_SPLIT_READS;
+    }
+  }
 }
 
 int OSDMonitor::prepare_command_pool_set(const cmdmap_t& cmdmap,
@@ -11664,10 +11690,49 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
 
     if (profile_map.find("plugin") == profile_map.end()) {
       ss << "erasure-code-profile " << profile_map
-	 << " must contain a plugin entry" << std::endl;
+      << " must contain a plugin entry" << std::endl;
       err = -EINVAL;
       goto reply_no_propose;
     }
+
+    bool force_no_fake = false;
+    cmd_getval(cmdmap, "yes_i_really_mean_it", force_no_fake);
+
+    //This is the start of the validation for the w value in a blaum_roth profile
+    //this will search the Profile map, which contains the values for the parameters given in the command, for the technique parameter
+    if (auto found = profile_map.find("technique"); found != profile_map.end()) {
+      //if the technique parameter is found then save the value of it
+      string technique = found->second;
+      //then search the profile map again for the w value, which doesnt have to be specified, and if it is found and the technique used is blaum-roth then check that the w value is correct.
+      if (found = profile_map.find("w"); technique == "blaum_roth" 
+      && found != profile_map.end()) {
+        int w = std::stoi(found->second);
+        if ((w <= 2) || (w >= 256)) {
+          ss << "erasure-code-profile: " << profile_map
+          << " The value of w must be greater than 2 and less than 256." << std::endl;
+          err = -EINVAL;
+          goto reply_no_propose;
+        }
+
+        //checks if w+1 is not prime
+        if (!is_prime(w + 1)) {
+          if (force ^ force_no_fake) {
+            err = -EPERM;
+            ss << "Creating a blaum-roth erasure code profile with a w+1 value"
+            << " that is not prime is dangerous, as it can cause data corruption."
+            << " You need to use both --yes-i-really-mean-it and --force flags."
+            << std::endl;
+            goto reply_no_propose;
+          } else if (!force && !force_no_fake) {
+            ss << "erasure-code-profile: " << profile_map 
+            << " must use a w value such that w+1 is prime." << std::endl;
+            err = -EINVAL;
+            goto reply_no_propose;
+          }
+        }
+      }
+    }
+
     string plugin = profile_map["plugin"];
 
     if (pending_inc.has_erasure_code_profile(name)) {
@@ -11689,8 +11754,7 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
 	  err = 0;
 	  goto reply_no_propose;
 	}
-	bool force_no_fake = false;
-	cmd_getval(cmdmap, "yes_i_really_mean_it", force_no_fake);
+
 	if (!force) {
 	  err = -EPERM;
 	  ss << "will not override erasure code profile " << name
@@ -12584,6 +12648,8 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
 	goto reply_no_propose;
       }
     }
+    // Optimized EC does not cope with pg temp with a mismatched size.
+    pending_inc.new_pg_temp[pgid].resize(osdmap.get_pg_size(pgid), CRUSH_ITEM_NONE);
     goto update;
   } else if (prefix == "osd pg-upmap" ||
              prefix == "osd rm-pg-upmap" ||

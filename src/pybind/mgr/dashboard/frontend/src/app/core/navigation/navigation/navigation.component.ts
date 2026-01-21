@@ -22,7 +22,8 @@ import { USER } from '~/app/shared/constants/app.constants';
 @Component({
   selector: 'cd-navigation',
   templateUrl: './navigation.component.html',
-  styleUrls: ['./navigation.component.scss']
+  styleUrls: ['./navigation.component.scss'],
+  standalone: false
 })
 export class NavigationComponent implements OnInit, OnDestroy {
   clusterDetails: any[] = [];
@@ -185,7 +186,7 @@ export class NavigationComponent implements OnInit, OnDestroy {
               const clusterUser = clusterDetails[USER];
 
               if (
-                clusterName === this.selectedCluster[USER] &&
+                clusterName === this.selectedCluster['name'] &&
                 clusterUser === this.selectedCluster[USER] &&
                 clusterDetails['cluster_alias'] !== 'local-cluster'
               ) {

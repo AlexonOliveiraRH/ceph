@@ -623,12 +623,14 @@ if(NOT WIN32)
   ceph_snappy
   cls_lock
   ceph_test_objectstore
-  ceph_test_bluefs
   ceph_erasure_code_non_regression
   cython_modules
   crushtool
   monmaptool)
 
+if (WITH_BLUESTORE)
+  add_dependencies(tests ceph_test_bluefs)
+endif()
 if (WITH_CEPHFS)
   add_dependencies(tests ceph-mds)
 endif()
@@ -1013,6 +1015,12 @@ add_executable(unittest_not_before_queue
 add_ceph_unittest(unittest_not_before_queue)
 target_link_libraries(unittest_not_before_queue ceph-common)
 
+# unittest_mode_collector
+add_executable(unittest_mode_collector
+  test_mode_collector.cc)
+add_ceph_unittest(unittest_mode_collector)
+target_link_libraries(unittest_mode_collector ceph-common)
+
 if(NOT WIN32)
 # unittest_on_exit
 add_executable(unittest_on_exit
@@ -1072,4 +1080,12 @@ add_executable(unittest_ceph_assert
 add_ceph_unittest(unittest_ceph_assert)
 target_link_libraries(unittest_ceph_assert ceph-common global)
 endif()
+
+add_executable(test_nvmeof_gw_utils
+  test_nvmeof_gw_utils.cc
+  ../nvmeof/NVMeofGwUtils.cc
+  )
+target_link_libraries(test_nvmeof_gw_utils
+  mon ceph-common global-static
+  )
 

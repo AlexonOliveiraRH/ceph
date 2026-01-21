@@ -17,11 +17,16 @@ import {
   ToggletipModule,
   IconModule,
   IconService,
-  TagModule
+  TagModule,
+  SelectModule,
+  LayoutModule,
+  NumberModule,
+  FileUploaderModule
 } from 'carbon-components-angular';
 import Analytics from '@carbon/icons/es/analytics/16';
 import CloseFilled from '@carbon/icons/es/close--filled/16';
 import ProgressBarRoundIcon from '@carbon/icons/es/progress-bar--round/32';
+import Connect from '@carbon/icons/es/connect/32';
 import {
   NgbActiveModal,
   NgbDatepickerModule,
@@ -84,6 +89,7 @@ import { MultiClusterFormComponent } from './multi-cluster/multi-cluster-form/mu
 import { MultiClusterListComponent } from './multi-cluster/multi-cluster-list/multi-cluster-list.component';
 import { DashboardV3Module } from '../dashboard-v3/dashboard-v3.module';
 import { MultiClusterDetailsComponent } from './multi-cluster/multi-cluster-details/multi-cluster-details.component';
+import { TextLabelListComponent } from '~/app/shared/components/text-label-list/text-label-list.component';
 
 @NgModule({
   imports: [
@@ -117,7 +123,12 @@ import { MultiClusterDetailsComponent } from './multi-cluster/multi-cluster-deta
     ListModule,
     ToggletipModule,
     IconModule,
-    TagModule
+    TagModule,
+    TextLabelListComponent,
+    SelectModule,
+    LayoutModule,
+    NumberModule,
+    FileUploaderModule
   ],
   declarations: [
     MonitorComponent,
@@ -170,6 +181,6 @@ import { MultiClusterDetailsComponent } from './multi-cluster/multi-cluster-deta
 })
 export class ClusterModule {
   constructor(private iconService: IconService) {
-    this.iconService.registerAll([Analytics, CloseFilled, ProgressBarRoundIcon]);
+    this.iconService.registerAll([Analytics, CloseFilled, ProgressBarRoundIcon, Connect]);
   }
 }

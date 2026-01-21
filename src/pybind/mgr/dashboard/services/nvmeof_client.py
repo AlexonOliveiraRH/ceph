@@ -33,7 +33,7 @@ else:
     class NVMeoFClient(object):
         pb2 = pb2
 
-        def __init__(self, gw_group: Optional[str] = None, traddr: Optional[str] = None):
+        def __init__(self, gw_group: Optional[str] = None, server_address: Optional[str] = None):
             logger.info("Initiating nvmeof gateway connection...")
             try:
                 if not gw_group:
@@ -41,7 +41,7 @@ else:
                 else:
                     res = NvmeofGatewaysConfig.get_service_info(gw_group)
                 if res is None:
-                    raise DashboardException("Gateway group does not exists")
+                    raise DashboardException("Gateway group does not exist")
                 service_name, self.gateway_addr = res
             except TypeError as e:
                 raise DashboardException(
@@ -50,14 +50,14 @@ else:
 
             # While creating listener need to direct request to the gateway
             # address where listener is supposed to be added.
-            if traddr:
+            if server_address:
                 gateways_info = NvmeofGatewaysConfig.get_gateways_config()
                 matched_gateway = next(
                     (
                         gateway
                         for gateways in gateways_info['gateways'].values()
                         for gateway in gateways
-                        if traddr in gateway['service_url']
+                        if server_address in gateway['service_url']
                     ),
                     None
                 )
@@ -68,7 +68,7 @@ else:
             if enable_auth:
                 client_key = NvmeofGatewaysConfig.get_client_key(service_name)
                 client_cert = NvmeofGatewaysConfig.get_client_cert(service_name)
-                server_cert = NvmeofGatewaysConfig.get_server_cert(service_name)
+                server_cert = NvmeofGatewaysConfig.get_ssl_cert(service_name)
                 logger.info('Securely connecting to: %s', self.gateway_addr)
                 credentials = grpc.ssl_channel_credentials(
                     root_certificates=server_cert,
@@ -111,11 +111,14 @@ else:
                     component="nvmeof",
                 )
 
-            if response.status != 0:
+            status = getattr(response, "status", None)
+            error_message = getattr(response, "error_message", None)
+
+            if status not in (None, 0):
                 raise DashboardException(
-                    msg=response.error_message,
-                    code=response.status,
-                    http_status_code=NVMeoFError2HTTP.get(response.status, 400),
+                    msg=error_message or "NVMeoF operation failed",
+                    code=status,
+                    http_status_code=NVMeoFError2HTTP.get(status, 400),  # type: ignore[arg-type]
                     component="nvmeof",
                 )
             return response

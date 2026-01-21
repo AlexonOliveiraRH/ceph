@@ -1045,6 +1045,7 @@ TEST(LibCephFS, StatfsQuota) {
 
   ASSERT_EQ(0, ceph_mkdir(cmount, quota_dir, 0777));
   EXPECT_EQ(0, ceph_setxattr(cmount, quota_dir, "ceph.quota.max_files", "10000", 05, 0));
+  EXPECT_EQ(0, ceph_setxattr(cmount, "/", "ceph.quota.max_bytes", "20G", 03, 0));
 
   const int num_quota_files = 1;
   char quota_file[256];
@@ -1073,6 +1074,7 @@ TEST(LibCephFS, StatfsQuota) {
   struct statvfs reg_stvbuf;
   ASSERT_EQ(0, ceph_statfs(cmount, "test_statfs_regular_1", &reg_stvbuf));
   ASSERT_GT(reg_stvbuf.f_files, quota_stvbuf.f_files);
+  ASSERT_EQ(21474836480, quota_stvbuf.f_blocks*quota_stvbuf.f_bsize);
 
   for (int i = 0; i < num_reg_files; i++) {
     sprintf(regular_file, "test_statfs_regular_%d", i);
@@ -4457,11 +4459,9 @@ TEST(LibCephFS, UnmountHangAfterOpenatFilePath) {
   struct ceph_statx stx;
   ASSERT_EQ(ceph_statxat(cmount, root_fd, c_rel_dir, &stx, 0, 0), 0);
 
-  char c_rel_path[PATH_MAX];
-  char c_path[PATH_MAX];
-  sprintf(c_rel_path, "created_file_%d", mypid);
-  sprintf(c_path, "%s/%s", c_dir, c_rel_path);
-  int file_fd = ceph_openat(cmount, dir_fd, c_rel_path, O_RDONLY | O_CREAT, 0777);
+  std::string c_rel_path = fmt::format("created_file_{}", mypid);
+  std::string c_path = fmt::format("{}/{}", c_dir, c_rel_path);
+  int file_fd = ceph_openat(cmount, dir_fd, c_rel_path.c_str(), O_RDONLY | O_CREAT, 0777);
   ASSERT_GT(file_fd, 0);
   int fd = ceph_openat(cmount, file_fd, ".", O_RDONLY, 0777);
   ASSERT_EQ(fd, -ENOTDIR);
@@ -4470,7 +4470,7 @@ TEST(LibCephFS, UnmountHangAfterOpenatFilePath) {
   ASSERT_EQ(ceph_close(cmount, dir_fd), 0);
   ASSERT_EQ(ceph_close(cmount, root_fd), 0);
 
-  ASSERT_EQ(0, ceph_unlink(cmount, c_path));
+  ASSERT_EQ(0, ceph_unlink(cmount, c_path.c_str()));
   ASSERT_EQ(0, ceph_rmdir(cmount, c_dir));
 
   std::cout << "Before ceph_unmount()" << std::endl;

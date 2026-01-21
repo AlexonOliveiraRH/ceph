@@ -1055,6 +1055,7 @@ int Directory::get_ent(const DoutPrefixProvider *dpp, optional_yield y, const st
         decode_attr(attrs, RGW_POSIX_ATTR_OBJECT_TYPE, type);
       }
     }
+    ::close(tmpfd);
     switch (type.type) {
     case ObjectType::VERSIONED:
       nent = std::make_unique<VersionedDirectory>(name, this, instance, nstx, ctx);
@@ -1399,7 +1400,7 @@ int VersionedDirectory::open(const DoutPrefixProvider* dpp)
   }
   int ret = Directory::open(dpp);
   if (ret < 0) {
-    return 0;
+    return ret;
   }
 
   if (!instance_id.empty()) {
@@ -2755,7 +2756,11 @@ int POSIXBucket::check_empty(const DoutPrefixProvider* dpp, optional_yield y)
 {
   return dir->for_each(dpp, [](const char* name) {
     /* for_each filters out "." and "..", so reaching here is not empty */
-    return -ENOTEMPTY;
+    std::string_view check_name = name;
+    if (!check_name.starts_with(".multipart")) { // incomplete uploads can be deleted
+      return -ENOTEMPTY;
+    }
+    return 0;
   });
 }
 
@@ -2976,6 +2981,7 @@ int POSIXObject::copy_object(const ACLOwner& owner,
                               std::string* etag,
                               void (*progress_cb)(off_t, void *),
                               void* progress_data,
+                              rgw::sal::DataProcessorFactory* dp_factory,
                               const DoutPrefixProvider* dpp,
                               optional_yield y)
 {
@@ -3243,6 +3249,7 @@ int POSIXObject::restore_obj_from_cloud(Bucket* bucket,
 	  CephContext* cct,
           std::optional<uint64_t> days,
           bool& in_progress,
+	  uint64_t& size,
           const DoutPrefixProvider* dpp, 
           optional_yield y)
 {

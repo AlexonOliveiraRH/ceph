@@ -54,7 +54,7 @@
   <!-- ***************************** -->
   <ng-template #brandTemplate>
     <a class="cds--header__name navbar-brand ms-3"
-       routerLink="/dashboard">
+       routerLink="/overview">
       <img src="assets/Ceph_Ceph_Logo_with_text_white.svg"
            alt="Ceph" />
     </a>
@@ -83,17 +83,17 @@
                    class="mt-5"
                    (click)="onMenuClick($event)"
                    #sidenavContainer>
-        <!-- Dashboard -->
-        <cds-sidenav-item route="/dashboard"
+        <!-- Overview -->
+        <cds-sidenav-item route="/overview"
                           [useRouter]="true"
-                          title="Dashboard"
+                          title="Overview"
                           i18n-title
-                          class="nav-item tc_menuitem_dashboard">
+                          class="nav-item tc_menuitem_overview">
           <svg cdsIcon="template"
                icon
                size="20"></svg>
           <span i18n>
-            Dashboard</span>
+            Overview</span>
         </cds-sidenav-item>
         <!-- Multi-cluster Dashboard -->
         <cds-sidenav-menu title="Multi-cluster"
@@ -180,11 +180,11 @@
                             class="tc_submenuitem tc_submenuitem_block_mirroring">
             <span i18n>Mirroring
               <cds-tag *ngIf="summaryData?.rbd_mirroring?.warnings !== 0"
-                       class="tag-warning">
+                       class="tag-warning content-theme">
                 {{ summaryData?.rbd_mirroring?.warnings }}
               </cds-tag>
               <cds-tag *ngIf="summaryData?.rbd_mirroring?.errors !== 0"
-                       class="tag-danger">
+                       class="tag-danger content-theme">
                 {{ summaryData?.rbd_mirroring?.errors }}
               </cds-tag>
             </span>
@@ -270,6 +270,12 @@
                             i18n-title
                             *ngIf="permissions.cephfs.read && enabledFeature.cephfs"
                             class="tc_submenuitem tc_submenuitem_file_cephfs"><span i18n>File systems</span></cds-sidenav-item>
+          <cds-sidenav-item route="/cephfs/mirroring"
+                            [useRouter]="true"
+                            title="Mirroring"
+                            i18n-title
+                            *ngIf="permissions.cephfs.read && enabledFeature.cephfs"
+                            class="tc_submenuitem tc_submenuitem_file_cephfs"><span i18n>Mirroring</span></cds-sidenav-item>
           <cds-sidenav-item route="/cephfs/nfs"
                             [useRouter]="true"
                             title="NFS"
@@ -306,9 +312,9 @@
             <span i18n>
               <ng-container>Alerts</ng-container>
               <cds-tag *ngIf="prometheusAlertService.activeCriticalAlerts > 0"
-                     class="tag-danger ms-1">{{ prometheusAlertService.activeCriticalAlerts }}</cds-tag>
+                     class="tag-danger ms-1 content-theme">{{ prometheusAlertService.activeCriticalAlerts }}</cds-tag>
               <cds-tag *ngIf="prometheusAlertService.activeWarningAlerts > 0"
-                     class="tag-warning ms-1">{{ prometheusAlertService.activeWarningAlerts }}</cds-tag>
+                     class="tag-warning ms-1 content-theme">{{ prometheusAlertService.activeWarningAlerts }}</cds-tag>
             </span>
           </cds-sidenav-item>
         </cds-sidenav-menu>
