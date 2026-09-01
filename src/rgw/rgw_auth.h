@@ -10,11 +10,14 @@
 #include <system_error>
 #include <utility>
 
+#include <fmt/ostream.h>
+
 #include "include/expected.hpp"
 #include "include/function2.hpp"
 
 #include "rgw_common.h"
 #include "rgw_web_idp.h"
+#include "rgw_keystone_scope.h"
 
 #define RGW_USER_ANON_ID "anonymous"
 
@@ -598,6 +601,9 @@ public:
     const std::string access_key_id;
     const std::string subuser;
     const std::string keystone_user;
+    const std::optional<rgw::keystone::ScopeInfo> keystone_scope;
+    const std::vector<std::string> keystone_roles;
+    const std::string keystone_user_id;
 
   public:
     enum class acct_privilege_t {
@@ -616,7 +622,11 @@ public:
              const std::string access_key_id,
              const std::string subuser,
              const std::string keystone_user,
-             const uint32_t acct_type=TYPE_NONE)
+             const uint32_t acct_type=TYPE_NONE,
+             std::optional<rgw::keystone::ScopeInfo> keystone_scope=std::nullopt,
+             std::vector<std::string> keystone_roles = {},
+             const std::string keystone_user_id = {}
+            )
     : acct_user(acct_user),
       acct_name(acct_name),
       perm_mask(perm_mask),
@@ -624,7 +634,10 @@ public:
       acct_type(acct_type),
       access_key_id(access_key_id),
       subuser(subuser),
-      keystone_user(keystone_user) {
+      keystone_user(keystone_user),
+      keystone_scope(std::move(keystone_scope)),
+      keystone_roles(std::move(keystone_roles)),
+      keystone_user_id(keystone_user_id) {
     }
   };
 
@@ -975,9 +988,47 @@ protected:
   }
 };
 
+// A Principal-only identity disconnected from any backends for use in
+// testing and utilities.
+class PrincipalIdentity : public Identity {
+  const Principal id;
+public:
+
+  explicit PrincipalIdentity(Principal&& id) : id(std::move(id)) {}
+
+  // These exist to meet the interface requirement but are
+  // unimplemented and will `abort()`.
+  ACLOwner get_aclowner() const override;
+  uint32_t get_perms_from_aclspec(const DoutPrefixProvider* dpp, const aclspec_t& aclspec) const override;
+  bool is_admin() const override;
+  bool is_owner_of(const rgw_owner& owner) const override;
+  bool is_root() const override;
+  uint32_t get_perm_mask() const override;
+  std::string get_acct_name() const override;
+  std::string get_subuser() const override;
+  const std::string& get_tenant() const override;
+  const std::optional<RGWAccountInfo>& get_account() const override;
+  void to_str(std::ostream& out) const override;
+
+  // Predict whether the server would consider this identity to match a
+  // policy principal `p`, mirroring the structural matching in
+  // rgw::auth::LocalApplier::is_identity (users) and
+  // RoleApplier::is_identity (roles and assumed-role sessions) as far as
+  // the tool's Principal-only identity model allows.
+  bool is_identity(const Principal& p) const override;
+
+  // A role or an assumed-role session evaluates trust policies
+  // through the TYPE_ROLE branch of Statement::eval_principal;
+  // reflect that so rather than always reporting TYPE_RGW.
+  uint32_t get_identity_type() const override;
+  std::optional<rgw::ARN> get_caller_identity() const override;
+};
+
+
 } /* namespace auth */
 } /* namespace rgw */
 
+template <> struct fmt::formatter<rgw::auth::Identity> : ostream_formatter {};
 
 uint32_t rgw_perms_from_aclspec_default_strategy(
   const std::string& uid,

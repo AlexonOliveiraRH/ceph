@@ -20,10 +20,37 @@ from threading import Event, Lock
 from collections import defaultdict
 from typing import cast, Any, DefaultDict, Dict, List, Optional, Tuple, TypeVar, TYPE_CHECKING, Union
 
-from mgr_module import CLICommand, CLIReadCommand, MgrModule, Option, OptionValue, ServiceInfoT
+from .cli import TelemetryCLICommand
+
+from mgr_module import MgrModule, Option, OptionValue, ServiceInfoT
 
 
 ALL_CHANNELS = ['basic', 'ident', 'crash', 'device', 'perf']
+
+
+def _defaultdict_list() -> defaultdict:
+    return defaultdict(list)
+
+
+def _defaultdict_dict() -> defaultdict:
+    return defaultdict(dict)
+
+
+def _defaultdict_int() -> defaultdict:
+    return defaultdict(int)
+
+
+def _defaultdict_defaultdict_int() -> defaultdict:
+    return defaultdict(_defaultdict_int)
+
+
+def _defaultdict_defaultdict_defaultdict_int() -> defaultdict:
+    return defaultdict(_defaultdict_defaultdict_int)
+
+
+def _defaultdict_histogram() -> defaultdict:
+    """Six-level nested defaultdict(int) used by get_osd_histograms."""
+    return defaultdict(_defaultdict_defaultdict_defaultdict_int)
 
 LICENSE = 'sharing-1-0'
 LICENSE_NAME = 'Community Data License Agreement - Sharing - Version 1.0'
@@ -185,6 +212,7 @@ ROOK_KEYS_BY_COLLECTION : List[Tuple[str, Collection]] = [
 ]
 
 class Module(MgrModule):
+    CLICommand = TelemetryCLICommand
     metadata_keys = [
         "arch",
         "ceph_version",
@@ -499,7 +527,7 @@ class Module(MgrModule):
         return  etype + '.' + m.hexdigest()
 
     def get_heap_stats(self) -> Dict[str, dict]:
-        result: Dict[str, dict] = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+        result: Dict[str, dict] = defaultdict(_defaultdict_defaultdict_int)
         anonymized_daemons = {}
         osd_map = self.get('osd_map')
 
@@ -574,7 +602,7 @@ class Module(MgrModule):
         return parsed_output
 
     def get_mempool(self, mode: str = 'separated') -> Dict[str, dict]:
-        result: Dict[str, dict] = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+        result: Dict[str, dict] = defaultdict(_defaultdict_defaultdict_int)
         anonymized_daemons = {}
         osd_map = self.get('osd_map')
 
@@ -630,11 +658,7 @@ class Module(MgrModule):
 
     def get_osd_histograms(self, mode: str = 'separated') -> List[Dict[str, dict]]:
         # Initialize result dict
-        result: Dict[str, dict] = defaultdict(lambda: defaultdict(
-                                              lambda: defaultdict(
-                                              lambda: defaultdict(
-                                              lambda: defaultdict(
-                                              lambda: defaultdict(int))))))
+        result: Dict[str, dict] = defaultdict(_defaultdict_histogram)
 
         # Get list of osd ids from the metadata
         osd_metadata = self.get('osd_metadata')
@@ -745,8 +769,7 @@ class Module(MgrModule):
         return self.get('io_rate')
 
     def get_stats_per_pool(self) -> dict:
-        result = self.get('pg_dump')['pool_stats']
-
+        result = self.get('pool_stats', mutable=True)['pool_stats']
         # collect application metadata from osd_map
         osd_map = self.get('osd_map')
         application_metadata = {pool['pool']: pool['application_metadata'] for pool in osd_map['pools']}
@@ -837,7 +860,7 @@ class Module(MgrModule):
         perf_counters = self.get_perf_counters()
 
         # Initialize 'result' dict
-        result: Dict[str, dict] = defaultdict(lambda: defaultdict(list))
+        result: Dict[str, dict] = defaultdict(_defaultdict_list)
 
         # 'separated' mode
         anonymized_daemon_dict = {}
@@ -876,7 +899,7 @@ class Module(MgrModule):
                 result[daemon][collection] = []
 
                 for sub_collection in sub_collection_list:
-                    sub_collection_result: Dict[str, dict] = defaultdict(lambda: defaultdict(dict))
+                    sub_collection_result: Dict[str, dict] = defaultdict(_defaultdict_dict)
                     sub_collection_result['labels'] = sub_collection['labels']
                     for sub_collection_counter_name, sub_collection_counter_info in sub_collection['counters'].items():
                         if mode == 'separated':
@@ -1667,7 +1690,7 @@ class Module(MgrModule):
 
         return 0, msg, ''
 
-    @CLIReadCommand('telemetry status')
+    @TelemetryCLICommand.Read('telemetry status')
     def status(self) -> Tuple[int, str, str]:
         '''
         Show current configuration
@@ -1679,7 +1702,7 @@ class Module(MgrModule):
                             if self.last_upload else self.last_upload)
         return 0, json.dumps(r, indent=4, sort_keys=True), ''
 
-    @CLIReadCommand('telemetry diff')
+    @TelemetryCLICommand.Read('telemetry diff')
     def diff(self) -> Tuple[int, str, str]:
         '''
         Show the diff between opted-in collection and available collection
@@ -1699,7 +1722,7 @@ class Module(MgrModule):
 
         return 0, r, ''
 
-    @CLICommand('telemetry on')
+    @TelemetryCLICommand('telemetry on')
     def on(self, license: Optional[str] = None) -> Tuple[int, str, str]:
         '''
         Enable telemetry reports from this cluster
@@ -1734,7 +1757,7 @@ To enable, add '--license {LICENSE}' to the 'ceph telemetry on' command.'''
 
             return 0, msg, ''
 
-    @CLICommand('telemetry off')
+    @TelemetryCLICommand('telemetry off')
     def off(self) -> Tuple[int, str, str]:
         '''
         Disable telemetry reports from this cluster
@@ -1761,35 +1784,35 @@ To enable, add '--license {LICENSE}' to the 'ceph telemetry on' command.'''
         msg = 'Telemetry is now disabled.'
         return 0, msg, ''
 
-    @CLIReadCommand('telemetry enable channel all')
+    @TelemetryCLICommand.Read('telemetry enable channel all')
     def enable_channel_all(self, channels: List[str] = ALL_CHANNELS) -> Tuple[int, str, str]:
         '''
         Enable all channels
         '''
         return self.toggle_channel('enable', channels)
 
-    @CLIReadCommand('telemetry enable channel')
+    @TelemetryCLICommand.Read('telemetry enable channel')
     def enable_channel(self, channels: Optional[List[str]] = None) -> Tuple[int, str, str]:
         '''
         Enable a list of channels
         '''
         return self.toggle_channel('enable', channels)
 
-    @CLIReadCommand('telemetry disable channel all')
+    @TelemetryCLICommand.Read('telemetry disable channel all')
     def disable_channel_all(self, channels: List[str] = ALL_CHANNELS) -> Tuple[int, str, str]:
         '''
         Disable all channels
         '''
         return self.toggle_channel('disable', channels)
 
-    @CLIReadCommand('telemetry disable channel')
+    @TelemetryCLICommand.Read('telemetry disable channel')
     def disable_channel(self, channels: Optional[List[str]] = None) -> Tuple[int, str, str]:
         '''
         Disable a list of channels
         '''
         return self.toggle_channel('disable', channels)
 
-    @CLIReadCommand('telemetry channel ls')
+    @TelemetryCLICommand.Read('telemetry channel ls')
     def channel_ls(self) -> Tuple[int, str, str]:
         '''
         List all channels
@@ -1822,7 +1845,7 @@ To enable, add '--license {LICENSE}' to the 'ceph telemetry on' command.'''
 
         return 0, table.get_string(sortby="NAME"), ''
 
-    @CLIReadCommand('telemetry collection ls')
+    @TelemetryCLICommand.Read('telemetry collection ls')
     def collection_ls(self) -> Tuple[int, str, str]:
         '''
         List all collections
@@ -1879,7 +1902,7 @@ To enable, add '--license {LICENSE}' to the 'ceph telemetry on' command.'''
 
         return 0, f'{msg}{table.get_string(sortby="NAME")}', ''
 
-    @CLICommand('telemetry send')
+    @TelemetryCLICommand('telemetry send')
     def do_send(self,
                 endpoint: Optional[List[EndPoint]] = None,
                 license: Optional[str] = None) -> Tuple[int, str, str]:
@@ -1896,7 +1919,7 @@ Please consider enabling the telemetry module with 'ceph telemetry on'.'''
             self.last_report = self.compile_report()
             return self.send(self.last_report, endpoint)
 
-    @CLIReadCommand('telemetry show')
+    @TelemetryCLICommand.Read('telemetry show')
     def show(self, channels: Optional[List[str]] = None) -> Tuple[int, str, str]:
         '''
         Show a sample report of opted-in collections (except for 'device')
@@ -1916,7 +1939,7 @@ Please consider enabling the telemetry module with 'ceph telemetry on'.'''
 
         return 0, report, ''
 
-    @CLIReadCommand('telemetry preview')
+    @TelemetryCLICommand.Read('telemetry preview')
     def preview(self, channels: Optional[List[str]] = None) -> Tuple[int, str, str]:
         '''
         Preview a sample report of the most recent collections available (except for 'device')
@@ -1953,7 +1976,7 @@ Please consider enabling the telemetry module with 'ceph telemetry on'.'''
 
         return 0, report, ''
 
-    @CLIReadCommand('telemetry show-device')
+    @TelemetryCLICommand.Read('telemetry show-device')
     def show_device(self) -> Tuple[int, str, str]:
         '''
         Show a sample device report
@@ -1972,7 +1995,7 @@ Please consider enabling the telemetry module with 'ceph telemetry on'.'''
 
         return 0, json.dumps(self.get_report_locked('device'), indent=4, sort_keys=True), ''
 
-    @CLIReadCommand('telemetry preview-device')
+    @TelemetryCLICommand.Read('telemetry preview-device')
     def preview_device(self) -> Tuple[int, str, str]:
         '''
         Preview a sample device report of the most recent device collection
@@ -2002,7 +2025,7 @@ Please consider enabling the telemetry module with 'ceph telemetry on'.'''
         report = json.dumps(report, indent=4, sort_keys=True)
         return 0, report, ''
 
-    @CLIReadCommand('telemetry show-all')
+    @TelemetryCLICommand.Read('telemetry show-all')
     def show_all(self) -> Tuple[int, str, str]:
         '''
         Show a sample report of all enabled channels (including 'device' channel)
@@ -2023,7 +2046,7 @@ Please consider enabling the telemetry module with 'ceph telemetry on'.'''
         self.format_perf_histogram(report)
         return 0, json.dumps(report, indent=4, sort_keys=True), ''
 
-    @CLIReadCommand('telemetry preview-all')
+    @TelemetryCLICommand.Read('telemetry preview-all')
     def preview_all(self) -> Tuple[int, str, str]:
         '''
         Preview a sample report of the most recent collections available of all channels (including 'device')

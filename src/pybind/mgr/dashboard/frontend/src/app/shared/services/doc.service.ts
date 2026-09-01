@@ -45,10 +45,19 @@ export class DocService {
       trademarks: `${domainCeph}/en/trademarks/`,
       'dashboard-landing-page-status': `${domain}mgr/dashboard/#dashboard-landing-page-status`,
       'dashboard-landing-page-performance': `${domain}mgr/dashboard/#dashboard-landing-page-performance`,
-      'dashboard-landing-page-capacity': `${domain}mgr/dashboard/#dashboard-landing-page-capacity`
+      'dashboard-landing-page-capacity': `${domain}mgr/dashboard/#dashboard-landing-page-capacity`,
+      'dashboard-side-panel': `${domain}/rados/operations/health-checks/`
     };
 
     return sections[section];
+  }
+
+  alertDocUrl(alertName: string, releaseVersion = ''): string | null {
+    const baseUrl = this.urlGenerator('managing-alerts', releaseVersion);
+    if (!baseUrl || !alertName) {
+      return null;
+    }
+    return `${baseUrl}#${encodeURIComponent(`managing-alerts__${alertName.toLowerCase()}`)}`;
   }
 
   subscribeOnce(

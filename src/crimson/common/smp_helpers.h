@@ -20,7 +20,12 @@
 namespace crimson {
 
 using core_id_t = seastar::shard_id;
+using store_index_t = uint32_t;
+using store_shard_t = uint32_t;
 static constexpr core_id_t NULL_CORE = std::numeric_limits<core_id_t>::max();
+static constexpr store_index_t NULL_STORE_INDEX = std::numeric_limits<store_index_t>::max();
+static constexpr store_shard_t GLOBAL_STORE = std::numeric_limits<store_shard_t>::max();
+static constexpr store_index_t META_STORE_INDEX = 0;
 
 /**
  * submit_to
@@ -61,7 +66,7 @@ auto proxy_method_on_core(
  */
 template <typename F>
 auto invoke_on_all_seq(F f) -> decltype(seastar::futurize_invoke(f)) {
-  for (auto core: seastar::smp::all_cpus()) {
+  for (auto core: seastar::this_smp_all_shards()) {
       co_await crimson::submit_to(core, [&f] { return seastar::futurize_invoke(f);});
   }
 }
@@ -91,8 +96,8 @@ public:
     : out_seqs(0) { }
 
   smp_crosscore_ordering_t() requires (!IS_ONE)
-    : out_seqs(seastar::smp::count, 0),
-      in_controls(seastar::smp::count) {}
+    : out_seqs(seastar::this_smp_shard_count(), 0),
+      in_controls(seastar::this_smp_shard_count()) {}
 
   ~smp_crosscore_ordering_t() = default;
 

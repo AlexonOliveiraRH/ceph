@@ -23,7 +23,7 @@ function run() {
 
     export CEPH_MON="127.0.0.1:7180" # git grep '\<7180\>' : there must be only one
     export CEPH_ARGS
-    CEPH_ARGS+="--fsid=$(uuidgen) --auth-supported=none "
+    CEPH_ARGS+="--fsid=$(uuidgen) --auth_cluster_required=none --auth_service_required=none --auth_client_required=none "
     CEPH_ARGS+="--mon-host=$CEPH_MON "
     CEPH_ARGS+="--osd_min_pg_log_entries=5 --osd_max_pg_log_entries=10 "
     CEPH_ARGS+="--fake_statfs_for_testing=3686400 "
@@ -290,7 +290,7 @@ function TEST_backfill_test_multi() {
 # Set size back to 2
 # The 2 pools should race to backfill.
 # One pool goes active+clean
-# The other goes acitve+...+backfill_toofull
+# The other goes active+...+backfill_toofull
 function TEST_backfill_test_sametarget() {
     local dir=$1
     local pools=10
@@ -311,6 +311,7 @@ function TEST_backfill_test_sametarget() {
     do
       create_pool "${poolprefix}$p" 1 1
       ceph osd pool set "${poolprefix}$p" size 2
+      ceph osd pool set "${poolprefix}$p" pg_autoscale_mode off
     done
     sleep 5
 
@@ -346,6 +347,7 @@ function TEST_backfill_test_sametarget() {
         PG2="${p}.0"
         POOLNUM2=$p
         pool2="${poolprefix}$p"
+        echo "Found pools $pool1 and $pool2 with same non-primary osd $chk_osd2"
         break
       fi
     done
@@ -373,11 +375,12 @@ function TEST_backfill_test_sametarget() {
     dd if=/dev/urandom of=$dir/datafile bs=1024 count=4
     for i in $(seq 1 $objects)
     do
-	rados -p $pool1 put obj$i $dir/datafile
+	      rados -p $pool1 put obj$i $dir/datafile
         rados -p $pool2 put obj$i $dir/datafile
     done
 
     ceph osd pool set $pool1 size 2
+    sleep 10
     ceph osd pool set $pool2 size 2
     sleep 30
 
@@ -396,7 +399,7 @@ function TEST_backfill_test_sametarget() {
       echo "One didn't finish backfill"
       ERRORS="$(expr $ERRORS + 1)"
     fi
-
+    ceph osd df
     ceph pg dump pgs
 
     if [ $ERRORS != "0" ];
@@ -823,6 +826,7 @@ function TEST_ec_backfill_multi() {
     for p in $(seq 1 $pools)
     do
       ceph osd pg-upmap $(expr $p + 1).0 ${nonfillosds% *} $fillosd
+      sleep 10
     done
 
     sleep 30

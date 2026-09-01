@@ -212,7 +212,9 @@ public:
    * atomic_write_unit does not require fsync().
    */
 
-  NVMeBlockDevice(std::string device_path) : device_path(device_path) {}
+  NVMeBlockDevice(std::string device_path, store_index_t store_index = 0)
+    : RBMDevice(store_index),
+      device_path(device_path) {}
   ~NVMeBlockDevice() = default;
 
   open_ertr::future<> open(
@@ -228,9 +230,14 @@ public:
   read_ertr::future<> read(
     uint64_t offset,
     bufferptr &bptr) final;
+  read_ertr::future<> _readv(
+    uint64_t offset,
+    std::vector<bufferptr> ptrs) final;
 
   read_ertr::future<> nvme_read(
     uint64_t offset, size_t len, void *buffer_ptr);
+  read_ertr::future<> nvme_readv(
+    uint64_t offset, std::vector<bufferptr> ptrs);
 
   close_ertr::future<> close() override;
 
@@ -282,17 +289,11 @@ public:
     return device_path;
   }
 
-  seastar::future<> start() final {
-    return shard_devices.start(device_path);
-  }
+  seastar::future<> start(uint32_t shard_nums) final;
 
-  seastar::future<> stop() final {
-    return shard_devices.stop();
-  }
+  seastar::future<> stop() final;
 
-  Device& get_sharded_device() final {
-    return shard_devices.local();
-  }
+  Device& get_sharded_device(store_index_t store_index = 0) final;
 
   uint64_t get_preffered_write_granularity() const { return write_granularity; }
   uint64_t get_preffered_write_alignment() const { return write_alignment; }
@@ -372,7 +373,8 @@ private:
 
   int namespace_id; // TODO: multi namespaces
   std::string device_path;
-  seastar::sharded<NVMeBlockDevice> shard_devices;
+
+  seastar::sharded<MultiShardDevices<NVMeBlockDevice>> shard_devices;
 };
 
 }

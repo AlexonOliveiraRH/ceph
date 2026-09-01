@@ -43,6 +43,23 @@ The automated upgrade process follows Ceph best practices.  For example:
    If the new release changes the above target value, there may be splitting
    or merging of PGs when unsetting after the upgrade.
 
+   Cephadm will automatically pause and resume the PG autoscaler activity 
+   during upgrade unless opted-in by setting:
+
+   .. prompt:: bash #
+
+     ceph config set mgr mgr/cephadm/pg_autoscale_during_upgrade true
+
+   To view the current value:
+
+   .. prompt:: bash #
+
+     ceph config get mgr mgr/cephadm/pg_autoscale_during_upgrade
+
+   If autoscaling was already off before the upgrade, cephadm does not change
+   it unless you have set ``pg_autoscale_during_upgrade`` to ``true`` (opt-in
+   to turn autoscaling on for the duration of the upgrade).
+
 
 Starting the Upgrade
 ====================
@@ -56,7 +73,7 @@ Starting the Upgrade
    large-scale CephFS deployments because the cluster cannot quickly reduce active MDS(s)
    to `1` and a single active MDS cannot easily handle the load of all clients
    even for a short time. Therefore, to upgrade MDS(s) without reducing ``max_mds``,
-   the ``fail_fs`` option can to be set to ``true`` (default value is ``false``) prior
+   the ``fail_fs`` option can be set to ``true`` (default value is ``false``) prior
    to initiating the upgrade:
 
    .. prompt:: bash #
@@ -84,20 +101,60 @@ To upgrade to a specific release, run a command of the following form:
 
   ceph orch upgrade start --ceph-version <version>
 
-For example, to upgrade to v16.2.6, run the following command:
+For example, to upgrade to v20.2.3, run the following command:
 
 .. prompt:: bash #
 
-  ceph orch upgrade start --ceph-version 16.2.6
+  ceph orch upgrade start --ceph-version 20.2.3
 
 .. note::
 
-    From version v16.2.6 the Docker Hub registry is no longer used, so if you
+    Since version v16.2.6 the Docker Hub registry is no longer used, so if you
     use Docker you have to point it to the image in the quay.io registry:
 
     .. prompt:: bash #
 
-       ceph orch upgrade start --image quay.io/ceph/ceph:v16.2.6
+       ceph orch upgrade start --image quay.io/ceph/ceph:v20.2.3
+
+
+CRUSH bucket-scoped OSD upgrades (``osd ok-to-upgrade``)
+========================================================
+
+When performing OSD upgrades as part of a staggered Ceph upgrade,
+one may constrain the set of OSDs on which cephadm will operate.
+This ability is available in the Ceph Umbrella and later releases.
+As cephadm progresses through the specified CRUSH bucket, it asks
+the Monitors which OSDs may safely move to the target release.
+This process uses the ceph ``osd ok-to-upgrade`` command.
+
+Requirements:
+
+* For OSD-only upgrades, pass both ``--crush_bucket_type`` and ``--crush_bucket_name``
+  and ``--daemon-types osd`` only. Supported types today are ``host``, ``rack``,
+  and ``chassis``.
+* The Monitor's ``osd ok-to-upgrade`` expects the target **short** Ceph version
+  (same shape as ``ceph_version_short`` in ``ceph osd metadata``).
+* If the Monitors indicate to cephadm that no OSDs in the selected CRUSH bucket
+  are okay to upgrade, cephadm will log details and then retry the operation.
+* If the bucket parameters for a ceph ``osd ok-to-upgrade`` upgrade are not provided,
+  cephadm will fall back to the default ceph osd ok-to-stop gate for OSD upgrades.
+* Bucket-scope upgrades apply only to OSDs. CRUSH buckets do not influence upgrades
+  of other daemon types, for example Monitors, Managers, and MDSes.
+
+Example:
+
+.. prompt:: bash #
+
+  ceph orch upgrade start --image quay.io/ceph/ceph:v21.2.1 \
+    --daemon-types osd \
+    --crush_bucket_type rack --crush_bucket_name rack-a
+
+When performing OSD upgrades within this failure domain, cephadm calls
+ceph ``osd ok-to-upgrade`` with the specified bucket name and type, and max set to
+:confval:`mgr/cephadm/max_parallel_osd_upgrades`
+
+.. warning:: Do not change the cluster's topology during an OSD upgrade phase.
+   This includes the name or type of any CRUSH bucket.
 
 
 Monitoring the Upgrade
@@ -123,7 +180,7 @@ looks like this:
 
   [...]
     progress:
-      Upgrade to docker.io/ceph/ceph:v15.2.1 (00h 20m 12s)
+      Upgrade to quay.io/ceph/ceph:v20.2.3 (00h 20m 12s)
         [=======.....................] (time remaining: 01h 43m 31s)
 
 
@@ -173,9 +230,13 @@ command ``ceph orch upgrade status`` if the orchestrator has crashed:
 
    Error ENOENT: Module not found
 
-This is possibly caused by invalid JSON in a mgr config-key.
-See `Redmine tracker Issue #67329 <https://tracker.ceph.com/issues/67329>`_
-and `this discussion on the ceph-users mailing list <https://www.spinics.net/lists/ceph-users/msg83667.html>`_.
+This is possibly caused by invalid JSON in a mgr config-key. One known
+cause on releases before the fix: the OSD removal queue stored under
+the ``mgr/cephadm/osd_remove_queue`` config-key could contain a field
+(``original_weight``) that the cephadm module was unable to load back,
+which crashed the module whenever the Manager restarted. The
+workaround was to edit the stored JSON to remove the offending field
+and then restart ``ceph-mgr``.
 
 
 ``UPGRADE_NO_STANDBY_MGR``
@@ -214,7 +275,7 @@ following command:
 This alert (``UPGRADE_FAILED_PULL``) means that Ceph was unable to pull the
 container image for the target version. This can happen if you specify a
 version or container image that does not exist (e.g. "1.2.3"), or if the
-container registry can not be reached by one or more hosts in the cluster.
+container registry cannot be reached by one or more hosts in the cluster.
 
 To cancel the existing upgrade and to specify a different target version, run
 the following commands:

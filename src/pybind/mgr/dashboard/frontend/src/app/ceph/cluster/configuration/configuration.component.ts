@@ -11,6 +11,7 @@ import { CdTableFetchDataContext } from '~/app/shared/models/cd-table-fetch-data
 import { CdTableSelection } from '~/app/shared/models/cd-table-selection';
 import { Permission } from '~/app/shared/models/permissions';
 import { AuthStorageService } from '~/app/shared/services/auth-storage.service';
+import { ConfigurationOption } from '~/app/shared/services/configuration-resource-state.service';
 
 const RGW = 'rgw';
 
@@ -72,12 +73,39 @@ export class ConfigurationComponent extends ListWithDetails implements OnInit {
     {
       name: $localize`Source`,
       prop: 'source',
-      filterOptions: ['mon'],
+      filterOptions: ['mon', 'mgr_module'],
       filterPredicate: (row, value) => {
         if (!row.hasOwnProperty('source')) {
           return false;
         }
         return row.source.includes(value);
+      }
+    },
+    {
+      name: $localize`Module`,
+      prop: 'module',
+      filterOptions: ['cephadm'],
+      filterPredicate: (row, value) => {
+        if (value === 'cephadm') {
+          return row.name?.startsWith('mgr/cephadm/');
+        }
+        return false;
+      }
+    },
+    {
+      name: $localize`Category`,
+      prop: 'category',
+      filterOptions: [$localize`certificate`],
+      filterPredicate: (row, value) => {
+        if (value === 'certificate') {
+          return (
+            row.name?.toLowerCase().includes('certificate') ||
+            row.name?.toLowerCase().includes('cert') ||
+            row.name?.toLowerCase().includes('ssl') ||
+            row.name?.toLowerCase().includes('tls')
+          );
+        }
+        return false;
       }
     }
   ];
@@ -108,7 +136,12 @@ export class ConfigurationComponent extends ListWithDetails implements OnInit {
 
   ngOnInit() {
     this.columns = [
-      { canAutoResize: true, prop: 'name', name: $localize`Name` },
+      {
+        canAutoResize: true,
+        prop: 'name',
+        name: $localize`Name`,
+        cellTransformation: CellTemplate.routerLink
+      },
       { prop: 'desc', name: $localize`Description`, cellClass: 'wrap' },
       {
         prop: 'value',
@@ -134,7 +167,10 @@ export class ConfigurationComponent extends ListWithDetails implements OnInit {
   getConfigurationList(context: CdTableFetchDataContext) {
     this.configurationService.getConfigData().subscribe(
       (data: any) => {
-        this.data = data;
+        this.data = (Array.isArray(data) ? data : []).map((configOption: ConfigurationOption) => ({
+          ...configOption,
+          cdLink: `/configuration/${encodeURIComponent(configOption.name)}`
+        }));
       },
       () => {
         context.error();

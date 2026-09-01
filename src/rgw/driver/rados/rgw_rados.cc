@@ -36,7 +36,9 @@
 #include "rgw_rest_conn.h"
 #include "rgw_cr_rados.h"
 #include "rgw_cr_rest.h"
+#include "rgw_crypt.h"
 #include "rgw_datalog.h"
+#include "rgw_op.h"
 #include "rgw_putobj_processor.h"
 #include "rgw_lc_tier.h"
 #include "rgw_restore.h"
@@ -151,6 +153,52 @@ static inline void read_attr(std::map<std::string, bufferlist>& attrs,
   }
   if (found) {
     *found = i != attrs.end();
+  }
+}
+
+/**
+ * Decode restore status and expiry date from an attrs map for the bucket index.
+ * Tries primary first; if a key is missing and fallback is non-null, tries fallback.
+ */
+static void decode_restore_index_fields(
+    const rgw::sal::Attrs& primary,
+    const rgw::sal::Attrs* fallback,
+    uint8_t& restore_status,
+    ceph::real_time& restore_expiry_date)
+{
+  restore_status = 0;
+  restore_expiry_date = {};
+
+  bufferlist rs_bl;
+  if (auto it = primary.find(RGW_ATTR_RESTORE_STATUS); it != primary.end()) {
+    rs_bl = it->second;
+  } else if (fallback) {
+    if (auto it2 = fallback->find(RGW_ATTR_RESTORE_STATUS); it2 != fallback->end()) {
+      rs_bl = it2->second;
+    }
+  }
+  if (rs_bl.length()) {
+    try {
+      rgw::sal::RGWRestoreStatus rs;
+      auto bl_iter = rs_bl.cbegin();
+      decode(rs, bl_iter);
+      restore_status = static_cast<uint8_t>(rs);
+    } catch (buffer::error&) {}
+  }
+
+  bufferlist re_bl;
+  if (auto it = primary.find(RGW_ATTR_RESTORE_EXPIRY_DATE); it != primary.end()) {
+    re_bl = it->second;
+  } else if (fallback) {
+    if (auto it2 = fallback->find(RGW_ATTR_RESTORE_EXPIRY_DATE); it2 != fallback->end()) {
+      re_bl = it2->second;
+    }
+  }
+  if (re_bl.length()) {
+    try {
+      auto bl_iter = re_bl.cbegin();
+      decode(restore_expiry_date, bl_iter);
+    } catch (buffer::error&) {}
   }
 }
 
@@ -350,7 +398,7 @@ void RGWRadosThread::start()
 
 void RGWRadosThread::stop()
 {
-  down_flag = true;
+  set_down_flag();
   stop_process();
   if (worker) {
     worker->signal();
@@ -972,12 +1020,14 @@ void RGWIndexCompletionManager::process()
       }
 
       if (c->log_op) {
-        // This null_yield can stay, for now, since we're in our own thread
-        r = add_datalog_entry(&dpp, store->svc.datalog_rados, bucket_info,
-			      bs.shard_id, null_yield);
-	ldpp_dout(&dpp, 0) << "ERROR: " << __func__ << "(): write to datalog failed, obj=" << c->obj << " r=" << r << dendl;
-
-        /* ignoring error, can't do anything about it */
+        /* this null_yield can stay for now since we're in our own
+         * thread */
+        std::ignore = add_datalog_entry(&dpp, store->svc.datalog_rados,
+                                        bucket_info, bs.shard_id,
+                                        null_yield);
+        /* if there is an error we can ignore it, as a) there's
+         * nothing we can do and b) it's already logged in
+         * add_datalog_entry */
       }
     }
   }
@@ -1068,6 +1118,19 @@ bool RGWIndexCompletionManager::handle_completion(completion_t cb, complete_op_d
 
 void RGWRados::finalize()
 {
+  if (run_sync_thread) {
+    std::lock_guard l{meta_sync_thread_lock};
+    meta_sync_processor_thread->set_down_flag();
+    std::lock_guard dl{data_sync_thread_lock};
+    for (auto iter : data_sync_processor_threads) {
+      RGWDataSyncProcessorThread *thread = iter.second;
+      thread->set_down_flag();
+    }
+    if (sync_log_trimmer) {
+      sync_log_trimmer->set_down_flag();
+    }
+  }
+
   /* Before joining any sync threads, drain outstanding requests &
    * mark the async_processor as going_down() */
   if (svc.async_processor) {
@@ -1112,6 +1175,11 @@ void RGWRados::finalize()
   }
   delete sync_tracer;
   
+  if (use_restore_thread) {
+    restore->stop_processor();
+  }
+  restore = NULL;
+
   delete lc;
   lc = NULL; 
 
@@ -1153,10 +1221,6 @@ void RGWRados::finalize()
     rgw::bucketlogging::shutdown();
   }
 
-  if (use_restore_thread) {
-    restore->stop_processor();
-  }
-  restore = NULL;
   delete index_completion_manager;
 }
 
@@ -1308,6 +1372,47 @@ int RGWRados::init_complete(const DoutPrefixProvider *dpp, optional_yield y, rgw
   auto& zone_params = svc.zone->get_zone_params();
   auto& zone = svc.zone->get_zone();
 
+  binfo_cache = new RGWChainedCacheImpl<bucket_info_entry>;
+  binfo_cache->init(svc.cache);
+
+  topic_cache = new RGWChainedCacheImpl<pubsub_bucket_topics_entry>;
+  topic_cache->init(svc.cache);
+
+  lc = new RGWLC();
+  lc->initialize(cct, this->driver);
+
+  restore = make_unique<rgw::restore::Restore>();
+  ret = restore->initialize(cct, this->driver);
+
+  if (ret < 0) {
+    ldpp_dout(dpp, 0) << "ERROR: failed to initialize restore thread" << dendl;
+    return ret;
+  }
+
+  quota_handler = RGWQuotaHandler::generate_handler(dpp, this->driver, quota_threads);
+
+  bucket_index_max_shards = (cct->_conf->rgw_override_bucket_index_max_shards ? cct->_conf->rgw_override_bucket_index_max_shards :
+                             zone.bucket_index_max_shards);
+  if (bucket_index_max_shards > get_max_bucket_shards()) {
+    bucket_index_max_shards = get_max_bucket_shards();
+    ldpp_dout(dpp, 1) << __func__ << " bucket index max shards is too large, reset to value: "
+      << get_max_bucket_shards() << dendl;
+  }
+  ldpp_dout(dpp, 20) << __func__ << " bucket index max shards: " << bucket_index_max_shards << dendl;
+
+  bool need_tombstone_cache = !svc.zone->get_zone_data_notify_to_map().empty(); /* have zones syncing from us */
+
+  if (need_tombstone_cache) {
+    obj_tombstone_cache = new tombstone_cache_t(cct->_conf->rgw_obj_tombstone_cache_size);
+  }
+
+  reshard_wait = std::make_shared<RGWReshardWait>();
+
+  reshard = new RGWReshard(this->driver);
+
+  // disable reshard thread based on zone/zonegroup support
+  run_reshard_thread = run_reshard_thread && svc.zone->can_reshard();
+
   /* no point of running sync thread if we don't have a master zone configured
     or there is no rest_master_conn */
   if (!svc.zone->need_to_sync()) {
@@ -1386,52 +1491,11 @@ int RGWRados::init_complete(const DoutPrefixProvider *dpp, optional_yield y, rgw
     data_notifier->start();
   }
 
-  binfo_cache = new RGWChainedCacheImpl<bucket_info_entry>;
-  binfo_cache->init(svc.cache);
-
-  topic_cache = new RGWChainedCacheImpl<pubsub_bucket_topics_entry>;
-  topic_cache->init(svc.cache);
-
-  lc = new RGWLC();
-  lc->initialize(cct, this->driver);
-
   if (use_lc_thread)
     lc->start_processor();
 
-  restore = make_unique<rgw::restore::Restore>();
-  ret = restore->initialize(cct, this->driver);
-
-  if (ret < 0) {
-    ldpp_dout(dpp, 0) << "ERROR: failed to initialize restore thread" << dendl;
-    return ret;
-  }
-
   if (use_restore_thread)
     restore->start_processor();
-
-  quota_handler = RGWQuotaHandler::generate_handler(dpp, this->driver, quota_threads);
-
-  bucket_index_max_shards = (cct->_conf->rgw_override_bucket_index_max_shards ? cct->_conf->rgw_override_bucket_index_max_shards :
-                             zone.bucket_index_max_shards);
-  if (bucket_index_max_shards > get_max_bucket_shards()) {
-    bucket_index_max_shards = get_max_bucket_shards();
-    ldpp_dout(dpp, 1) << __func__ << " bucket index max shards is too large, reset to value: "
-      << get_max_bucket_shards() << dendl;
-  }
-  ldpp_dout(dpp, 20) << __func__ << " bucket index max shards: " << bucket_index_max_shards << dendl;
-
-  bool need_tombstone_cache = !svc.zone->get_zone_data_notify_to_map().empty(); /* have zones syncing from us */
-
-  if (need_tombstone_cache) {
-    obj_tombstone_cache = new tombstone_cache_t(cct->_conf->rgw_obj_tombstone_cache_size);
-  }
-
-  reshard_wait = std::make_shared<RGWReshardWait>();
-
-  reshard = new RGWReshard(this->driver);
-
-  // disable reshard thread based on zone/zonegroup support
-  run_reshard_thread = run_reshard_thread && svc.zone->can_reshard();
 
   if (run_reshard_thread)  {
     reshard->start_processor();
@@ -2451,12 +2515,8 @@ int RGWRados::create_pool(const DoutPrefixProvider *dpp, const rgw_pool& pool)
 
 void RGWRados::create_bucket_id(string *bucket_id)
 {
-  uint64_t iid = instance_id();
-  uint64_t bid = next_bucket_id();
-  char buf[svc.zone->get_zone_params().get_id().size() + 48];
-  snprintf(buf, sizeof(buf), "%s.%" PRIu64 ".%" PRIu64,
-           svc.zone->get_zone_params().get_id().c_str(), iid, bid);
-  *bucket_id = buf;
+  *bucket_id = fmt::format("{}.{}.{}", svc.zone->get_zone_params().get_id(),
+			   instance_id(), next_bucket_id());
 }
 
 int RGWRados::create_bucket(const DoutPrefixProvider* dpp,
@@ -3045,10 +3105,10 @@ int RGWRados::swift_versioning_copy(RGWObjectCtx& obj_ctx,
   }
 
   const string& src_name = obj.get_oid();
-  char buf[src_name.size() + 32];
   struct timespec ts = ceph::real_clock::to_timespec(state->mtime);
-  snprintf(buf, sizeof(buf), "%03x%s/%lld.%06ld", (int)src_name.size(),
-           src_name.c_str(), (long long)ts.tv_sec, ts.tv_nsec / 1000);
+  auto buf = fmt::format("{:03x}{}/{}.{:06}", int(src_name.size()),
+			src_name, static_cast<long long>(ts.tv_sec),
+			ts.tv_nsec / 1000);
 
   RGWBucketInfo dest_bucket_info;
 
@@ -3419,6 +3479,12 @@ int RGWRados::Object::Write::_do_write_meta(uint64_t size, uint64_t accounted_si
     }
   }
 
+  // extract restore fields for bucket index
+  uint8_t idx_restore_status = 0;
+  ceph::real_time idx_restore_expiry_date;
+  decode_restore_index_fields(attrs, nullptr,
+                              idx_restore_status, idx_restore_expiry_date);
+
   if (!op.size())
     return 0;
 
@@ -3474,12 +3540,33 @@ int RGWRados::Object::Write::_do_write_meta(uint64_t size, uint64_t accounted_si
     ldpp_dout(rctx.dpp, 0) << "ERROR: complete_atomic_modification returned r=" << r << dendl;
   }
 
+  /**
+   * For AEAD encryption (GCM), set bucket index sizes:
+   *   index_size = encrypted bytes on disk (for size_utilized)
+   *   index_accounted_size = plaintext bytes (for quota/listings)
+   *
+   * This is consistent with compression behavior where:
+   *   index_size = compressed bytes, index_accounted_size = uncompressed bytes
+   *
+   * For non-AEAD (CBC or unencrypted), both remain as passed in.
+   */
+  uint64_t index_size, index_accounted_size;
+  {
+    index_size = size;
+    index_accounted_size = accounted_size;
+    uint64_t original_size = 0;
+    if (rgw_get_aead_original_size(rctx.dpp, attrs, &original_size)) {
+      index_accounted_size = original_size;
+    }
+  }
+
   tracepoint(rgw_rados, complete_enter, req_id.c_str());
-  r = index_op->complete(rctx.dpp, poolid, epoch, size, accounted_size,
+  r = index_op->complete(rctx.dpp, poolid, epoch, index_size, index_accounted_size,
                         meta.set_mtime, etag, content_type,
                         storage_class, meta.owner,
 			 meta.category, meta.remove_objs, rctx.y,
-			 meta.user_data, meta.appendable, log_op);
+			 meta.user_data, meta.appendable, log_op,
+			 idx_restore_status, idx_restore_expiry_date);
   tracepoint(rgw_rados, complete_exit, req_id.c_str());
   if (r < 0)
     goto done_cancel;
@@ -3545,6 +3632,9 @@ done_cancel:
    */
   if (meta.if_match == NULL && meta.if_nomatch == NULL) {
     if (r == -ECANCELED || r == -ENOENT || r == -EEXIST) {
+      if (meta.mtime) {
+        *meta.mtime = meta.set_mtime;
+      }
       r = 0;
     }
   } else {
@@ -3840,6 +3930,10 @@ public:
   }
 
   int handle_headers(const map<string, string>& headers, int http_status) override {
+    if (http_status == 503) {
+      return -EBUSY;
+    }
+
     if (src_bucket_perms && http_status != 403 && http_status != 401) {
       auto iter = headers.find("RGWX_PERM_CHECKED");
       // if the header is not present, we need to check the ACL
@@ -3866,7 +3960,13 @@ static void set_copy_attrs(map<string, bufferlist>& src_attrs,
 {
   switch (attrs_mod) {
   case RGWRados::ATTRSMOD_NONE:
-    attrs = src_attrs;
+    {
+      auto tags = attrs.extract(RGW_ATTR_TAGS);
+      attrs = src_attrs;
+      if (!tags.empty()) {
+        attrs[RGW_ATTR_TAGS] = std::move(tags.mapped());
+      }
+    }
     break;
   case RGWRados::ATTRSMOD_REPLACE:
     if (!attrs[RGW_ATTR_ETAG].length()) {
@@ -3876,6 +3976,13 @@ static void set_copy_attrs(map<string, bufferlist>& src_attrs,
       auto ttiter = src_attrs.find(RGW_ATTR_TAIL_TAG);
       if (ttiter != src_attrs.end()) {
         attrs[RGW_ATTR_TAIL_TAG] = src_attrs[RGW_ATTR_TAIL_TAG];
+      }
+    }
+    // the tag-set is copied from the source unless the request replaced it
+    if (attrs.find(RGW_ATTR_TAGS) == attrs.end()) {
+      auto titer = src_attrs.find(RGW_ATTR_TAGS);
+      if (titer != src_attrs.end()) {
+        attrs[RGW_ATTR_TAGS] = titer->second;
       }
     }
     break;
@@ -3909,6 +4016,8 @@ int RGWRados::rewrite_obj(RGWBucketInfo& dest_bucket_info, const rgw_obj& obj, c
   attrset.erase(RGW_ATTR_ID_TAG);
   attrset.erase(RGW_ATTR_TAIL_TAG);
   attrset.erase(RGW_ATTR_STORAGE_CLASS);
+  attrset.erase(RGW_ATTR_SHARE_MANIFEST);
+  attrset.erase(RGW_ATTR_BLAKE3);
 
   ACLOwner owner;
   if (auto i = attrset.find(RGW_ATTR_ACL); i != attrset.end()) {
@@ -4082,6 +4191,12 @@ int RGWRados::reindex_obj(rgw::sal::Driver* driver,
   read_attr(attr_set, RGW_ATTR_OLH_INFO, olh_info_bl, &found_olh_info);
   read_attr(attr_set, RGW_ATTR_APPEND_PART_NUM, part_num_bl, &appendable);
 
+  // extract restore fields for bucket index
+  uint8_t idx_restore_status = 0;
+  ceph::real_time idx_restore_expiry_date;
+  decode_restore_index_fields(attr_set, nullptr,
+                              idx_restore_status, idx_restore_expiry_date);
+
   // check for a pure OLH object and if so exit early
   if (found_olh_info) {
     try {
@@ -4160,7 +4275,10 @@ int RGWRados::reindex_obj(rgw::sal::Driver* driver,
 			    nullptr, // remove_objs list
 			    y,
 			    nullptr, // user data string
-			    appendable);
+			    appendable,
+			    true, // log_op
+			    idx_restore_status,
+			    idx_restore_expiry_date);
   if (ret < 0) {
     ldpp_dout(dpp, 0) << "ERROR: " << __func__ <<
       ": update index complete for " << p(head_obj) << " returned: " <<
@@ -4182,6 +4300,8 @@ int RGWRados::reindex_obj(rgw::sal::Driver* driver,
     meta.etag = etag;
     meta.content_type = content_type;
     meta.appendable = appendable;
+    meta.restore_status = idx_restore_status;
+    meta.restore_expiry_date = idx_restore_expiry_date;
 
     ret = link_helper(false, meta, "linking version");
   } // if bucket is versioned
@@ -4789,6 +4909,8 @@ int RGWRados::fetch_remote_obj(RGWObjectCtx& dest_obj_ctx,
   if (!keep_tags) {
     attrs.erase(RGW_ATTR_TAGS);
   }
+  attrs.erase(RGW_ATTR_SHARE_MANIFEST);
+  attrs.erase(RGW_ATTR_BLAKE3);
 
   if (copy_if_newer) {
     uint64_t pg_ver = 0;
@@ -5081,14 +5203,29 @@ int RGWRados::copy_obj(RGWObjectCtx& src_obj_ctx,
   src_attrs.erase(RGW_ATTR_OBJ_REPLICATION_TIMESTAMP);
   src_attrs.erase(RGW_ATTR_OBJ_REPLICATION_STATUS);
 
-  // drop encryption attributes
-  // will be generated by copy_obj_data() if encryption is requested
+  /**
+   * Drop encryption key-related attributes — they will be regenerated by
+   * copy_obj_data() if encryption is requested.
+   *
+   * CRYPT_ORIGINAL_SIZE and CRYPT_PARTS are intentionally preserved here.
+   * In the zero-copy path (!copy_data), the object's raw bytes are not
+   * rewritten, so the encryption state (ciphertext layout, sizes) is
+   * unchanged and these size attributes remain valid. In the copy_data
+   * path, they are erased separately once the data is rewritten as a
+   * single stream.
+   *
+   * CRYPT_PART_NUMS must be erased because copy writes data as a single
+   * stream (part 0), so stale part numbers from a multipart source would
+   * cause wrong key derivation.
+   */
   src_attrs.erase(RGW_ATTR_CRYPT_KEYSEL);
   src_attrs.erase(RGW_ATTR_CRYPT_CONTEXT);
   src_attrs.erase(RGW_ATTR_CRYPT_MODE);
   src_attrs.erase(RGW_ATTR_CRYPT_KEYID);
   src_attrs.erase(RGW_ATTR_CRYPT_KEYMD5);
   src_attrs.erase(RGW_ATTR_CRYPT_DATAKEY);
+  src_attrs.erase(RGW_ATTR_CRYPT_SALT);
+  src_attrs.erase(RGW_ATTR_CRYPT_PART_NUMS);
 
   set_copy_attrs(src_attrs, attrs, attrs_mod);
   attrs.erase(RGW_ATTR_ID_TAG);
@@ -5184,8 +5321,15 @@ int RGWRados::copy_obj(RGWObjectCtx& src_obj_ctx,
 
   if (copy_data) { /* refcounting tail wouldn't work here, just copy the data */
     attrs.erase(RGW_ATTR_TAIL_TAG);
+    attrs.erase(RGW_ATTR_SHARE_MANIFEST);
+    attrs.erase(RGW_ATTR_BLAKE3);
+    // Data is rewritten as a single stream; drop stale multipart boundaries
+    attrs.erase(RGW_ATTR_CRYPT_PARTS);
+    attrs.erase(RGW_ATTR_CRYPT_PART_NUMS);
+    attrs.erase(RGW_ATTR_CRYPT_PREFETCH_ALIGN);
     return copy_obj_data(dest_obj_ctx, owner, dest_bucket_info, dest_placement, read_op, obj_size - 1, dest_obj,
-                         mtime, real_time(), attrs, olh_epoch, delete_at, petag, dp_factory, dpp, y);
+                         mtime, real_time(), attrs, olh_epoch, delete_at, petag, dp_factory, dpp, y,
+                         astate->accounted_size);
   }
 
   /* This has been in for 2 years, so we can safely assume amanifest is not NULL */
@@ -5220,6 +5364,8 @@ int RGWRados::copy_obj(RGWObjectCtx& src_obj_ctx,
   if (!copy_itself) {
     aio = rgw::make_throttle(cct->_conf->rgw_max_copy_obj_concurrent_io, y);
     attrs.erase(RGW_ATTR_TAIL_TAG);
+    attrs.erase(RGW_ATTR_SHARE_MANIFEST);
+    attrs.erase(RGW_ATTR_BLAKE3);
     manifest = *amanifest;
     const rgw_bucket_placement& tail_placement = manifest.get_tail_placement();
     if (tail_placement.bucket.name.empty()) {
@@ -5356,6 +5502,7 @@ int RGWRados::copy_obj_data(RGWObjectCtx& obj_ctx,
                rgw::sal::DataProcessorFactory *dp_factory,
                const DoutPrefixProvider *dpp,
                optional_yield y,
+               uint64_t src_accounted_size,
                bool log_op)
 {
   string tag;
@@ -5424,8 +5571,17 @@ int RGWRados::copy_obj_data(RGWObjectCtx& obj_ctx,
       ldpp_dout(dpp, 0) << "ERROR: failed to read compression info" << dendl;
       return ret;
     }
-    // pass original size if compressed
-    accounted_size = compressed ? cs_info.orig_size : ofs;
+    // The bucket index accounted_size must be the object's logical (uncompressed)
+    // size. When the destination is compressed we take it from the compression info.
+    // Otherwise `ofs` is the number of RAW bytes read from the source: but if the source
+    // itself is compressed, the ofs is the *compressed* size, not the logical
+    // size. So, prefer the source's known logical size.
+    accounted_size = compressed ? cs_info.orig_size
+                                : (src_accounted_size ? src_accounted_size : ofs);
+  }
+
+  if (dp_factory) {
+    accounted_size = dp_factory->get_accounted_size(accounted_size);
   }
 
   const req_context rctx{dpp, y, nullptr};
@@ -5463,6 +5619,68 @@ int fixup_manifest_to_parts_len(const DoutPrefixProvider *dpp, rgw::sal::Attrs &
 
   return 0;
 }
+
+/*
+ * DataProcessorFactory for lifecycle transitions.
+ *
+ * Thin subclass of RGWRecompressDPF that supplies a pre-fetched
+ * decrypt key and zone compression config. The encrypt key is
+ * built fresh at set_writer() time so AEAD modes get a new salt
+ * (avoids GCM nonce reuse on re-encrypted plaintext).
+ */
+class RGWTransitionDPF : public RGWRecompressDPF {
+  RGWObjectCtx& obj_ctx;
+  rgw_obj& obj;
+  std::string dest_compression;
+  bool compress_encrypted_enabled;
+
+  /* pre-fetched by transition_obj() and passed to constructor */
+  std::unique_ptr<BlockCrypt> prefetched_decrypt;
+
+protected:
+  int get_decrypt_crypt(const DoutPrefixProvider* dpp,
+                        optional_yield y,
+                        const rgw::sal::Attrs& src_attrs,
+                        std::unique_ptr<BlockCrypt>* crypt) override
+  {
+    *crypt = std::move(prefetched_decrypt);
+    return 0;
+  }
+
+  int get_encrypt_crypt(const DoutPrefixProvider* dpp,
+                        optional_yield y,
+                        rgw::sal::Attrs& dest_attrs,
+                        std::unique_ptr<BlockCrypt>* crypt) override
+  {
+    return rgw_prepare_reencrypt_object(dpp, cct, dest_attrs,
+                                        obj.bucket.bucket_id,
+                                        obj.key.name, y, crypt);
+  }
+
+  const std::string& get_dest_compression() override { return dest_compression; }
+
+  bool supports_compress_encrypted() override {
+    return compress_encrypted_enabled;
+  }
+
+  void mark_compressed() override { obj_ctx.set_compressed(obj); }
+
+public:
+  RGWTransitionDPF(CephContext* cct_,
+                   uint64_t& obj_size,
+                   const rgw::sal::Attrs& src_attrs,
+                   RGWObjectCtx& obj_ctx_,
+                   rgw_obj& obj_,
+                   const std::string& dest_compression_,
+                   bool compress_encrypted,
+                   std::unique_ptr<BlockCrypt> decrypt)
+    : RGWRecompressDPF(cct_, obj_size, src_attrs),
+      obj_ctx(obj_ctx_), obj(obj_),
+      dest_compression(dest_compression_),
+      compress_encrypted_enabled(compress_encrypted),
+      prefetched_decrypt(std::move(decrypt))
+  {}
+};
 
 int RGWRados::transition_obj(RGWObjectCtx& obj_ctx,
                              RGWBucketInfo& bucket_info,
@@ -5509,10 +5727,114 @@ int RGWRados::transition_obj(RGWObjectCtx& obj_ctx,
   }
   attrs.erase(RGW_ATTR_ID_TAG);
   attrs.erase(RGW_ATTR_TAIL_TAG);
+  attrs.erase(RGW_ATTR_SHARE_MANIFEST);
+  attrs.erase(RGW_ATTR_BLAKE3);
 
   ACLOwner owner;
   if (auto i = attrs.find(RGW_ATTR_ACL); i != attrs.end()) {
     (void) decode_policy(dpp, i->second, &owner);
+  }
+
+  rgw::sal::DataProcessorFactory* dp_factory = nullptr;
+  std::optional<RGWTransitionDPF> transition_dpf;
+
+  const auto& compression_type =
+      svc.zone->get_zone_params().get_compression_type(placement_rule);
+
+  bool src_compressed = false;
+  RGWCompressionInfo cs_info;
+  ret = rgw_compression_info_from_attrset(attrs, src_compressed, cs_info);
+  if (ret < 0)
+    return ret;
+
+  /*
+   * Determine the effective destination compression. If the source
+   * is encrypted and the zonegroup doesn't support compress_encrypted,
+   * force "none" to avoid incompatible layouts.
+   */
+  std::string dest_compression = compression_type;
+  bool is_encrypted = attrs.count(RGW_ATTR_CRYPT_MODE);
+  if (is_encrypted &&
+      !svc.zone->get_zonegroup().supports(
+          rgw::zone_features::compress_encrypted)) {
+    dest_compression = "none";
+  }
+
+  /*
+   * Skip when the source already matches the destination config.
+   * "random" never matches because the stored codec is concrete
+   * (e.g. "zlib") while the config string stays "random".
+   */
+  bool already_matches =
+      dest_compression != "random" &&
+      ((!src_compressed && dest_compression == "none") ||
+       (src_compressed && cs_info.compression_type == dest_compression));
+
+  bool need_recompress = !already_matches;
+
+  /*
+   * Retrieve the decryption key when the source is encrypted
+   * and compression needs to change. The re-encryption path will
+   * fetch the same key again from the backend (after regenerating
+   * the GCM salt for AEAD modes) — a second KMS/SSE-S3 round-trip
+   * per transitioned object.
+   */
+  std::unique_ptr<BlockCrypt> decrypt_crypt;
+
+  if (obj_size == 0) {
+    ldpp_dout(dpp, 20) << __func__ << " " << obj
+        << " is empty, skipping recompression" << dendl;
+    need_recompress = false;
+  }
+
+  if (need_recompress && is_encrypted) {
+    ret = rgw_prepare_decrypt_object(
+        dpp, cct, attrs,
+        bucket_info.bucket.bucket_id, obj.key.name,
+        y, &decrypt_crypt);
+    if (ret == -ENOTSUP) {
+      ldpp_dout(dpp, 10) << __func__ << " cannot decrypt "
+          << obj << ", copying as-is" << dendl;
+    } else if (ret < 0) {
+      return ret;
+    }
+
+    if (!decrypt_crypt) {
+      if (src_compressed && !svc.zone->get_zonegroup().supports(
+              rgw::zone_features::compress_encrypted)) {
+        ldpp_dout(dpp, 0) << "ERROR: " << obj
+            << " is encrypted+compressed but cannot decrypt;"
+            " refusing to copy incompatible layout when"
+            " compress_encrypted is disabled" << dendl;
+        return -ENOTSUP;
+      }
+      ldpp_dout(dpp, 10) << __func__ << " " << obj
+          << " encrypted but cannot decrypt, copying as-is" << dendl;
+      need_recompress = false;
+    } else {
+      ldpp_dout(dpp, 10) << __func__ << " re-encrypting "
+          << obj << " for recompression" << dendl;
+    }
+  }
+
+  bool compress_encrypted = svc.zone->get_zonegroup().supports(
+      rgw::zone_features::compress_encrypted);
+
+  if (need_recompress) {
+    transition_dpf.emplace(cct, obj_size, attrs,
+                           obj_ctx, obj,
+                           dest_compression,
+                           compress_encrypted,
+                           std::move(decrypt_crypt));
+    dp_factory = &*transition_dpf;
+  } else if (!is_encrypted) {
+    ldpp_dout(dpp, 20) << __func__
+        << " compression already matches dest config ("
+        << dest_compression << "), skipping" << dendl;
+  } else {
+    ldpp_dout(dpp, 20) << __func__
+        << " encrypted, compression already matches, copying as-is"
+        << dendl;
   }
 
   ret = copy_obj_data(obj_ctx,
@@ -5528,9 +5850,10 @@ int RGWRados::transition_obj(RGWObjectCtx& obj_ctx,
                       olh_epoch,
                       real_time(),
                       nullptr /* petag */,
-                      nullptr, /* dp_factory */
+                      dp_factory,
                       dpp,
                       y,
+                      0, /* src_accounted_size: unknown here, keep ofs-based size */
                       log_op);
   if (ret < 0) {
     return ret;
@@ -5571,20 +5894,32 @@ int RGWRados::restore_obj_from_cloud(RGWLCCloudTierCtx& tier_ctx,
   }
 
   uint64_t olh_epoch = 0; // read it from attrs fetched from cloud below
+  /*
+   * Versioned restores still re-link at their original epoch: complete()
+   * re-arms it from RGW_ATTR_RESTORE_VERSIONED_EPOCH. The nullopt covers
+   * objects with no recorded epoch (null versions, non-versioned), where
+   * an engaged 0 would mean "next epoch" and promote over the real latest.
+   */
   rgw::putobj::AtomicObjectProcessor processor(aio.get(), this, dest_bucket_info, nullptr,
-                                  owner, obj_ctx, dest_obj_bi, olh_epoch, tag, dpp, y, no_trace);
+                                  owner, obj_ctx, dest_obj_bi, std::nullopt, tag, dpp, y, no_trace);
  
   void (*progress_cb)(off_t, void *) = NULL;
   void *progress_data = NULL;
   bool cb_processed = false;
-  RGWFetchObjFilter *filter;
-  RGWFetchObjFilter_Default source_filter;
-  if (!filter) {
-    filter = &source_filter;
-  }
   boost::optional<RGWPutObj_Compress> compressor;
   CompressorRef plugin;
   rgw_placement_rule dest_placement(dest_bucket_info.placement_rule, tier_ctx.restore_storage_class);
+
+  // check if the dest placement is still valid
+  if (!tier_ctx.driver->valid_placement(dest_placement)) {
+    ret = -EINVAL;
+    ldpp_dout(dpp, 0) << "ERROR: non existent restore storage class:"
+	  	      << tier_ctx.restore_storage_class
+		      << ". Restore of object(" << dest_obj << ") , failed, ret="
+		      << ret << dendl;
+    return ret;
+  }
+
   RGWRadosPutObj cb(dpp, cct, plugin, compressor, &processor, progress_cb, progress_data,
                     [&](map<string, bufferlist> obj_attrs) {
                       processor.set_tail_placement(dest_placement);
@@ -5626,9 +5961,11 @@ int RGWRados::restore_obj_from_cloud(RGWLCCloudTierCtx& tier_ctx,
                                 attrs, days, glacier_params, in_progress, &cb);
   } else {
     ldpp_dout(dpp, 20) << "Fetching  object:" << dest_obj << "from the cloud" <<  dendl;
-    ret = rgw_cloud_tier_get_object(tier_ctx, false,  headers,
-                                &set_mtime, etag, accounted_size,
-                                attrs, &cb);
+    ret = retry_on_transient_error(tier_ctx.y, dpp, cct, __func__, [&]() {
+      return rgw_cloud_tier_get_object(tier_ctx, false, headers,
+                                       &set_mtime, etag, accounted_size,
+                                       attrs, &cb);
+    });
     in_progress = false;
   }
 
@@ -5766,6 +6103,36 @@ int RGWRados::restore_obj_from_cloud(RGWLCCloudTierCtx& tier_ctx,
                            (rgw_zone_set *)&zone_set, &canceled, rctx, log_op ? rgw::sal::FLAG_LOG_OP : 0);
   if (ret < 0) {
     return ret;
+  }
+
+  if (dest_obj.key.have_null_instance()) {
+    /*
+     * Keep a sole null version current: promote only when the OLH does
+     * not already resolve to a real version, never demoting the latest.
+     */
+    rgw_obj head = dest_obj;
+    head.key.instance.clear();
+    RGWObjState* st = nullptr;
+    if (get_obj_state(dpp, &obj_ctx, dest_bucket_info, head, &st, nullptr, true, y) >= 0 &&
+        (!st->exists || st->obj.key.instance.empty() || st->obj.key.have_null_instance())) {
+      set_olh(dpp, obj_ctx, dest_bucket_info, dest_obj_bi, false, nullptr,
+              olh_epoch, real_time(), false, y, nullptr, log_op);
+    }
+  }
+
+  /*
+   * complete() doesn't write the separate version list entry; refresh it
+   * so the listing reflects the restored size. No-op for non-versioned
+   * entries.
+   */
+  int r = bucket_index_refresh_instance(dpp, dest_bucket_info, dest_obj_bi, y);
+  if (r == -EOPNOTSUPP) {
+    ldpp_dout(dpp, 4) << "WARNING: bucket_refresh_instance not supported by OSD; "
+                      << "listing metadata for " << dest_obj << " may be stale" << dendl;
+  } else if (r < 0) {
+    ldpp_dout(dpp, 0) << "ERROR: failed to refresh listing entry for " << dest_obj
+                      << ": " << r << dendl;
+    return r;
   }
 
   // set size to be used to send bucket notification
@@ -6148,7 +6515,7 @@ int RGWRados::bucket_suspended(const DoutPrefixProvider *dpp, rgw_bucket& bucket
     return ret;
   }
 
-  *suspended = ((bucket_info.flags & BUCKET_SUSPENDED) != 0);
+  *suspended = bucket_info.bucket_suspended();
   return 0;
 }
 
@@ -6421,43 +6788,6 @@ int RGWRados::bucket_resync_encrypted_multipart(const DoutPrefixProvider* dpp,
 
   f->close_section(); // "progress" array
   return 0;
-}
-
-int RGWRados::defer_gc(const DoutPrefixProvider *dpp, RGWObjectCtx* octx, RGWBucketInfo& bucket_info, const rgw_obj& obj, optional_yield y)
-{
-  std::string oid, key;
-  get_obj_bucket_and_oid_loc(obj, oid, key);
-  if (!octx)
-    return 0;
-
-  RGWObjState *state = NULL;
-  RGWObjManifest *manifest = nullptr;
-
-  int r = get_obj_state(dpp, octx, bucket_info, obj, &state, &manifest, false, y);
-  if (r < 0)
-    return r;
-
-  if (!state->is_atomic) {
-    ldpp_dout(dpp, 20) << "state for obj=" << obj << " is not atomic, not deferring gc operation" << dendl;
-    return -EINVAL;
-  }
-
-  string tag;
-
-  if (state->tail_tag.length() > 0) {
-    tag = state->tail_tag.c_str();
-  } else if (state->obj_tag.length() > 0) {
-    tag = state->obj_tag.c_str();
-  } else {
-    ldpp_dout(dpp, 20) << "state->obj_tag is empty, not deferring gc operation" << dendl;
-    return -EINVAL;
-  }
-
-  ldpp_dout(dpp, 0) << "defer chain tag=" << tag << dendl;
-
-  cls_rgw_obj_chain chain;
-  update_gc_chain(dpp, state->obj, *manifest, &chain);
-  return gc->async_defer_chain(tag, chain);
 }
 
 void RGWRados::remove_rgw_head_obj(ObjectWriteOperation& op)
@@ -6871,7 +7201,6 @@ static void generate_fake_tag(const DoutPrefixProvider *dpp, RGWRados* store, ma
   }
 
   unsigned char md5[CEPH_CRYPTO_MD5_DIGESTSIZE];
-  char md5_str[CEPH_CRYPTO_MD5_DIGESTSIZE * 2 + 1];
   MD5 hash;
   // Allow use of MD5 digest in FIPS mode for non-cryptographic purposes
   hash.SetFlags(EVP_MD_CTX_FLAG_NON_FIPS_ALLOW);
@@ -6884,8 +7213,7 @@ static void generate_fake_tag(const DoutPrefixProvider *dpp, RGWRados* store, ma
   }
 
   hash.Final(md5);
-  buf_to_hex(md5, CEPH_CRYPTO_MD5_DIGESTSIZE, md5_str);
-  tag.append(md5_str);
+  buf_to_hex(md5, std::back_inserter(tag));
 
   ldpp_dout(dpp, 10) << "generate_fake_tag new tag=" << tag << dendl;
 
@@ -7051,6 +7379,26 @@ int RGWRados::get_obj_state_impl(const DoutPrefixProvider *dpp, RGWObjectCtx *oc
        */
       generate_fake_tag(dpp, this, s->attrset, *sm->manifest, manifest_bl, s->obj_tag);
       s->fake_tag = true;
+    }
+  }
+
+  /**
+   * For AEAD encryption: adjust accounted_size to original plaintext size.
+   * This ensures Content-Length headers and range requests use plaintext size.
+   * Helpers return false for non-AEAD modes (including CBC), so this is a no-op
+   * outside of AEAD.
+   * Must be after manifest handling since manifest->get_obj_size() returns
+   * encrypted size and re-sets accounted_size.
+   */
+  if (!compressed && s->accounted_size == s->size) {
+    uint64_t original_size = 0;
+    if (rgw_get_aead_original_size(dpp, s->attrset, &original_size)) {
+      s->accounted_size = original_size;
+    } else {
+      uint64_t decrypted_size = 0;
+      if (rgw_get_aead_decrypted_size(dpp, s->attrset, s->size, &decrypted_size)) {
+        s->accounted_size = decrypted_size;
+      }
     }
   }
   if (iter = s->attrset.find(RGW_ATTR_PG_VER); iter != s->attrset.end()) {
@@ -7589,33 +7937,52 @@ int RGWRados::set_attrs(const DoutPrefixProvider *dpp, RGWObjectCtx* octx, RGWBu
       }
       int64_t poolid = ioctx.get_id();
 
-      // Retain Object category as CloudTiered while restore is in
-      // progress or failed or if its temporarily restored copy
+      /*
+       * Retain Object category as CloudTiered while restore is in
+       * progress or failed or if its temporarily restored copy.
+       * Check new attrs first, fall back to existing attrs for partial updates.
+       */
       RGWObjCategory category = RGWObjCategory::Main;
-      auto r_iter = attrs.find(RGW_ATTR_RESTORE_STATUS);
-      auto t_iter = attrs.find(RGW_ATTR_RESTORE_TYPE);
-      if (r_iter != attrs.end()) {
-        rgw::sal::RGWRestoreStatus st = rgw::sal::RGWRestoreStatus::None;
-        auto iter = r_iter->second.cbegin();
-
+      bufferlist rs_bl, rt_bl;
+      if (auto it = attrs.find(RGW_ATTR_RESTORE_STATUS); it != attrs.end()) {
+        rs_bl = it->second;
+      } else if (auto it2 = state->attrset.find(RGW_ATTR_RESTORE_STATUS);
+                 it2 != state->attrset.end()) {
+        rs_bl = it2->second;
+      }
+      if (rs_bl.length()) {
         try {
           using ceph::decode;
-          decode(st, iter);
+          rgw::sal::RGWRestoreStatus st = rgw::sal::RGWRestoreStatus::None;
+          auto bl_iter = rs_bl.cbegin();
+          decode(st, bl_iter);
 
           if (st != rgw::sal::RGWRestoreStatus::CloudRestored) {
             category = RGWObjCategory::CloudTiered;
           } else { // check if its temporary copy
-            if (t_iter != attrs.end()) {
+            if (auto it = attrs.find(RGW_ATTR_RESTORE_TYPE); it != attrs.end()) {
+              rt_bl = it->second;
+            } else if (auto it2 = state->attrset.find(RGW_ATTR_RESTORE_TYPE);
+                       it2 != state->attrset.end()) {
+              rt_bl = it2->second;
+            }
+            if (rt_bl.length()) {
               rgw::sal::RGWRestoreType rt;
-              decode(rt, t_iter->second);
+              decode(rt, rt_bl);
 
               if (rt == rgw::sal::RGWRestoreType::Temporary) {
                 category = RGWObjCategory::CloudTiered;
                 // temporary restore; set storage-class to cloudtier storage class
-                auto c_iter = attrs.find(RGW_ATTR_CLOUDTIER_STORAGE_CLASS);
-
-                if (c_iter != attrs.end()) {
-                  storage_class = rgw_bl_str(c_iter->second);
+                bufferlist sc_bl;
+                if (auto it = attrs.find(RGW_ATTR_CLOUDTIER_STORAGE_CLASS);
+                    it != attrs.end()) {
+                  sc_bl = it->second;
+                } else if (auto it2 = state->attrset.find(RGW_ATTR_CLOUDTIER_STORAGE_CLASS);
+                           it2 != state->attrset.end()) {
+                  sc_bl = it2->second;
+                }
+                if (sc_bl.length()) {
+                  storage_class = rgw_bl_str(sc_bl);
                 }
               }
             }
@@ -7623,10 +7990,17 @@ int RGWRados::set_attrs(const DoutPrefixProvider *dpp, RGWObjectCtx* octx, RGWBu
         } catch (buffer::error& err) {
         }
       }
+      // extract restore fields for index, with partial-update fallback
+      uint8_t idx_restore_status = 0;
+      ceph::real_time idx_restore_expiry_date;
+      decode_restore_index_fields(attrs, &state->attrset,
+                                  idx_restore_status, idx_restore_expiry_date);
+
 	    ldpp_dout(dpp, 20) << "Setting obj category:" << category << ", storage_class:" << storage_class << dendl;
       r = index_op.complete(dpp, poolid, epoch, state->size, state->accounted_size,
                             mtime, etag, content_type, storage_class, owner,
-                            category, nullptr, y, nullptr, false, log_op);
+                            category, nullptr, y, nullptr, false, log_op,
+                            idx_restore_status, idx_restore_expiry_date);
     } else {
       int ret = index_op.cancel(dpp, nullptr, y, log_op);
       if (ret < 0) {
@@ -7832,6 +8206,17 @@ int RGWRados::Object::Read::prepare(optional_yield y, const DoutPrefixProvider *
     }
 
     for (auto& iter : src_attrset) {
+      /*
+       * Skip object-level crypt attrs (ORIGINAL_SIZE, PARTS) that describe the
+       * whole object and would break a single-part read. PART_NUMS passes
+       * through; it carries the per-part (num, salt) needed to derive this
+       * part's key.
+       */
+      if (iter.first == RGW_ATTR_CRYPT_ORIGINAL_SIZE ||
+          iter.first == RGW_ATTR_CRYPT_PARTS) {
+        ldpp_dout(dpp, 4) << "skip crypt attr for part read: " << iter.first << dendl;
+        continue;
+      }
       ldpp_dout(dpp, 4) << "copy crypt attr: " << iter.first << dendl;
       if (astate->attrset.find(iter.first) == astate->attrset.end()) {
         astate->attrset[iter.first] = std::move(iter.second);
@@ -7974,6 +8359,12 @@ int RGWRados::Bucket::UpdateIndex::guard_reshard(const DoutPrefixProvider *dpp, 
     }
 
     r = call(bs);
+    if (r == -ENOENT) {
+      ldpp_dout(dpp, 10) << "ENOENT in guard_reshard(), likely bucket resharding, retrying" << dendl;
+      invalidate_bs();
+      continue;
+    }
+
     if (r != -ERR_BUSY_RESHARDING) {
       break;
     }
@@ -8054,7 +8445,9 @@ int RGWRados::Bucket::UpdateIndex::complete(const DoutPrefixProvider *dpp, int64
 					    optional_yield y,
 					    const string *user_data,
                                             bool appendable,
-                                            bool log_op)
+                                            bool log_op,
+					    uint8_t restore_status,
+					    ceph::real_time restore_expiry_date)
 {
   if (blind) {
     return 0;
@@ -8082,6 +8475,8 @@ int RGWRados::Bucket::UpdateIndex::complete(const DoutPrefixProvider *dpp, int64
   ent.meta.owner_display_name = owner.display_name;
   ent.meta.content_type = content_type;
   ent.meta.appendable = appendable;
+  ent.meta.restore_status = restore_status;
+  ent.meta.restore_expiry_date = restore_expiry_date;
 
   bool add_log = log_op && store->svc.zone->need_to_log_data();
 
@@ -8635,6 +9030,7 @@ int RGWRados::olh_init_modification_impl(const DoutPrefixProvider *dpp, const RG
   string attr_name = RGW_ATTR_OLH_PENDING_PREFIX;
   attr_name.append(*op_tag);
 
+  ldpp_dout(dpp, 20) << __func__ << " adding olh pending attr: " << attr_name << dendl;
   op.setxattr(attr_name.c_str(), bl);
 
   int ret = obj_operate(dpp, bucket_info, olh_obj, std::move(op), y);
@@ -8678,6 +9074,10 @@ int RGWRados::guard_reshard(const DoutPrefixProvider *dpp,
     }
 
     r = call(bs);
+    if (r == -ENOENT) {
+      ldpp_dout(dpp, 10) << "ENOENT in guard_reshard(), likely bucket resharding, retrying" << dendl;
+      continue;
+    }
     if (r != -ERR_BUSY_RESHARDING) {
       break;
     }
@@ -9009,6 +9409,31 @@ int RGWRados::bucket_index_link_olh(const DoutPrefixProvider *dpp, RGWBucketInfo
   return r;
 }
 
+int RGWRados::bucket_index_refresh_instance(const DoutPrefixProvider *dpp,
+                                            RGWBucketInfo& bucket_info,
+                                            const rgw_obj& obj_instance,
+                                            optional_yield y)
+{
+  rgw_rados_ref ref;
+  int r = get_obj_head_ref(dpp, bucket_info, obj_instance, &ref);
+  if (r < 0) {
+    return r;
+  }
+
+  BucketShard bs(this);
+
+  return guard_reshard(dpp, &bs, obj_instance, bucket_info,
+                       [&](BucketShard *bs) -> int {
+                         cls_rgw_obj_key key(obj_instance.key.get_index_key_name(), obj_instance.key.instance);
+                         auto& ref = bs->bucket_obj;
+                         librados::ObjectWriteOperation op;
+                         op.assert_exists(); // bucket index shard must exist
+                         cls_rgw_guard_bucket_resharding(op, -ERR_BUSY_RESHARDING);
+                         cls_rgw_bucket_refresh_instance(op, key);
+                         return rgw_rados_operate(dpp, ref.ioctx, ref.obj.oid, std::move(op), y);
+                       }, y);
+}
+
 void RGWRados::bucket_index_guard_olh_op(const DoutPrefixProvider *dpp, RGWObjState& olh_state, ObjectOperation& op)
 {
   ldpp_dout(dpp, 20) << __func__ << "(): olh_state.olh_tag=" << string(olh_state.olh_tag.c_str(), olh_state.olh_tag.length()) << dendl;
@@ -9280,7 +9705,7 @@ int RGWRados::apply_olh_log(const DoutPrefixProvider *dpp,
   uint64_t link_epoch = 0;
   cls_rgw_obj_key key;
   bool delete_marker = false;
-  list<cls_rgw_obj_key> remove_instances;
+  set<cls_rgw_obj_key> remove_instances;
   bool need_to_remove = false;
 
   // decode current epoch and instance
@@ -9310,20 +9735,26 @@ int RGWRados::apply_olh_log(const DoutPrefixProvider *dpp,
                      << " key=" << entry.key.name << "[" << entry.key.instance << "] "
                      << (entry.delete_marker ? "(delete)" : "") << dendl;
 
-      if (link_epoch == iter->first)
+      if (link_epoch == entry.epoch)
         ldpp_dout(dpp, 1) << "apply_olh_log epoch collision detected for " << entry.key
                           << "; incoming op: " << entry.op << "(" << entry.op_tag << ")" << dendl;
 
       switch (entry.op) {
       case CLS_RGW_OLH_OP_REMOVE_INSTANCE:
-        remove_instances.push_back(entry.key);
+        remove_instances.insert(entry.key);
         break;
       case CLS_RGW_OLH_OP_LINK_OLH:
         // only overwrite a link of the same epoch if its key sorts before
-        if (link_epoch < iter->first || key.instance.empty() ||
+        // or there is a CLS_RGW_OLH_OP_UNLINK_OLH before this op in this batch
+        if (need_to_remove || link_epoch < entry.epoch || key.instance.empty() ||
             key.instance > entry.key.instance) {
           ldpp_dout(dpp, 20) << "apply_olh_log applying key=" << entry.key << " epoch=" << iter->first << " delete_marker=" << entry.delete_marker
               << " over current=" << key << " epoch=" << link_epoch << " delete_marker=" << delete_marker << dendl;
+
+          if (need_to_remove) {
+            // cancel the instance removal if it's linked again -- e.g. coming from a multisite remote zone
+            remove_instances.erase(entry.key);
+          }
           need_to_link = true;
           need_to_remove = false;
           key = entry.key;
@@ -9336,6 +9767,8 @@ int RGWRados::apply_olh_log(const DoutPrefixProvider *dpp,
       case CLS_RGW_OLH_OP_UNLINK_OLH:
         need_to_remove = true;
         need_to_link = false;
+        break;
+      case CLS_RGW_OLH_OP_STALE:
         break;
       default:
         ldpp_dout(dpp, 0) << "ERROR: apply_olh_log: invalid op: " << (int)entry.op << dendl;
@@ -9366,9 +9799,9 @@ int RGWRados::apply_olh_log(const DoutPrefixProvider *dpp,
   }
 
   /* first remove object instances */
-  for (list<cls_rgw_obj_key>::iterator liter = remove_instances.begin();
+  for (set<cls_rgw_obj_key>::iterator liter = remove_instances.begin();
        liter != remove_instances.end(); ++liter) {
-    cls_rgw_obj_key& key = *liter;
+    const cls_rgw_obj_key& key = *liter;
     rgw_obj obj_instance(bucket, key);
     int ret = delete_obj(dpp, obj_ctx, bucket_info, obj_instance, 0, y,
 			 null_verid, RGW_BILOG_FLAG_VERSIONED_OP,
@@ -9382,7 +9815,9 @@ int RGWRados::apply_olh_log(const DoutPrefixProvider *dpp,
   /* update olh object */
   r = rgw_rados_operate(dpp, ref.ioctx, ref.obj.oid, std::move(op), y);
   if (r < 0) {
-    ldpp_dout(dpp, 0) << "ERROR: " << __func__ << ": could not apply olh update to oid \"" << ref.obj.oid << "\", r=" << r << dendl;
+    if (r != -ECANCELED) {
+      ldpp_dout(dpp, 0) << "ERROR: " << __func__ << ": could not apply olh update to oid \"" << ref.obj.oid << "\", r=" << r << dendl;
+    }
     return r;
   }
 
@@ -10460,14 +10895,14 @@ int RGWRados::gc_operate(const DoutPrefixProvider *dpp, string& oid, librados::O
   return rgw_rados_operate(dpp, gc_pool_ctx, oid, std::move(op), pbl, y);
 }
 
-int RGWRados::list_gc_objs(int *index, string& marker, uint32_t max, bool expired_only, std::list<cls_rgw_gc_obj_info>& result, bool *truncated, bool& processing_queue)
+int RGWRados::list_gc_objs(int& index, string& marker, uint32_t max, bool expired_only, std::list<cls_rgw_gc_obj_info>& result, bool& truncated, bool& processing_queue, std::optional<int> shard_id)
 {
-  return gc->list(index, marker, max, expired_only, result, truncated, processing_queue);
+  return gc->list(index, marker, max, expired_only, result, truncated, processing_queue, shard_id);
 }
 
-int RGWRados::process_gc(bool expired_only, optional_yield y)
+int RGWRados::process_gc(bool expired_only, optional_yield y, std::optional<int> shard_id)
 {
-  return gc->process(expired_only, y);
+  return gc->process(expired_only, y, shard_id);
 }
 
 int RGWRados::process_lc(const std::unique_ptr<rgw::sal::Bucket>& optional_bucket)
@@ -11072,6 +11507,7 @@ int RGWRados::cls_bucket_list_unordered(const DoutPrefixProvider *dpp,
   uint32_t count = 0u;
   std::map<std::string, bufferlist> updates;
   rgw_obj_index_key last_added_entry;
+
   while (count <= num_entries &&
 	 ((shard_id >= 0 && current_shard == uint32_t(shard_id)) ||
 	  current_shard < num_shards)) {
@@ -11080,10 +11516,44 @@ int RGWRados::cls_bucket_list_unordered(const DoutPrefixProvider *dpp,
 
     librados::ObjectReadOperation op;
     const std::string empty_delimiter;
+
+    // Keep the previous marker to detect real progress
+    const auto prev_marker = marker;
+
     cls_rgw_bucket_list_op(op, marker, prefix, empty_delimiter,
 			   num_entries,
                            list_versions, &result);
     r = rgw_rados_operate(dpp, ioctx, oid, std::move(op), nullptr, y, 0, nullptr, &index_ver.epoch);
+    if (r == RGWBIAdvanceAndRetryError) {
+      // CLS could not return any visible entries in this round,
+      // but it advanced the marker; retry with the new marker.
+
+      // Copy marker from cls type into rgw index key (avoid type-mismatch assignment)
+      marker.name = result.marker.name;
+      marker.instance = result.marker.instance;
+
+      // AdvanceAndRetry expected the marker to advance; no progress observed. Return -EIO.
+      if (prev_marker == marker) {
+        ldpp_dout(dpp, 0)
+          << "ERROR: " << __func__
+          << ": RGW_UNORDERED_LIST_NO_MARKER_PROGRESS_ON_ADVANCE_AND_RETRY"
+          << " oid=" << oid
+          << " prev_marker=" << prev_marker
+          << " marker=" << marker
+          << dendl;
+        return -EIO;
+      }
+
+      ldpp_dout(dpp, 10)
+        << __func__
+        << ": RGWBIAdvanceAndRetryError"
+        << " on oid=" << oid
+        << "; prev_marker=" << prev_marker
+        << " -> marker=" << marker
+        << "; advancing marker and retrying"
+        << dendl;
+      continue;
+    }
     if (r < 0) {
       ldpp_dout(dpp, 0) << "ERROR: " << __func__ <<
 	": error in rgw_rados_operate (bucket list op), r=" << r << dendl;

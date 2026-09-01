@@ -1,5 +1,5 @@
 import { CommonModule } from '@angular/common';
-import { NgModule } from '@angular/core';
+import { CUSTOM_ELEMENTS_SCHEMA, NgModule } from '@angular/core';
 import { FormsModule, ReactiveFormsModule } from '@angular/forms';
 
 import {
@@ -32,6 +32,16 @@ import { CephfsSnapshotscheduleFormComponent } from './cephfs-snapshotschedule-f
 import { CephfsMountDetailsComponent } from './cephfs-mount-details/cephfs-mount-details.component';
 import { CephfsAuthModalComponent } from './cephfs-auth-modal/cephfs-auth-modal.component';
 import { CephfsMirroringListComponent } from './cephfs-mirroring-list/cephfs-mirroring-list.component';
+import { CephfsMirroringErrorComponent } from './cephfs-mirroring-error/cephfs-mirroring-error.component';
+import { CephfsAddMirroringPathComponent } from './cephfs-add-mirroring-path/cephfs-add-mirroring-path.component';
+import { MirroringPathsStepComponent } from './cephfs-add-mirroring-path/mirroring-paths-step/mirroring-paths-step.component';
+import { MirroringReviewStepComponent } from './cephfs-add-mirroring-path/mirroring-review-step/mirroring-review-step.component';
+import { CephfsMirroringFsTabsComponent } from './cephfs-mirroring-fs-tabs/cephfs-mirroring-fs-tabs.component';
+import { CephfsMirroringFsOverviewComponent } from './cephfs-mirroring-fs-overview/cephfs-mirroring-fs-overview.component';
+import { CephfsMirroringFsMirrorPathsComponent } from './cephfs-mirroring-fs-mirror-paths/cephfs-mirroring-fs-mirror-paths.component';
+import { CephfsGenerateTokenComponent } from './cephfs-generate-token/cephfs-generate-token.component';
+import { CephfsDownloadTokenComponent } from './cephfs-download-token/cephfs-download-token.component';
+import { CephfsSetupMirroringComponent } from './cephfs-setup-mirroring/cephfs-setup-mirroring.component';
 import {
   ButtonModule,
   CheckboxModule,
@@ -41,21 +51,40 @@ import {
   GridModule,
   IconModule,
   IconService,
+  InlineLoadingModule,
   InputModule,
   LayoutModule,
+  LoadingModule,
   ModalModule,
   NumberModule,
   PlaceholderModule,
+  RadioModule,
   SelectModule,
+  TagModule,
   TimePickerModule,
+  TilesModule,
   TreeviewModule,
-  TabsModule
+  TabsModule,
+  NotificationModule,
+  ProgressBarModule
 } from 'carbon-components-angular';
 
 import AddIcon from '@carbon/icons/es/add/32';
 import LaunchIcon from '@carbon/icons/es/launch/32';
 import Close from '@carbon/icons/es/close/32';
 import Trash from '@carbon/icons/es/trash-can/32';
+import TrashIcon16 from '@carbon/icons/es/trash-can/16';
+import Renew16 from '@carbon/icons/es/renew/16';
+import ReplicateIcon from '@carbon/icons/es/replicate/32';
+import ReplicateIcon24 from '@carbon/icons/es/replicate/24';
+import ShareIcon from '@carbon/icons/es/share/32';
+import ShareIcon24 from '@carbon/icons/es/share/24';
+import PendingFilled from '@carbon/icons/es/pending--filled/16';
+import DotMark from '@carbon/icons/es/dot-mark/16';
+import ChevronDown16 from '@carbon/icons/es/chevron--down/16';
+import ChevronUp16 from '@carbon/icons/es/chevron--up/16';
+import WarningAltFilled16 from '@carbon/icons/es/warning--alt--filled/16';
+import FolderIcon16 from '@carbon/icons/es/folder/16';
 
 @NgModule({
   imports: [
@@ -86,8 +115,16 @@ import Trash from '@carbon/icons/es/trash-can/32';
     LayoutModule,
     ComboBoxModule,
     IconModule,
+    InlineLoadingModule,
+    LoadingModule,
+    RadioModule,
     BaseChartDirective,
-    TabsModule
+    TabsModule,
+    RadioModule,
+    TilesModule,
+    TagModule,
+    NotificationModule,
+    ProgressBarModule
   ],
   declarations: [
     CephfsDetailComponent,
@@ -99,7 +136,6 @@ import Trash from '@carbon/icons/es/trash-can/32';
     CephfsDirectoriesComponent,
     CephfsSubvolumeListComponent,
     CephfsSubvolumeFormComponent,
-    CephfsDirectoriesComponent,
     CephfsSubvolumeGroupComponent,
     CephfsSubvolumegroupFormComponent,
     CephfsSubvolumeSnapshotsListComponent,
@@ -108,12 +144,40 @@ import Trash from '@carbon/icons/es/trash-can/32';
     CephfsSubvolumeSnapshotsFormComponent,
     CephfsMountDetailsComponent,
     CephfsAuthModalComponent,
-    CephfsMirroringListComponent
+    CephfsMirroringListComponent,
+    CephfsMirroringErrorComponent,
+    CephfsMirroringFsTabsComponent,
+    CephfsMirroringFsOverviewComponent,
+    CephfsMirroringFsMirrorPathsComponent,
+    CephfsGenerateTokenComponent,
+    CephfsDownloadTokenComponent,
+    CephfsSetupMirroringComponent,
+    CephfsAddMirroringPathComponent,
+    MirroringPathsStepComponent,
+    MirroringReviewStepComponent
   ],
-  providers: [provideCharts(withDefaultRegisterables())]
+  providers: [provideCharts(withDefaultRegisterables())],
+  schemas: [CUSTOM_ELEMENTS_SCHEMA]
 })
 export class CephfsModule {
   constructor(private iconService: IconService) {
-    this.iconService.registerAll([AddIcon, LaunchIcon, Close, Trash]);
+    this.iconService.registerAll([
+      AddIcon,
+      LaunchIcon,
+      Close,
+      Trash,
+      TrashIcon16,
+      Renew16,
+      ReplicateIcon,
+      ReplicateIcon24,
+      ShareIcon,
+      ShareIcon24,
+      PendingFilled,
+      DotMark,
+      ChevronDown16,
+      ChevronUp16,
+      WarningAltFilled16,
+      FolderIcon16
+    ]);
   }
 }

@@ -101,7 +101,7 @@ Limitations
    reached.  They will inevitably be allowed to write some amount of
    data over the configured limit.  How far over the quota they are
    able to go depends primarily on the amount of time, not the amount
-   of data.  Generally speaking writers will be stopped within 10s of
+   of data.  Generally speaking writers will be stopped within tens of
    seconds of crossing the configured limit.
 
 #. *Quotas are implemented in the kernel client 4.17 and higher.*
@@ -118,8 +118,8 @@ Limitations
    (e.g., ``/home/user``) based on the MDS capability, and a quota is
    configured on an ancestor directory they do not have access to
    (e.g., ``/home``), the client will not enforce it.  When using
-   path-based access restrictions be sure to configure the quota on
-   the directory the client is restricted too (e.g., ``/home/user``)
+   path-based access restrictions, be sure to configure the quota on
+   the directory the client is restricted to (e.g., ``/home/user``)
    or something nested beneath it.
 
    In case of a kernel client, it needs to have access to the parent
@@ -128,11 +128,18 @@ Limitations
    (e.g., ``/home/volumes/group``), the kclient needs to have access
    to the parent (e.g., ``/home/volumes``).
 
-   An example command to create such an user is as below::
+   An example command to create such a user::
 
      $ ceph auth get-or-create client.guest mds 'allow r path=/home/volumes, allow rw path=/home/volumes/group' mgr 'allow rw' osd 'allow rw tag cephfs metadata=*' mon 'allow r'
 
-   See also: https://tracker.ceph.com/issues/55090
+   A related known issue: when the kernel client mounts a subdirectory
+   below the directory on which the quota is set, tools such as ``df``
+   may report the size and usage of the entire file system rather than
+   of the quota, because the client cannot see the quota-bearing
+   ancestor directory. ``ceph-fuse`` is not affected.
 
 #. *Snapshot file data which has since been deleted or changed does not count
-   towards the quota.* See also: http://tracker.ceph.com/issues/24284
+   towards the quota.* As a consequence, snapshots can retain space beyond
+   the configured quota. If this is a concern, the creation of new
+   snapshots can be disabled with ``ceph fs set <fs_name> allow_new_snaps
+   false``.

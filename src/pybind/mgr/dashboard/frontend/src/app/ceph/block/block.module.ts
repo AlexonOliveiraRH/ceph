@@ -10,6 +10,8 @@ import { ActionLabels, URLVerbs } from '~/app/shared/constants/app.constants';
 import { FeatureTogglesGuardService } from '~/app/shared/services/feature-toggles-guard.service';
 import { ModuleStatusGuardService } from '~/app/shared/services/module-status-guard.service';
 import { SharedModule } from '~/app/shared/shared.module';
+import { TextLabelListComponent } from '~/app/shared/components/text-label-list/text-label-list.component';
+import { CertificateAuthorityFormComponent } from '~/app/shared/components/certificate-authority-form/certificate-authority-form.component';
 import { IscsiSettingComponent } from './iscsi-setting/iscsi-setting.component';
 import { IscsiTabsComponent } from './iscsi-tabs/iscsi-tabs.component';
 import { IscsiTargetDetailsComponent } from './iscsi-target-details/iscsi-target-details.component';
@@ -24,8 +26,10 @@ import { OverviewComponent as RbdMirroringComponent } from './mirroring/overview
 import { PoolEditModeModalComponent } from './mirroring/pool-edit-mode-modal/pool-edit-mode-modal.component';
 import { RbdConfigurationFormComponent } from './rbd-configuration-form/rbd-configuration-form.component';
 import { RbdConfigurationListComponent } from './rbd-configuration-list/rbd-configuration-list.component';
-import { RbdDetailsComponent } from './rbd-details/rbd-details.component';
 import { RbdFormComponent } from './rbd-form/rbd-form.component';
+import { RbdImageResourceBreadcrumbResolver } from './rbd-image-resource-page/rbd-image-resource-breadcrumb.resolver';
+import { RbdImageResourcePageComponent } from './rbd-image-resource-page/rbd-image-resource-page.component';
+import { RbdImageResourceSidebarComponent } from './rbd-image-resource-sidebar/rbd-image-resource-sidebar.component';
 import { RbdListComponent } from './rbd-list/rbd-list.component';
 import { RbdNamespaceFormModalComponent } from './rbd-namespace-form/rbd-namespace-form-modal.component';
 import { RbdNamespaceListComponent } from './rbd-namespace-list/rbd-namespace-list.component';
@@ -47,24 +51,40 @@ import { NvmeofNamespacesListComponent } from './nvmeof-namespaces-list/nvmeof-n
 import { NvmeofNamespacesFormComponent } from './nvmeof-namespaces-form/nvmeof-namespaces-form.component';
 import { NvmeofInitiatorsListComponent } from './nvmeof-initiators-list/nvmeof-initiators-list.component';
 import { NvmeofInitiatorsFormComponent } from './nvmeof-initiators-form/nvmeof-initiators-form.component';
+import { NvmeofGatewayGroupComponent } from './nvmeof-gateway-group/nvmeof-gateway-group.component';
+import { NvmeofSubsystemsStepOneComponent } from './nvmeof-subsystems-form/nvmeof-subsystem-step-1/nvmeof-subsystem-step-1.component';
+import { NvmeofSubsystemsStepThreeComponent } from './nvmeof-subsystems-form/nvmeof-subsystem-step-3/nvmeof-subsystem-step-3.component';
+import { NvmeofSubsystemsStepTwoComponent } from './nvmeof-subsystems-form/nvmeof-subsystem-step-2/nvmeof-subsystem-step-2.component';
+import { NvmeofGatewayNodeComponent } from './nvmeof-gateway-node/nvmeof-gateway-node.component';
+import { NvmeofGroupFormComponent } from './nvmeof-group-form/nvmeof-group-form.component';
+import { NvmeofEditHostKeyModalComponent } from './nvmeof-edit-host-key-modal/nvmeof-edit-host-key-modal.component';
+import { NvmeofSubsystemsStepFourComponent } from './nvmeof-subsystems-form/nvmeof-subsystem-step-4/nvmeof-subsystem-step-4.component';
 
 import {
   ButtonModule,
   CheckboxModule,
   ComboBoxModule,
   DatePickerModule,
+  FileUploaderModule,
   GridModule,
   IconModule,
   IconService,
+  InlineLoadingModule,
   InputModule,
+  LoadingModule,
   ModalModule,
   NumberModule,
   RadioModule,
   SelectModule,
   UIShellModule,
   TreeviewModule,
+  SideNavModule,
   TabsModule,
-  TagModule
+  TagModule,
+  LayoutModule,
+  ContainedListModule,
+  LayerModule,
+  ThemeModule
 } from 'carbon-components-angular';
 
 // Icons
@@ -75,7 +95,25 @@ import SubtractFilled from '@carbon/icons/es/subtract--filled/32';
 import Reset from '@carbon/icons/es/reset/32';
 import SubtractAlt from '@carbon/icons/es/subtract--alt/20';
 import ProgressBarRound from '@carbon/icons/es/progress-bar--round/32';
-import { NvmeofGatewayGroupComponent } from './nvmeof-gateway-group/nvmeof-gateway-group.component';
+import Search from '@carbon/icons/es/search/32';
+import Datastore from '@carbon/icons/es/datastore/16';
+import { NvmeofGatewaySubsystemComponent } from './nvmeof-gateway-subsystem/nvmeof-gateway-subsystem.component';
+import { NvmeofNamespaceExpandModalComponent } from './nvmeof-namespace-expand-modal/nvmeof-namespace-expand-modal.component';
+import { NvmeGatewayViewComponent } from './nvme-gateway-view/nvme-gateway-view.component';
+// import { ProductiveCardComponent } from '~/app/shared/components/productive-card/productive-card.component';
+import { NvmeGatewayViewBreadcrumbResolver } from './nvme-gateway-view/nvme-gateway-view-breadcrumb.resolver';
+import { NvmeofGatewayNodeMode } from '~/app/shared/models/nvmeof';
+import { NvmeofGatewayNodeAddModalComponent } from './nvmeof-gateway-node/nvmeof-gateway-node-add-modal/nvmeof-gateway-node-add-modal.component';
+import { NvmeofSubsystemNamespacesListComponent } from './nvmeof-subsystem-namespaces-list/nvmeof-subsystem-namespaces-list.component';
+import { NvmeofSubsystemOverviewComponent } from './nvmeof-subsystem-overview/nvmeof-subsystem-overview.component';
+import { NvmeSubsystemViewBreadcrumbResolver } from './nvme-subsystem-view/nvme-subsystem-view-breadcrumb.resolver';
+import { NvmeSubsystemViewComponent } from './nvme-subsystem-view/nvme-subsystem-view.component';
+import { NvmeofSubsystemPerformanceComponent } from './nvmeof-subsystem-performance/nvmeof-subsystem-performance.component';
+import { NvmeofTabsComponent } from './nvmeof-tabs/nvmeof-tabs.component';
+
+import { NvmeofSetupCardsComponent } from './nvmeof-setup-cards/nvmeof-setup-cards.component';
+import { NvmeofGatewayGroupFilterComponent } from './nvmeof-gateway-group-filter/nvmeof-gateway-group-filter.component';
+import { NvmeofEditAuthenticationComponent } from './nvmeof-edit-authentication/nvmeof-edit-authentication.component';
 
 @NgModule({
   imports: [
@@ -92,18 +130,31 @@ import { NvmeofGatewayGroupComponent } from './nvmeof-gateway-group/nvmeof-gatew
     TreeviewModule,
     UIShellModule,
     InputModule,
-    GridModule,
     ButtonModule,
+    GridModule,
     IconModule,
+    InlineLoadingModule,
+    LoadingModule,
     CheckboxModule,
     RadioModule,
     SelectModule,
     NumberModule,
     ModalModule,
     DatePickerModule,
+    FileUploaderModule,
     ComboBoxModule,
     TabsModule,
-    TagModule
+    TagModule,
+    GridModule,
+    LayerModule,
+    ContainedListModule,
+    SideNavModule,
+    LayoutModule,
+    ThemeModule,
+    NvmeofSetupCardsComponent,
+    NvmeofGatewayGroupFilterComponent,
+    TextLabelListComponent,
+    CertificateAuthorityFormComponent
   ],
   declarations: [
     RbdListComponent,
@@ -111,8 +162,9 @@ import { NvmeofGatewayGroupComponent } from './nvmeof-gateway-group/nvmeof-gatew
     IscsiSettingComponent,
     IscsiTabsComponent,
     IscsiTargetListComponent,
-    RbdDetailsComponent,
     RbdFormComponent,
+    RbdImageResourceSidebarComponent,
+    RbdImageResourcePageComponent,
     RbdNamespaceFormModalComponent,
     RbdNamespaceListComponent,
     RbdSnapshotListComponent,
@@ -138,10 +190,28 @@ import { NvmeofGatewayGroupComponent } from './nvmeof-gateway-group/nvmeof-gatew
     NvmeofListenersFormComponent,
     NvmeofListenersListComponent,
     NvmeofNamespacesListComponent,
+    NvmeofSubsystemNamespacesListComponent,
     NvmeofNamespacesFormComponent,
     NvmeofInitiatorsListComponent,
-    NvmeofInitiatorsFormComponent
+    NvmeofInitiatorsFormComponent,
+    NvmeofGatewayNodeComponent,
+    NvmeofGroupFormComponent,
+    NvmeofSubsystemsStepOneComponent,
+    NvmeofSubsystemsStepTwoComponent,
+    NvmeofSubsystemsStepThreeComponent,
+    NvmeGatewayViewComponent,
+    NvmeofGatewaySubsystemComponent,
+    NvmeofGatewayNodeAddModalComponent,
+    NvmeofNamespaceExpandModalComponent,
+    NvmeSubsystemViewComponent,
+    NvmeofEditHostKeyModalComponent,
+    NvmeofSubsystemsStepFourComponent,
+    NvmeofSubsystemOverviewComponent,
+    NvmeofSubsystemPerformanceComponent,
+    NvmeofTabsComponent,
+    NvmeofEditAuthenticationComponent
   ],
+
   exports: [RbdConfigurationListComponent, RbdConfigurationFormComponent]
 })
 export class BlockModule {
@@ -153,7 +223,9 @@ export class BlockModule {
       SubtractFilled,
       Reset,
       ProgressBarRound,
-      SubtractAlt
+      SubtractAlt,
+      Search,
+      Datastore
     ]);
   }
 }
@@ -220,6 +292,37 @@ const routes: Routes = [
         path: `${URLVerbs.COPY}/:image_spec/:snap`,
         component: RbdFormComponent,
         data: { breadcrumbs: ActionLabels.COPY }
+      },
+      {
+        path: ':image_spec',
+        component: RbdImageResourceSidebarComponent,
+        data: {
+          breadcrumbs: RbdImageResourceBreadcrumbResolver,
+          showBreadcrumbsLayout: false
+        },
+        children: [
+          { path: '', redirectTo: 'overview', pathMatch: 'full' },
+          {
+            path: 'overview',
+            component: RbdImageResourcePageComponent,
+            data: { breadcrumbs: 'Overview', section: 'overview' }
+          },
+          {
+            path: 'snapshots',
+            component: RbdImageResourcePageComponent,
+            data: { breadcrumbs: 'Snapshots', section: 'snapshots' }
+          },
+          {
+            path: 'configuration',
+            component: RbdImageResourcePageComponent,
+            data: { breadcrumbs: 'Configuration', section: 'configuration' }
+          },
+          {
+            path: 'performance',
+            component: RbdImageResourcePageComponent,
+            data: { breadcrumbs: 'Performance', section: 'performance' }
+          }
+        ]
       }
     ]
   },
@@ -278,6 +381,7 @@ const routes: Routes = [
   {
     path: 'nvmeof',
     canActivate: [ModuleStatusGuardService],
+    component: NvmeofTabsComponent,
     data: {
       breadcrumbs: true,
       text: 'NVMe/TCP',
@@ -294,41 +398,156 @@ const routes: Routes = [
     },
     children: [
       { path: '', redirectTo: 'gateways', pathMatch: 'full' },
-      { path: '', component: NvmeofGatewayComponent, data: { breadcrumbs: 'Gateways' } },
       {
-        path: 'subsystems',
-        component: NvmeofSubsystemsComponent,
-        data: { breadcrumbs: 'Subsystems' },
+        path: 'gateways',
+        data: { breadcrumbs: 'Gateways' },
         children: [
-          // subsystems
-          { path: '', component: NvmeofSubsystemsComponent },
+          {
+            path: '',
+            component: NvmeofGatewayGroupComponent
+          },
           {
             path: URLVerbs.CREATE,
-            component: NvmeofSubsystemsFormComponent,
-            outlet: 'modal'
+            component: NvmeofGroupFormComponent,
+            data: {
+              breadcrumbs: ActionLabels.CREATE,
+              pageHeader: {
+                title: $localize`Create Gateway Group`,
+                description: $localize`A logical group of NVMe gateways that hosts connect to for load-balanced access.`
+              }
+            }
           },
-          // listeners
           {
-            path: `${URLVerbs.CREATE}/:subsystem_nqn/listener`,
-            component: NvmeofListenersFormComponent,
-            outlet: 'modal'
+            path: `${URLVerbs.EDIT}/:name`,
+            component: NvmeofGroupFormComponent,
+            data: {
+              breadcrumbs: ActionLabels.EDIT,
+              pageHeader: {
+                title: $localize`Edit Gateway Group`,
+                description: $localize`Modify gateway group configuration.`
+              }
+            }
           },
-          // namespaces
           {
-            path: `${URLVerbs.CREATE}/:subsystem_nqn/namespace`,
+            path: `${URLVerbs.VIEW}/:group`,
+            component: NvmeGatewayViewComponent,
+            data: {
+              breadcrumbs: NvmeGatewayViewBreadcrumbResolver,
+              showBreadcrumbsLayout: false
+            },
+            children: [
+              { path: '', redirectTo: 'nodes', pathMatch: 'full' },
+              {
+                path: 'nodes',
+                component: NvmeofGatewayNodeComponent,
+                data: { breadcrumbs: $localize`Overview`, mode: NvmeofGatewayNodeMode.DETAILS }
+              },
+              {
+                path: 'subsystems',
+                component: NvmeofGatewaySubsystemComponent,
+                data: { breadcrumbs: $localize`Subsystems` }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        path: 'subsystems',
+        data: { breadcrumbs: 'Subsystems' },
+        children: [
+          {
+            path: '',
+            component: NvmeofSubsystemsComponent,
+            children: [
+              {
+                path: URLVerbs.CREATE,
+                component: NvmeofSubsystemsFormComponent,
+                outlet: 'modal'
+              },
+              {
+                path: `${URLVerbs.CREATE}/:subsystem_nqn/listener`,
+                component: NvmeofListenersFormComponent,
+                outlet: 'modal'
+              },
+              {
+                path: `${URLVerbs.EDIT}/:subsystem_nqn/namespace/:nsid`,
+                component: NvmeofNamespaceExpandModalComponent,
+                outlet: 'modal'
+              },
+              {
+                path: `${URLVerbs.ADD}/:subsystem_nqn/initiator`,
+                component: NvmeofInitiatorsFormComponent,
+                outlet: 'modal'
+              }
+            ]
+          },
+          {
+            path: ':subsystem_nqn',
+            component: NvmeSubsystemViewComponent,
+            data: {
+              breadcrumbs: NvmeSubsystemViewBreadcrumbResolver,
+              showBreadcrumbsLayout: false
+            },
+            children: [
+              { path: '', redirectTo: 'overview', pathMatch: 'full' },
+              {
+                path: 'overview',
+                component: NvmeofSubsystemOverviewComponent
+              },
+              {
+                path: 'hosts',
+                component: NvmeofInitiatorsListComponent
+              },
+              {
+                path: 'namespaces',
+                component: NvmeofSubsystemNamespacesListComponent
+              },
+              {
+                path: 'listeners',
+                component: NvmeofListenersListComponent
+              },
+              {
+                path: 'performance',
+                component: NvmeofSubsystemPerformanceComponent
+              },
+              {
+                path: `${URLVerbs.ADD}/initiator`,
+                component: NvmeofInitiatorsFormComponent,
+                outlet: 'modal'
+              },
+              {
+                path: `${URLVerbs.ADD}/listener`,
+                component: NvmeofListenersFormComponent,
+                outlet: 'modal'
+              },
+              {
+                path: `${URLVerbs.EDIT}/:subsystem_nqn/namespace/:nsid`,
+                component: NvmeofNamespaceExpandModalComponent,
+                outlet: 'modal'
+              }
+            ]
+          }
+        ]
+      },
+      {
+        path: 'namespaces',
+        data: { breadcrumbs: 'Namespaces' },
+        children: [
+          {
+            path: '',
+            component: NvmeofNamespacesListComponent,
+            children: [
+              {
+                path: `${URLVerbs.EDIT}/:subsystem_nqn/namespace/:nsid`,
+                component: NvmeofNamespaceExpandModalComponent,
+                outlet: 'modal'
+              }
+            ]
+          },
+          {
+            path: URLVerbs.CREATE,
             component: NvmeofNamespacesFormComponent,
-            outlet: 'modal'
-          },
-          {
-            path: `${URLVerbs.EDIT}/:subsystem_nqn/namespace/:nsid`,
-            component: NvmeofNamespacesFormComponent,
-            outlet: 'modal'
-          },
-          // initiators
-          {
-            path: `${URLVerbs.ADD}/:subsystem_nqn/initiator`,
-            component: NvmeofInitiatorsFormComponent,
-            outlet: 'modal'
+            data: { breadcrumbs: ActionLabels.CREATE }
           }
         ]
       }

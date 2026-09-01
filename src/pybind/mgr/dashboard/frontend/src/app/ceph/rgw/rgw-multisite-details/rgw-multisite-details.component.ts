@@ -125,6 +125,10 @@ export class RgwMultisiteDetailsComponent extends CdForm implements OnDestroy, O
   MODULE_NAME = 'rgw';
   NAVIGATE_TO = '/rgw/multisite';
 
+  get disableActions(): boolean {
+    return !this.permissions?.rgw?.create;
+  }
+
   constructor(
     private modalService: ModalService,
     private timerService: TimerService,
@@ -190,9 +194,7 @@ export class RgwMultisiteDetailsComponent extends CdForm implements OnDestroy, O
     const initialState = {
       multisiteInfo: this.multisiteInfo
     };
-    this.bsModalRef = this.modalService.show(RgwMultisiteImportComponent, initialState, {
-      size: 'lg'
-    });
+    this.cdsModalService.show(RgwMultisiteImportComponent, initialState);
   }
 
   openExportModal() {
@@ -610,7 +612,7 @@ export class RgwMultisiteDetailsComponent extends CdForm implements OnDestroy, O
         zonegroup: node.data
       });
     } else if (node?.data?.type === 'zone') {
-      this.modalRef = this.modalService.show(RgwMultisiteZoneDeletionFormComponent, {
+      this.cdsModalService.show(RgwMultisiteZoneDeletionFormComponent, {
         zone: node.data
       });
     }

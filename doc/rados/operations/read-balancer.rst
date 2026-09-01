@@ -28,7 +28,7 @@ To enable automatic read balancing, you must turn on the *balancer module*
    ceph balancer on
    ceph balancer mode <read|upmap-read>
 
-Both ``read`` and ``upmap-read`` mode make use of ``pg-upmap-primary``. In order
+Both the ``read`` and ``upmap-read`` modes make use of ``pg-upmap-primary``. In order
 to use ``pg-upmap-primary``, the cluster cannot have any pre-Reef clients.
 
 If you want to use a different balancer or if you want to make your
@@ -47,13 +47,18 @@ following command:
 
    ceph osd set-require-min-compat-client reef
 
-This command will fail if any pre-Reef clients or daemons are connected to
-the monitors. To see which client versions are in use, run the following
-command:
+Do not lower an already-higher value: that would prevent features that
+depend on a newer release from working.  This command will fail if any
+pre-Reef clients or daemons are connected to the Monitors. To see which
+client versions are in use, run the following command:
 
 .. prompt:: bash $
 
    ceph features
+
+See :ref:`require_min_compat_client` for what the
+``set-require-min-compat-client`` command does and how to choose an
+appropriate release argument.
 
 Balancer Module
 ---------------
@@ -97,7 +102,7 @@ Primaries are updated with an offline optimizer that is built into the
    If you are working in a vstart cluster, you may pass the ``--vstart`` parameter
    as shown above so the CLI commands are formatted with the `./bin/` prefix.
 
-   Note that any time the number of pgs changes (for instance, if the pg autoscaler [:ref:`pg-autoscaler`]
+   Note that any time the number of pgs changes (for instance, if the PG autoscaler [:ref:`pg-autoscaler`]
    kicks in), you should consider rechecking the scores and rerunning the balancer if needed.
 
 To see some details about what the tool is doing, you can pass
@@ -116,8 +121,12 @@ primary PG mappings and can impact read performance (this excludes any data move
 
 .. note::
 
-  Users affected by `#66867 <https://tracker.ceph.com/issues/66867>`_ or `#61948 <https://tracker.ceph.com/issues/61948>`_
-  may find these commands useful when dealing with unexpected ``pg-upmap-primary`` behavior.
+  These commands are useful for cleaning up unexpected
+  ``pg-upmap-primary`` state. For example, on some releases
+  ``pg-upmap-primary`` mappings were retained in the OSD map for pools
+  that had already been deleted, and such stale mappings could crash
+  Monitors with a ``pg_upmap_primaries.empty()`` assertion when an
+  older-format OSD map was encoded.
 
 To remove a specific ``pg-upmap-primary`` mapping, use:
 
@@ -125,11 +134,12 @@ To remove a specific ``pg-upmap-primary`` mapping, use:
 
    ceph osd rm-pg-upmap-primary <pgid>
 
-If you need to clear **all** ``pg-upmap-primary`` mappings in your cluster, you may use:
+If you need to clear **all** ``pg-upmap-primary`` mappings in your cluster, you may use the
+following command to either remove all mappings or optionally remove mappings for a single pool:
 
 .. prompt:: bash $
 
-   ceph osd rm-pg-upmap-primary-all
+   ceph osd rm-pg-upmap-primary-all {pool name}
 
 Unable to Use Kernel Client
 ---------------------------

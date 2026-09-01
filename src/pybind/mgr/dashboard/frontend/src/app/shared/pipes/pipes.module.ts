@@ -41,6 +41,10 @@ import { MbpersecondPipe } from './mbpersecond.pipe';
 import { PipeFunctionPipe } from './pipe-function.pipe';
 import { DimlessBinaryPerMinutePipe } from './dimless-binary-per-minute.pipe';
 import { RedirectLinkResolverPipe } from './redirect-link-resolver.pipe';
+import { CephVersionPipe } from './ceph-version.pipe';
+import { OverviewStatusPipe } from './overview-status.pipe';
+import { OverviewGridColumnNumbersPipe } from './overview-grid-column-numbers.pipe';
+import { ServiceCertificateStatusPipe } from './service-certificate-status.pipe';
 
 @NgModule({
   imports: [CommonModule],
@@ -84,7 +88,11 @@ import { RedirectLinkResolverPipe } from './redirect-link-resolver.pipe';
     MbpersecondPipe,
     PipeFunctionPipe,
     DimlessBinaryPerMinutePipe,
-    RedirectLinkResolverPipe
+    RedirectLinkResolverPipe,
+    CephVersionPipe,
+    OverviewStatusPipe,
+    OverviewGridColumnNumbersPipe,
+    ServiceCertificateStatusPipe
   ],
   exports: [
     ArrayPipe,
@@ -126,7 +134,11 @@ import { RedirectLinkResolverPipe } from './redirect-link-resolver.pipe';
     MbpersecondPipe,
     PipeFunctionPipe,
     DimlessBinaryPerMinutePipe,
-    RedirectLinkResolverPipe
+    RedirectLinkResolverPipe,
+    CephVersionPipe,
+    OverviewStatusPipe,
+    OverviewGridColumnNumbersPipe,
+    ServiceCertificateStatusPipe
   ],
   providers: [
     ArrayPipe,
@@ -159,7 +171,10 @@ import { RedirectLinkResolverPipe } from './redirect-link-resolver.pipe';
     OctalToHumanReadablePipe,
     MbpersecondPipe,
     DimlessBinaryPerMinutePipe,
-    RedirectLinkResolverPipe
+    RedirectLinkResolverPipe,
+    CephVersionPipe,
+    OverviewStatusPipe,
+    OverviewGridColumnNumbersPipe
   ]
 })
 export class PipesModule {}

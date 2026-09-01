@@ -1,10 +1,11 @@
 import json
 import random
+import re
 import string
-import sys
 import time
 import logging
 import errno
+import contextlib
 import dateutil.parser
 from datetime import datetime
 import threading
@@ -14,10 +15,7 @@ from itertools import combinations
 from itertools import zip_longest
 from io import StringIO
 
-import boto
-import boto.s3.connection
-from boto.s3.website import WebsiteConfiguration
-from boto.s3.cors import CORSConfiguration
+import boto3
 from botocore.exceptions import ClientError
 
 from nose.tools import eq_ as eq
@@ -28,7 +26,6 @@ from nose.plugins.skip import SkipTest
 from .multisite import Zone, ZoneGroup, Credentials
 
 from .conn import get_gateway_connection
-from .tools import assert_raises
 
 class Config:
     """ test configuration """
@@ -39,6 +36,20 @@ class Config:
         # allow some time for realm reconfiguration after changing master zone
         self.reconfigure_delay = kwargs.get('reconfigure_delay', 5)
         self.tenant = kwargs.get('tenant', '')
+
+@contextlib.contextmanager
+def override_config(**kwargs):
+    """Temporarily override config values for a test."""
+    global config
+    old_values = {}
+    for key, value in kwargs.items():
+        old_values[key] = getattr(config, key)
+        setattr(config, key, value)
+    try:
+        yield
+    finally:
+        for key, value in old_values.items():
+            setattr(config, key, value)
 
 # rgw multisite tests, written against the interfaces provided in rgw_multi.
 # these tests must be initialized and run by another module that provides
@@ -77,12 +88,6 @@ run_prefix=''.join(random.choice(string.ascii_lowercase) for _ in range(6))
 
 num_roles = 0
 num_topic = 0
-
-def get_zone_connection(zone, credentials):
-    """ connect to the zone's first gateway """
-    if isinstance(credentials, list):
-        credentials = credentials[0]
-    return get_gateway_connection(zone.gateways[0], credentials)
 
 def mdlog_list(zone, period = None):
     cmd = ['mdlog', 'list']
@@ -426,6 +431,49 @@ def zonegroup_bucket_checkpoint(zonegroup_conns, bucket_name):
         if target_conn.zone.has_buckets():
             target_conn.check_bucket_eq(source_conn, bucket_name)
 
+def get_oldest_incremental_change_not_applied_epoch(zone):
+    cmd = ['sync', 'status'] + zone.zone_args()
+    sync_status_output, retcode = zone.cluster.admin(cmd, check_retcode=False, read_only=True)
+    if retcode != 0:
+        # sync status failed for some reason, return epoch 0 to signal no progress
+        return 0.0
+
+    # extract the "data sync source:" section from the output
+    data_sync_match = re.search(r"data sync source:.*", sync_status_output, re.DOTALL)
+    if not data_sync_match:
+        # no data sync section found; return epoch 0 to signal no progress
+        return 0.0
+
+    data_sync_section = data_sync_match.group(0)
+
+    # 1) look for "oldest incremental change not applied" in the data sync section
+    match = re.search(r"oldest incremental change not applied:\s*([0-9T:\.\+\-Z]+)", data_sync_section)
+    if match:
+        return datetime.strptime(match.group(1), "%Y-%m-%dT%H:%M:%S.%f%z").timestamp()
+
+    # 2) if data is caught up with source, return None (no work pending)
+    if "data is caught up with source" in data_sync_section:
+        return None
+
+    # 3) data sync section exists but neither marker found; return epoch 0
+    #    so the caller knows data sync is not making progress
+    return 0.0
+
+def data_sync_making_progress(zone):
+    oldest_inc_change = None
+    result = False
+    for _ in range(config.checkpoint_retries):
+        new_reading = get_oldest_incremental_change_not_applied_epoch(zone)
+        if new_reading is not None:
+            if oldest_inc_change is None:
+                oldest_inc_change = new_reading
+            elif oldest_inc_change != new_reading:
+                result = True
+                oldest_inc_change = new_reading
+                break
+        time.sleep(config.checkpoint_delay)
+    return result or oldest_inc_change is None
+
 def set_master_zone(zone):
     zone.modify(zone.cluster, ['--master'])
     zonegroup = zone.zonegroup
@@ -458,14 +506,29 @@ def disable_bucket_sync(zone, bucket_name):
     cmd = ['bucket', 'sync', 'disable', '--bucket', bucket_name] + zone.zone_args()
     zone.cluster.admin(cmd)
 
-def check_buckets_sync_status_obj_not_exist(zone, buckets):
+def check_buckets_sync_disabled(zonegroup, buckets):
+    """ verify that no zone is actively (full or incremental) syncing the
+    given buckets from any other zone, ie that bucket sync is disabled.
+    this polls because it can take a few seconds for the disabled state to
+    propagate via metadata sync """
+    active_states = ('full-sync', 'incremental-sync')
+    zones = zonegroup.zones
     for _ in range(config.checkpoint_retries):
-        cmd = ['log', 'list'] + zone.zone_arg()
-        log_list, ret = zone.cluster.admin(cmd, check_retcode=False, read_only=True)
-        for bucket in buckets:
-            if log_list.find(':'+bucket+":") >= 0:
+        still_syncing = False
+        for zone in zones:
+            for source_zone in zones:
+                if source_zone == zone:
+                    continue
+                for bucket_name in buckets:
+                    state = get_bucket_sync_state(zone, source_zone, bucket_name)
+                    if state in active_states:
+                        still_syncing = True
+                        break
+                if still_syncing:
+                    break
+            if still_syncing:
                 break
-        else:
+        if not still_syncing:
             return
         time.sleep(config.checkpoint_delay)
     assert False
@@ -504,6 +567,7 @@ class ZonegroupConns:
         self.master_zone = None
 
         for z in zonegroup.zones:
+            log.debug('=== Debug get_conn for zone=%s ===', z.name)
             zone_conn = z.get_conn(user.credentials)
             non_account_zone_conn = z.get_conn(non_account_user.credentials)
             non_account_alt_zone_conn = z.get_conn(non_account_alt_user.credentials)
@@ -529,8 +593,12 @@ def check_all_buckets_exist(zone_conn, buckets):
     for b in buckets:
         try:
             zone_conn.get_bucket(b)
-        except:
-            log.critical('zone %s does not contain bucket %s', zone_conn.zone.name, b)
+        except ClientError as e:
+            errcode = e.response['Error']['Code']
+            if errcode in ['404', 'NoSuchBucket']:
+                log.critical('zone %s does not contain bucket %s', zone_conn.zone.name, b)
+            else:
+                log.critical('zone %s unexpected error checking bucket %s: %s', zone_conn.zone.name, b, errcode)
             return False
 
     return True
@@ -539,16 +607,20 @@ def check_all_buckets_dont_exist(zone_conn, buckets):
     if not zone_conn.zone.has_buckets():
         return True
 
+    remaining = []
     for b in buckets:
         try:
             zone_conn.get_bucket(b)
-        except:
-            continue
-
+        except ClientError as e:
+            errcode = e.response['Error']['Code']
+            if errcode in ['404', 'NoSuchBucket']:
+                continue
+            log.critical('zone %s unexpected error checking bucket %s: %s', zone_conn.zone, b, errcode)
+            return False
         log.critical('zone %s contains bucket %s', zone_conn.zone, b)
-        return False
+        remaining.append(b)
 
-    return True
+    return len(remaining) == 0
 
 
 def get_topics(zone):
@@ -618,6 +690,8 @@ def create_bucket_per_zone_in_realm():
 def test_bucket_create():
     zonegroup = realm.master_zonegroup()
     zonegroup_conns = ZonegroupConns(zonegroup)
+    zonegroup_meta_checkpoint(zonegroup)
+
     buckets, _ = create_bucket_per_zone(zonegroup_conns)
     zonegroup_meta_checkpoint(zonegroup)
 
@@ -639,30 +713,38 @@ def test_bucket_create_with_tenant():
     tenant = 'testx'
     uid = 'test'
 
-    tenant_secondary_conn = boto.s3.connection.S3Connection(aws_access_key_id=access_key,
-                                aws_secret_access_key=secret_key,
-                                is_secure=False,
-                                port=secondary.zone.gateways[0].port,
-                                host=secondary.zone.gateways[0].host,
-                                calling_format='boto.s3.connection.OrdinaryCallingFormat')
+    # create s3 clients for tenant user
+    tenant_secondary_conn = boto3.client(
+        's3',
+        endpoint_url=f'http://{secondary.zone.gateways[0].host}:{secondary.zone.gateways[0].port}',
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        region_name='default'
+    )
 
-    tenant_primary_conn = boto.s3.connection.S3Connection(aws_access_key_id=access_key,
-                                aws_secret_access_key=secret_key,
-                                is_secure=False,
-                                port=primary.zone.gateways[0].port,
-                                host=primary.zone.gateways[0].host,
-                                calling_format='boto.s3.connection.OrdinaryCallingFormat')
+    tenant_primary_conn = boto3.client(
+        's3',
+        endpoint_url=f'http://{primary.zone.gateways[0].host}:{primary.zone.gateways[0].port}',
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        region_name='default'
+    )
 
     cmd = ['user', 'create', '--tenant', tenant, '--uid', uid, '--access-key', access_key, '--secret-key', secret_key, '--display-name', 'tenanted-user']
     primary.zone.cluster.admin(cmd)
     zonegroup_meta_checkpoint(zonegroup)
     try:
-        bucket = tenant_secondary_conn.create_bucket('tenanted-bucket')
+        bucket_name = 'tenanted-bucket'
+        tenant_secondary_conn.create_bucket(Bucket=bucket_name)
         zonegroup_meta_checkpoint(zonegroup)
-        assert tenant_primary_conn.get_bucket(bucket.name)
+        tenant_primary_conn.head_bucket(Bucket=bucket_name)
         log.info("bucket exists in tenant namespace")
-        e = assert_raises(boto.exception.S3ResponseError, primary.get_bucket, bucket.name)
-        assert e.error_code == 'NoSuchBucket'
+
+        try:
+            primary.s3_client.head_bucket(Bucket=bucket_name)
+            assert False, "Expected 404 error - bucket should not exist in default namespace"
+        except ClientError as e:
+            assert e.response['Error']['Code'] == '404'
         log.info("bucket does not exist in default user namespace")
     finally:
         cmd = ['user', 'rm', '--tenant', tenant, '--uid', uid, '--purge-data']
@@ -700,24 +782,17 @@ def test_bucket_remove():
         for zone in zonegroup_conns.zones:
             assert check_all_buckets_exist(zone, buckets)
 
-        for zone, bucket_name in zone_buckets:
-            zone.conn.delete_bucket(bucket_name)
+        for zone, bucket in zone_buckets:
+            zone.s3_client.delete_bucket(Bucket=bucket.name)
 
         zonegroup_meta_checkpoint(zonegroup)
 
         for zone in zonegroup_conns.zones:
-            assert check_all_buckets_dont_exist(zone, buckets)
-
-def get_bucket(zone, bucket_name):
-    return zone.conn.get_bucket(bucket_name)
-
-def get_key(zone, bucket_name, obj_name):
-    b = get_bucket(zone, bucket_name)
-    return b.get_key(obj_name)
-
-def new_key(zone, bucket_name, obj_name):
-    b = get_bucket(zone, bucket_name)
-    return b.new_key(obj_name)
+            log.info("Checking zone=%s for deleted buckets", zone.name)
+            result = check_all_buckets_dont_exist(zone, buckets)
+            if not result:
+                log.error("Zone %s still has buckets", zone.name)
+            assert result
 
 def check_bucket_eq(zone_conn1, zone_conn2, bucket):
     if zone_conn2.zone.has_buckets():
@@ -837,6 +912,9 @@ def check_oidc_provider_eq(zone_conn1, zone_conn2, arn):
 
     p1 = iam1.get_open_id_connect_provider(OpenIDConnectProviderArn=arn)
     p2 = iam2.get_open_id_connect_provider(OpenIDConnectProviderArn=arn)
+    # Remove transport metadata
+    p1.pop('ResponseMetadata', None)
+    p2.pop('ResponseMetadata', None)
     eq(p1, p2)
 
 def check_oidc_providers_eq(zone_conn1, zone_conn2):
@@ -854,15 +932,13 @@ def test_object_sync():
     zonegroup_conns = ZonegroupConns(zonegroup)
     buckets, zone_bucket = create_bucket_per_zone(zonegroup_conns)
 
-    objnames = [ 'myobj', '_myobj', ':', '&', '.', '..', '...',  '.o', '.o.']
-
+    objnames = ['myobj', '_myobj', ':', '&', '.', '..', '...', '.o', '.o.']
     content = 'asdasd'
 
-    # don't wait for meta sync just yet
-    for zone, bucket_name in zone_bucket:
+    # upload objects
+    for zone, bucket in zone_bucket:
         for objname in objnames:
-            k = new_key(zone, bucket_name, objname)
-            k.set_contents_from_string(content)
+            zone.s3_client.put_object(Bucket=bucket.name, Key=objname, Body=content)
 
     zonegroup_meta_checkpoint(zonegroup)
 
@@ -882,10 +958,9 @@ def test_object_delete():
     objname = 'myobj'
     content = 'asdasd'
 
-    # don't wait for meta sync just yet
+    # upload objects
     for zone, bucket in zone_bucket:
-        k = new_key(zone, bucket, objname)
-        k.set_contents_from_string(content)
+        zone.s3_client.put_object(Bucket=bucket.name, Key=objname, Body=content)
 
     zonegroup_meta_checkpoint(zonegroup)
 
@@ -898,10 +973,10 @@ def test_object_delete():
             zone_bucket_checkpoint(target_conn.zone, source_conn.zone, bucket.name)
             check_bucket_eq(source_conn, target_conn, bucket)
 
-    # check object removal
+    # delete objects
     for source_conn, bucket in zone_bucket:
-        k = get_key(source_conn, bucket, objname)
-        k.delete()
+        source_conn.s3_client.delete_object(Bucket=bucket.name, Key=objname)
+        
         for target_conn in zonegroup_conns.zones:
             if source_conn.zone == target_conn.zone:
                 continue
@@ -914,12 +989,13 @@ def test_multi_object_delete():
     zonegroup_conns = ZonegroupConns(zonegroup)
     buckets, zone_bucket = create_bucket_per_zone(zonegroup_conns)
 
-    objnames = [f'obj{i}' for i in range(1,50)]
+    objnames = [f'obj{i}' for i in range(1, 50)]
     content = 'asdasd'
 
-    # don't wait for meta sync just yet
+    # upload objects
     for zone, bucket in zone_bucket:
-        create_objects(zone, bucket, objnames, content)
+        for objname in objnames:
+            zone.s3_client.put_object(Bucket=bucket.name, Key=objname, Body=content)
 
     zonegroup_meta_checkpoint(zonegroup)
 
@@ -932,9 +1008,14 @@ def test_multi_object_delete():
             zone_bucket_checkpoint(target_conn.zone, source_conn.zone, bucket.name)
             check_bucket_eq(source_conn, target_conn, bucket)
 
-    # check object removal
+    # delete objects
     for source_conn, bucket in zone_bucket:
-        bucket.delete_keys(objnames)
+        objects = [{'Key': obj} for obj in objnames]
+        source_conn.s3_client.delete_objects(
+            Bucket=bucket.name,
+            Delete={'Objects': objects}
+        )
+        
         for target_conn in zonegroup_conns.zones:
             if source_conn.zone == target_conn.zone:
                 continue
@@ -942,27 +1023,24 @@ def test_multi_object_delete():
             zone_bucket_checkpoint(target_conn.zone, source_conn.zone, bucket.name)
             check_bucket_eq(source_conn, target_conn, bucket)
 
-def get_latest_object_version(key):
-    for k in key.bucket.list_versions(key.name):
-        if k.is_latest:
-            return k
-    return None
-
 def test_versioned_object_incremental_sync():
     zonegroup = realm.master_zonegroup()
     zonegroup_conns = ZonegroupConns(zonegroup)
     buckets, zone_bucket = create_bucket_per_zone(zonegroup_conns)
 
     # enable versioning
-    for _, bucket in zone_bucket:
-        bucket.configure_versioning(True)
+    for zone, bucket in zone_bucket:
+        zone.s3_client.put_bucket_versioning(
+            Bucket=bucket.name,
+            VersioningConfiguration={'Status': 'Enabled'}
+        )
 
     zonegroup_meta_checkpoint(zonegroup)
 
     # upload a dummy object to each bucket and wait for sync. this forces each
     # bucket to finish a full sync and switch to incremental
     for source_conn, bucket in zone_bucket:
-        new_key(source_conn, bucket, 'dummy').set_contents_from_string('')
+        source_conn.s3_client.put_object(Bucket=bucket.name, Key='dummy', Body='')
         for target_conn in zonegroup_conns.zones:
             if source_conn.zone == target_conn.zone:
                 continue
@@ -972,33 +1050,48 @@ def test_versioned_object_incremental_sync():
         # create and delete multiple versions of an object from each zone
         for zone_conn in zonegroup_conns.rw_zones:
             obj = 'obj-' + zone_conn.name
-            k = new_key(zone_conn, bucket, obj)
 
-            k.set_contents_from_string('version1')
-            log.debug('version1 id=%s', k.version_id)
+            resp1 = zone_conn.s3_client.put_object(Bucket=bucket.name, Key=obj, Body='version1')
+            version_id_1 = resp1['VersionId']
+            log.debug('version1 id=%s', version_id_1)
             # don't delete version1 - this tests that the initial version
             # doesn't get squashed into later versions
 
             # create and delete the following object versions to test that
             # the operations don't race with each other during sync
-            k.set_contents_from_string('version2')
-            log.debug('version2 id=%s', k.version_id)
-            k.bucket.delete_key(obj, version_id=k.version_id)
-
-            k.set_contents_from_string('version3')
-            log.debug('version3 id=%s', k.version_id)
-            k.bucket.delete_key(obj, version_id=k.version_id)
+            resp2 = zone_conn.s3_client.put_object(Bucket=bucket.name, Key=obj, Body='version2')
+            version_id_2 = resp2['VersionId']
+            log.debug('version2 id=%s', version_id_2)
+            zone_conn.s3_client.delete_object(Bucket=bucket.name, Key=obj, VersionId=version_id_2)
+            
+            # Create and delete version3
+            resp3 = zone_conn.s3_client.put_object(Bucket=bucket.name, Key=obj, Body='version3')
+            version_id_3 = resp3['VersionId']
+            log.debug('version3 id=%s', version_id_3)
+            zone_conn.s3_client.delete_object(Bucket=bucket.name, Key=obj, VersionId=version_id_3)
 
     for _, bucket in zone_bucket:
         zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
 
+    # update ACLs to test metadata-only entries
     for _, bucket in zone_bucket:
-        # overwrite the acls to test that metadata-only entries are applied
         for zone_conn in zonegroup_conns.rw_zones:
             obj = 'obj-' + zone_conn.name
-            k = new_key(zone_conn, bucket.name, obj)
-            v = get_latest_object_version(k)
-            v.make_public()
+            
+            # get latest version
+            response = zone_conn.s3_client.list_object_versions(
+                Bucket=bucket.name,
+                Prefix=obj,
+                MaxKeys=1
+            )
+            if response.get('Versions'):
+                latest = response['Versions'][0]
+                zone_conn.s3_client.put_object_acl(
+                    Bucket=bucket.name,
+                    Key=obj,
+                    VersionId=latest['VersionId'],
+                    ACL='public-read'
+                )
 
     for _, bucket in zone_bucket:
         zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
@@ -1016,24 +1109,29 @@ def test_null_version_id_delete():
     obj = 'obj'
 
     # upload an initial object
-    key1 = new_key(zone, bucket, obj)
-    key1.set_contents_from_string('')
-    log.debug('created initial version id=%s', key1.version_id)
+    resp1 = zone.s3_client.put_object(Bucket=bucket.name, Key=obj, Body='')
+    version_id_1 = resp1.get('VersionId', 'null')
+    log.debug('created initial version id=%s', version_id_1)
     zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
 
     # enable versioning
-    bucket.configure_versioning(True)
+    zone.s3_client.put_bucket_versioning(
+        Bucket=bucket.name,
+        VersioningConfiguration={'Status': 'Enabled'}
+    )
     zonegroup_meta_checkpoint(zonegroup)
 
     # re-upload the object as a new version
-    key2 = new_key(zone, bucket, obj)
-    key2.set_contents_from_string('')
-    log.debug('created new version id=%s', key2.version_id)
+    resp2 = zone.s3_client.put_object(Bucket=bucket.name, Key=obj, Body='')
+    version_id_2 = resp2['VersionId']
+    log.debug('created new version id=%s', version_id_2)
     zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
 
-    bucket.delete_key(obj, version_id='null')
+    # delete null version
+    zone.s3_client.delete_object(Bucket=bucket.name, Key=obj, VersionId='null')
 
-    bucket.delete_key(obj, version_id=key2.version_id)
+    # delete version 2
+    zone.s3_client.delete_object(Bucket=bucket.name, Key=obj, VersionId=version_id_2)
 
     zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
 
@@ -1045,22 +1143,24 @@ def test_concurrent_versioned_object_incremental_sync():
     # create a versioned bucket
     bucket = zone.create_bucket(gen_bucket_name())
     log.debug('created bucket=%s', bucket.name)
-    bucket.configure_versioning(True)
+    
+    zone.s3_client.put_bucket_versioning(
+        Bucket=bucket.name,
+        VersioningConfiguration={'Status': 'Enabled'}
+    )
 
     zonegroup_meta_checkpoint(zonegroup)
 
-    # upload a dummy object and wait for sync. this forces each zone to finish
-    # a full sync and switch to incremental
-    new_key(zone, bucket, 'dummy').set_contents_from_string('')
+    # upload a dummy object and wait for sync
+    zone.s3_client.put_object(Bucket=bucket.name, Key='dummy', Body='')
     zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
 
-    # create several concurrent versions on each zone and let them race to sync
+    # create several concurrent versions on each zone
     obj = 'obj'
     for i in range(10):
         for zone_conn in zonegroup_conns.rw_zones:
-            k = new_key(zone_conn, bucket, obj)
-            k.set_contents_from_string('version1')
-            log.debug('zone=%s version=%s', zone_conn.zone.name, k.version_id)
+            resp = zone_conn.s3_client.put_object(Bucket=bucket.name, Key=obj, Body='version1')
+            log.debug('zone=%s version=%s', zone_conn.zone.name, resp['VersionId'])
 
     zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
     zonegroup_data_checkpoint(zonegroup_conns)
@@ -1068,7 +1168,6 @@ def test_concurrent_versioned_object_incremental_sync():
 def test_version_suspended_incremental_sync():
     zonegroup = realm.master_zonegroup()
     zonegroup_conns = ZonegroupConns(zonegroup)
-
     zone = zonegroup_conns.rw_zones[0]
 
     # create a non-versioned bucket
@@ -1077,29 +1176,32 @@ def test_version_suspended_incremental_sync():
     zonegroup_meta_checkpoint(zonegroup)
 
     # upload an initial object
-    key1 = new_key(zone, bucket, 'obj')
-    key1.set_contents_from_string('')
-    log.debug('created initial version id=%s', key1.version_id)
+    resp1 = zone.s3_client.put_object(Bucket=bucket.name, Key='obj', Body='')
+    log.debug('created initial version id=%s', resp1.get('VersionId', 'null'))
     zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
 
     # enable versioning
-    bucket.configure_versioning(True)
+    zone.s3_client.put_bucket_versioning(
+        Bucket=bucket.name,
+        VersioningConfiguration={'Status': 'Enabled'}
+    )
     zonegroup_meta_checkpoint(zonegroup)
 
     # re-upload the object as a new version
-    key2 = new_key(zone, bucket, 'obj')
-    key2.set_contents_from_string('')
-    log.debug('created new version id=%s', key2.version_id)
+    resp2 = zone.s3_client.put_object(Bucket=bucket.name, Key='obj', Body='')
+    log.debug('created new version id=%s', resp2['VersionId'])
     zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
 
     # suspend versioning
-    bucket.configure_versioning(False)
+    zone.s3_client.put_bucket_versioning(
+        Bucket=bucket.name,
+        VersioningConfiguration={'Status': 'Suspended'}
+    )
     zonegroup_meta_checkpoint(zonegroup)
 
     # re-upload the object as a 'null' version
-    key3 = new_key(zone, bucket, 'obj')
-    key3.set_contents_from_string('')
-    log.debug('created null version id=%s', key3.version_id)
+    resp3 = zone.s3_client.put_object(Bucket=bucket.name, Key='obj', Body='')
+    log.debug('created null version id=%s', resp3.get('VersionId', 'null'))
     zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
 
 def test_delete_marker_full_sync():
@@ -1108,20 +1210,21 @@ def test_delete_marker_full_sync():
     buckets, zone_bucket = create_bucket_per_zone(zonegroup_conns)
 
     # enable versioning
-    for _, bucket in zone_bucket:
-        bucket.configure_versioning(True)
+    for zone, bucket in zone_bucket:
+        zone.s3_client.put_bucket_versioning(
+            Bucket=bucket.name,
+            VersioningConfiguration={'Status': 'Enabled'}
+        )
     zonegroup_meta_checkpoint(zonegroup)
 
     for zone, bucket in zone_bucket:
         # upload an initial object
-        key1 = new_key(zone, bucket, 'obj')
-        key1.set_contents_from_string('')
+        zone.s3_client.put_object(Bucket=bucket.name, Key='obj', Body='')
 
-        # create a delete marker
-        key2 = new_key(zone, bucket, 'obj')
-        key2.delete()
-        key2.delete()
-        key2.delete()
+        # create delete markers
+        zone.s3_client.delete_object(Bucket=bucket.name, Key='obj')
+        zone.s3_client.delete_object(Bucket=bucket.name, Key='obj')
+        zone.s3_client.delete_object(Bucket=bucket.name, Key='obj')
 
     # wait for full sync
     for _, bucket in zone_bucket:
@@ -1133,21 +1236,25 @@ def test_suspended_delete_marker_full_sync():
     buckets, zone_bucket = create_bucket_per_zone(zonegroup_conns)
 
     # enable/suspend versioning
-    for _, bucket in zone_bucket:
-        bucket.configure_versioning(True)
-        bucket.configure_versioning(False)
+    for zone, bucket in zone_bucket:
+        zone.s3_client.put_bucket_versioning(
+            Bucket=bucket.name,
+            VersioningConfiguration={'Status': 'Enabled'}
+        )
+        zone.s3_client.put_bucket_versioning(
+            Bucket=bucket.name,
+            VersioningConfiguration={'Status': 'Suspended'}
+        )
     zonegroup_meta_checkpoint(zonegroup)
 
     for zone, bucket in zone_bucket:
         # upload an initial object
-        key1 = new_key(zone, bucket, 'obj')
-        key1.set_contents_from_string('')
+        zone.s3_client.put_object(Bucket=bucket.name, Key='obj', Body='')
 
-        # create a delete marker
-        key2 = new_key(zone, bucket, 'obj')
-        key2.delete()
-        key2.delete()
-        key2.delete()
+        # create delete markers
+        zone.s3_client.delete_object(Bucket=bucket.name, Key='obj')
+        zone.s3_client.delete_object(Bucket=bucket.name, Key='obj')
+        zone.s3_client.delete_object(Bucket=bucket.name, Key='obj')
 
     # wait for full sync
     for _, bucket in zone_bucket:
@@ -1161,22 +1268,24 @@ def test_concurrent_delete_markers_incremental_sync():
     # create a versioned bucket
     bucket = zone.create_bucket(gen_bucket_name())
     log.debug('created bucket=%s', bucket.name)
-    bucket.configure_versioning(True)
+    
+    zone.s3_client.put_bucket_versioning(
+        Bucket=bucket.name,
+        VersioningConfiguration={'Status': 'Enabled'}
+    )
 
     zonegroup_meta_checkpoint(zonegroup)
 
     obj = 'obj'
 
-    # upload a dummy object and wait for sync. this forces each zone to finish
-    # a full sync and switch to incremental
-    new_key(zone, bucket, obj).set_contents_from_string('')
+    # upload a dummy object and wait for sync
+    zone.s3_client.put_object(Bucket=bucket.name, Key=obj, Body='')
     zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
 
-    # create several concurrent delete markers on each zone and let them race to sync
+    # create several concurrent delete markers on each zone
     for i in range(2):
         for zone_conn in zonegroup_conns.rw_zones:
-            key = new_key(zone_conn, bucket, obj)
-            key.delete()
+            zone_conn.s3_client.delete_object(Bucket=bucket.name, Key=obj)
 
     zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
 
@@ -1188,46 +1297,65 @@ def test_suspended_delete_marker_incremental_sync():
     # create a versioned bucket
     bucket = zone.create_bucket(gen_bucket_name())
     log.debug('created bucket=%s', bucket.name)
-    bucket.configure_versioning(True)
-    bucket.configure_versioning(False)
+    
+    zone.s3_client.put_bucket_versioning(
+        Bucket=bucket.name,
+        VersioningConfiguration={'Status': 'Enabled'}
+    )
+    zone.s3_client.put_bucket_versioning(
+        Bucket=bucket.name,
+        VersioningConfiguration={'Status': 'Suspended'}
+    )
 
     zonegroup_meta_checkpoint(zonegroup)
 
     obj = 'obj'
 
-    # upload a dummy object and wait for sync. this forces each zone to finish
-    # a full sync and switch to incremental
-    new_key(zone, bucket, obj).set_contents_from_string('')
+    # upload a dummy object and wait for sync
+    zone.s3_client.put_object(Bucket=bucket.name, Key=obj, Body='')
     zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
 
-    # create several a delete marker on source zone and let it sync
-    key = new_key(zone, bucket, obj)
-    key.delete()
+    # create a delete marker on source zone
+    zone.s3_client.delete_object(Bucket=bucket.name, Key=obj)
 
     zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
 
 def test_bucket_versioning():
     buckets, zone_bucket = create_bucket_per_zone_in_realm()
-    for _, bucket in zone_bucket:
-        bucket.configure_versioning(True)
-        res = bucket.get_versioning_status()
-        key = 'Versioning'
-        assert(key in res and res[key] == 'Enabled')
+    for zone, bucket in zone_bucket:
+        zone.s3_client.put_bucket_versioning(
+            Bucket=bucket.name,
+            VersioningConfiguration={'Status': 'Enabled'}
+        )
+        response = zone.s3_client.get_bucket_versioning(Bucket=bucket.name)
+        assert response.get('Status') == 'Enabled'
 
 def test_bucket_acl():
     buckets, zone_bucket = create_bucket_per_zone_in_realm()
-    for _, bucket in zone_bucket:
-        assert(len(bucket.get_acl().acl.grants) == 1) # single grant on owner
-        bucket.set_acl('public-read')
-        assert(len(bucket.get_acl().acl.grants) == 2) # new grant on AllUsers
+    for zone, bucket in zone_bucket:
+        acl = zone.s3_client.get_bucket_acl(Bucket=bucket.name)
+        assert len(acl['Grants']) == 1  # single grant on owner
+        
+        zone.s3_client.put_bucket_acl(Bucket=bucket.name, ACL='public-read')
+        
+        acl = zone.s3_client.get_bucket_acl(Bucket=bucket.name)
+        assert len(acl['Grants']) == 2  # new grant on AllUsers
 
 def test_bucket_cors():
     buckets, zone_bucket = create_bucket_per_zone_in_realm()
-    for _, bucket in zone_bucket:
-        cors_cfg = CORSConfiguration()
-        cors_cfg.add_rule(['DELETE'], 'https://www.example.com', allowed_header='*', max_age_seconds=3000)
-        bucket.set_cors(cors_cfg)
-        assert(bucket.get_cors().to_xml() == cors_cfg.to_xml())
+    for zone, bucket in zone_bucket:
+        cors_cfg = {
+            'CORSRules': [{
+                'AllowedMethods': ['DELETE'],
+                'AllowedOrigins': ['https://www.example.com'],
+                'AllowedHeaders': ['*'],
+                'MaxAgeSeconds': 3000
+            }]
+        }
+        zone.s3_client.put_bucket_cors(Bucket=bucket.name, CORSConfiguration=cors_cfg)
+        
+        response = zone.s3_client.get_bucket_cors(Bucket=bucket.name)
+        assert response['CORSRules'] == cors_cfg['CORSRules']
 
 def test_bucket_delete_notempty():
     zonegroup = realm.master_zonegroup()
@@ -1235,24 +1363,21 @@ def test_bucket_delete_notempty():
     buckets, zone_bucket = create_bucket_per_zone(zonegroup_conns)
     zonegroup_meta_checkpoint(zonegroup)
 
-    for zone_conn, bucket_name in zone_bucket:
+    for zone_conn, bucket in zone_bucket:
         # upload an object to each bucket on its own zone
-        conn = zone_conn.get_connection()
-        bucket = conn.get_bucket(bucket_name)
-        k = bucket.new_key('foo')
-        k.set_contents_from_string('bar')
+        zone_conn.s3_client.put_object(Bucket=bucket.name, Key='foo', Body='bar')
+        
         # attempt to delete the bucket before this object can sync
         try:
-            conn.delete_bucket(bucket_name)
-        except boto.exception.S3ResponseError as e:
-            assert(e.error_code == 'BucketNotEmpty')
+            zone_conn.s3_client.delete_bucket(Bucket=bucket.name)
+        except ClientError as e:
+            assert e.response['Error']['Code'] == 'BucketNotEmpty'
             continue
-        assert False # expected 409 BucketNotEmpty
+        assert False  # expected BucketNotEmpty
 
     # assert that each bucket still exists on the master
-    c1 = zonegroup_conns.master_zone.conn
-    for _, bucket_name in zone_bucket:
-        assert c1.get_bucket(bucket_name)
+    for _, bucket in zone_bucket:
+        zonegroup_conns.master_zone.s3_client.head_bucket(Bucket=bucket.name)
 
 def test_multi_period_incremental_sync():
     zonegroup = realm.master_zonegroup()
@@ -1283,7 +1408,7 @@ def test_multi_period_incremental_sync():
             continue
         bucket_name = gen_bucket_name()
         log.info('create bucket zone=%s name=%s', zone_conn.name, bucket_name)
-        bucket = zone_conn.conn.create_bucket(bucket_name)
+        zone_conn.s3_client.create_bucket(Bucket=bucket_name)
         buckets.append(bucket_name)
 
     # wait for zone 1 to sync
@@ -1293,12 +1418,12 @@ def test_multi_period_incremental_sync():
     set_master_zone(z1)
     mdlog_periods += [realm.current_period.id]
 
-    for zone_conn, bucket_name in zone_bucket:
+    for zone_conn, _ in zone_bucket:
         if zone_conn.zone == z3:
             continue
         bucket_name = gen_bucket_name()
         log.info('create bucket zone=%s name=%s', zone_conn.name, bucket_name)
-        zone_conn.conn.create_bucket(bucket_name)
+        zone_conn.s3_client.create_bucket(Bucket=bucket_name)
         buckets.append(bucket_name)
 
     # restart zone 3 gateway and wait for sync
@@ -1311,7 +1436,6 @@ def test_multi_period_incremental_sync():
             for target_conn in zonegroup_conns.zones:
                 if source_conn.zone == target_conn.zone:
                     continue
-
                 if target_conn.zone.has_buckets():
                     target_conn.check_bucket_eq(source_conn, bucket_name)
 
@@ -1347,8 +1471,7 @@ def test_datalog_autotrim():
 
     # upload an object to each zone to generate a datalog entry
     for zone, bucket in zone_bucket:
-        k = new_key(zone, bucket.name, 'key')
-        k.set_contents_from_string('body')
+        zone.s3_client.put_object(Bucket=bucket.name, Key='key', Body='body')
 
     # wait for metadata and data sync to catch up
     zonegroup_meta_checkpoint(zonegroup)
@@ -1378,47 +1501,46 @@ def test_datalog_autotrim():
 def test_multi_zone_redirect():
     zonegroup = realm.master_zonegroup()
     if len(zonegroup.rw_zones) < 2:
-        raise SkipTest("test_multi_period_incremental_sync skipped. Requires 3 or more zones in master zonegroup.")
+        raise SkipTest("test_multi_zone_redirect skipped. Requires 2 or more zones in master zonegroup.")
 
     zonegroup_conns = ZonegroupConns(zonegroup)
     (zc1, zc2) = zonegroup_conns.rw_zones[0:2]
-
     z1, z2 = (zc1.zone, zc2.zone)
 
     set_sync_from_all(z2, False)
 
-    # create a bucket on the first zone
     bucket_name = gen_bucket_name()
     log.info('create bucket zone=%s name=%s', z1.name, bucket_name)
-    bucket = zc1.conn.create_bucket(bucket_name)
+    zc1.s3_client.create_bucket(Bucket=bucket_name)
+    
     obj = 'testredirect'
-
-    key = bucket.new_key(obj)
-    data = 'A'*512
-    key.set_contents_from_string(data)
+    data = 'A' * 512
+    zc1.s3_client.put_object(Bucket=bucket_name, Key=obj, Body=data)
 
     zonegroup_meta_checkpoint(zonegroup)
 
-    # try to read object from second zone (should fail)
-    bucket2 = get_bucket(zc2, bucket_name)
-    assert_raises(boto.exception.S3ResponseError, bucket2.get_key, obj)
+    try:
+        # try to read object from second zone (should fail)
+        try:
+            zc2.s3_client.get_object(Bucket=bucket_name, Key=obj)
+            assert False, "Expected NoSuchKey error"
+        except ClientError as e:
+            assert e.response['Error']['Code'] == 'NoSuchKey'
 
-    set_redirect_zone(z2, z1)
+        set_redirect_zone(z2, z1)
 
-    key2 = bucket2.get_key(obj)
+        # verify redirect is configured by checking for 301 response
+        try:
+            zc2.s3_client.get_object(Bucket=bucket_name, Key=obj)
+            assert False, "expected 301 error (boto3 doesn't follow redirects \
+                        https://github.com/boto/botocore/issues/2571)"
+        except ClientError as e:
+            assert e.response['Error']['Code'] == '301', \
+                f"Expected 301 but got {e.response['Error']['Code']}"
 
-    eq(data, key2.get_contents_as_string(encoding='ascii'))
-
-    key = bucket.new_key(obj)
-
-    for x in ['a', 'b', 'c', 'd']:
-        data = x*512
-        key.set_contents_from_string(data)
-        eq(data, key2.get_contents_as_string(encoding='ascii'))
-
-    # revert config changes
-    set_sync_from_all(z2, True)
-    set_redirect_zone(z2, None)
+    finally:
+        set_sync_from_all(z2, True)
+        set_redirect_zone(z2, None)
 
 def test_zonegroup_remove():
     zonegroup = realm.master_zonegroup()
@@ -1480,16 +1602,77 @@ def test_zg_master_zone_delete():
     rm_zg.delete(master_cluster)
     master_zg.period.update(master_zone, commit=True)
 
+def test_zonegroup_rename():
+    master_zg = realm.master_zonegroup()
+    master_zone = master_zg.master_zone
+    master_cluster = master_zone.cluster
+
+    old_name = 'rename_test_zg'
+    new_name = 'rename_test_zg_renamed'
+
+    # create a temporary zonegroup with a zone and commit the period
+    test_zg = ZoneGroup(old_name, master_zg.period)
+    test_zg.create(master_cluster)
+    test_zone = Zone('rename_test_zone', test_zg, master_cluster)
+    test_zone.create(master_cluster)
+    master_zg.period.update(master_zone, commit=True)
+
+    realm_meta_checkpoint(realm)
+
+    # rename the zonegroup on the master and commit the updated period
+    r = test_zg.rename(master_cluster, new_name)
+    assert r == 0, "zonegroup rename failed with %d" % r
+    master_zg.period.update(master_zone, commit=True)
+
+    realm_meta_checkpoint(realm)
+
+    time.sleep(config.reconfigure_delay)
+
+    # verify on each zone:
+    new_zg = ZoneGroup(new_name, master_zg.period)
+    old_zg = ZoneGroup(old_name, master_zg.period)
+    for zone in master_zg.zones:
+        for _ in range(config.checkpoint_retries):
+            _, r = new_zg.get(zone.cluster, check_retcode=False)
+            if r == 0:
+                break
+            time.sleep(config.checkpoint_delay)
+        assert r == 0, \
+            "new zonegroup name '%s' not found on zone %s" % (new_name, zone.name)
+
+        for _ in range(config.checkpoint_retries):
+            _, r = old_zg.get(zone.cluster, check_retcode=False)
+            if r == errno.ENOENT:
+                break
+            time.sleep(config.checkpoint_delay)
+        assert r == errno.ENOENT, \
+            "old zonegroup name '%s' still present on zone %s (r=%d)" % (old_name, zone.name, r)
+
+    # clean up
+    test_zone.delete(master_cluster)
+    test_zg.delete(master_cluster)
+    master_zg.period.update(master_zone, commit=True)
+    time.sleep(config.reconfigure_delay)
+
 def test_set_bucket_website():
     buckets, zone_bucket = create_bucket_per_zone_in_realm()
-    for _, bucket in zone_bucket:
-        website_cfg = WebsiteConfiguration(suffix='index.html',error_key='error.html')
+    for zone, bucket in zone_bucket:
+        website_cfg = {
+            'IndexDocument': {'Suffix': 'index.html'},
+            'ErrorDocument': {'Key': 'error.html'}
+        }
         try:
-            bucket.set_website_configuration(website_cfg)
-        except boto.exception.S3ResponseError as e:
-            if e.error_code == 'MethodNotAllowed':
+            zone.s3_client.put_bucket_website(
+                Bucket=bucket.name,
+                WebsiteConfiguration=website_cfg
+            )
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'MethodNotAllowed':
                 raise SkipTest("test_set_bucket_website skipped. Requires rgw_enable_static_website = 1.")
-        assert(bucket.get_website_configuration_with_xml()[1] == website_cfg.to_xml())
+        
+        response = zone.s3_client.get_bucket_website(Bucket=bucket.name)
+        assert response['IndexDocument']['Suffix'] == 'index.html'
+        assert response['ErrorDocument']['Key'] == 'error.html'
 
 def test_set_bucket_policy():
     policy = '''{
@@ -1500,9 +1683,10 @@ def test_set_bucket_policy():
   }]
 }'''
     buckets, zone_bucket = create_bucket_per_zone_in_realm()
-    for _, bucket in zone_bucket:
-        bucket.set_policy(policy)
-        assert(bucket.get_policy().decode('ascii') == policy)
+    for zone, bucket in zone_bucket:
+        zone.s3_client.put_bucket_policy(Bucket=bucket.name, Policy=policy)
+        response = zone.s3_client.get_bucket_policy(Bucket=bucket.name)
+        assert response['Policy'] == policy
 
 @attr('bucket_sync_disable')
 def test_bucket_sync_disable():
@@ -1513,9 +1697,9 @@ def test_bucket_sync_disable():
 
     for bucket_name in buckets:
         disable_bucket_sync(realm.meta_master_zone(), bucket_name)
+    zonegroup_meta_checkpoint(zonegroup)
 
-    for zone in zonegroup.zones:
-        check_buckets_sync_status_obj_not_exist(zone, buckets)
+    check_buckets_sync_disabled(zonegroup, buckets)
 
     zonegroup_data_checkpoint(zonegroup_conns)
 
@@ -1530,8 +1714,7 @@ def test_bucket_sync_enable_right_after_disable():
 
     for zone, bucket in zone_bucket:
         for objname in objnames:
-            k = new_key(zone, bucket.name, objname)
-            k.set_contents_from_string(content)
+            zone.s3_client.put_object(Bucket=bucket.name, Key=objname, Body=content)
 
     zonegroup_meta_checkpoint(zonegroup)
 
@@ -1546,8 +1729,7 @@ def test_bucket_sync_enable_right_after_disable():
 
     for zone, bucket in zone_bucket:
         for objname in objnames_2:
-            k = new_key(zone, bucket.name, objname)
-            k.set_contents_from_string(content)
+            zone.s3_client.put_object(Bucket=bucket.name, Key=objname, Body=content)
 
     for bucket_name in buckets:
         zonegroup_bucket_checkpoint(zonegroup_conns, bucket_name)
@@ -1560,13 +1742,12 @@ def test_bucket_sync_disable_enable():
     zonegroup_conns = ZonegroupConns(zonegroup)
     buckets, zone_bucket = create_bucket_per_zone(zonegroup_conns)
 
-    objnames = [ 'obj1', 'obj2', 'obj3', 'obj4' ]
+    objnames = ['obj1', 'obj2', 'obj3', 'obj4']
     content = 'asdasd'
 
     for zone, bucket in zone_bucket:
         for objname in objnames:
-            k = new_key(zone, bucket.name, objname)
-            k.set_contents_from_string(content)
+            zone.s3_client.put_object(Bucket=bucket.name, Key=objname, Body=content)
 
     zonegroup_meta_checkpoint(zonegroup)
 
@@ -1578,12 +1759,11 @@ def test_bucket_sync_disable_enable():
 
     zonegroup_meta_checkpoint(zonegroup)
 
-    objnames_2 = [ 'obj5', 'obj6', 'obj7', 'obj8' ]
+    objnames_2 = ['obj5', 'obj6', 'obj7', 'obj8']
 
     for zone, bucket in zone_bucket:
         for objname in objnames_2:
-            k = new_key(zone, bucket.name, objname)
-            k.set_contents_from_string(content)
+            zone.s3_client.put_object(Bucket=bucket.name, Key=objname, Body=content)
 
     for bucket_name in buckets:
         enable_bucket_sync(realm.meta_master_zone(), bucket_name)
@@ -1593,24 +1773,134 @@ def test_bucket_sync_disable_enable():
 
     zonegroup_data_checkpoint(zonegroup_conns)
 
+@attr('bucket_sync_disable')
+def test_versioned_bucket_sync_disable_enable_object_delete():
+    zonegroup = realm.master_zonegroup()
+    zonegroup_conns = ZonegroupConns(zonegroup)
+
+    primary = zonegroup_conns.rw_zones[0]
+    secondary = zonegroup_conns.rw_zones[1]
+
+    # create a bucket
+    bucket = primary.create_bucket(gen_bucket_name())
+    log.debug('created bucket=%s', bucket.name)
+    zonegroup_meta_checkpoint(zonegroup)
+
+    # enable versioning
+    primary.s3_client.put_bucket_versioning(
+        Bucket=bucket.name,
+        VersioningConfiguration={'Status': 'Enabled'}
+    )
+    zonegroup_meta_checkpoint(zonegroup)
+
+    obj = 'obj'
+
+    # upload an initial object
+    resp1 = primary.s3_client.put_object(Bucket=bucket.name, Key=obj, Body='')
+    version_id_1 = resp1.get('VersionId', 'null')
+    log.debug('created initial version id=%s', version_id_1)
+    zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
+
+    # upload the second version
+    resp2 = primary.s3_client.put_object(Bucket=bucket.name, Key=obj, Body='')
+    version_id_2 = resp2['VersionId']
+    log.debug('created new version id=%s', version_id_2)
+    zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
+
+    # upload the third version
+    resp3 = primary.s3_client.put_object(Bucket=bucket.name, Key=obj, Body='')
+    version_id_3 = resp3['VersionId']
+    log.debug('created new version id=%s', version_id_3)
+    zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
+
+    # test deleting the non-head from the secondary
+
+    log.debug(f"Disabling bucket sync for bucket:{bucket.name}")
+    disable_bucket_sync(realm.meta_master_zone(), bucket.name)
+    zonegroup_meta_checkpoint(zonegroup)
+
+    # upload the fourth version - do this before the following object delete
+    # so it has a slightly smaller epoch
+    resp4 = primary.s3_client.put_object(Bucket=bucket.name, Key=obj, Body='')
+    version_id_4 = resp4['VersionId']
+    log.debug('created new version id=%s', version_id_4)
+
+    # Delete the second object version
+    cmd = ['object', 'rm', '--bucket', bucket.name, '--object', obj, '--object-version', version_id_2]
+    secondary.zone.cluster.admin(cmd + secondary.zone.zone_args())
+
+    log.debug(f"Enabling bucket sync for bucket:{bucket.name}")
+    enable_bucket_sync(realm.meta_master_zone(), bucket.name)
+
+    zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
+
+    # test deleting the head from the secondary
+
+    log.debug(f"Disabling bucket sync for bucket:{bucket.name}")
+    disable_bucket_sync(realm.meta_master_zone(), bucket.name)
+    zonegroup_meta_checkpoint(zonegroup)
+
+    # Delete the fourth object version
+    cmd = ['object', 'rm', '--bucket', bucket.name, '--object', obj, '--object-version', version_id_4]
+    secondary.zone.cluster.admin(cmd + secondary.zone.zone_args())
+
+    log.debug(f"Enabling bucket sync for bucket:{bucket.name}")
+    enable_bucket_sync(realm.meta_master_zone(), bucket.name)
+
+    zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
+
+    # test deleting everything from the secondary
+
+    log.debug(f"Disabling bucket sync for bucket:{bucket.name}")
+    disable_bucket_sync(realm.meta_master_zone(), bucket.name)
+    zonegroup_meta_checkpoint(zonegroup)
+
+    # Delete all object versions
+    cmd = ['object', 'rm', '--bucket', bucket.name, '--object', obj, '--object-version', version_id_1]
+    secondary.zone.cluster.admin(cmd + secondary.zone.zone_args())
+    cmd = ['object', 'rm', '--bucket', bucket.name, '--object', obj, '--object-version', version_id_2]
+    secondary.zone.cluster.admin(cmd + secondary.zone.zone_args())
+    cmd = ['object', 'rm', '--bucket', bucket.name, '--object', obj, '--object-version', version_id_3]
+    secondary.zone.cluster.admin(cmd + secondary.zone.zone_args())
+    cmd = ['object', 'rm', '--bucket', bucket.name, '--object', obj, '--object-version', version_id_4]
+    secondary.zone.cluster.admin(cmd + secondary.zone.zone_args())
+
+    log.debug(f"Enabling bucket sync for bucket:{bucket.name}")
+    enable_bucket_sync(realm.meta_master_zone(), bucket.name)
+
+    zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
+
 def test_multipart_object_sync():
     zonegroup = realm.master_zonegroup()
     zonegroup_conns = ZonegroupConns(zonegroup)
     buckets, zone_bucket = create_bucket_per_zone(zonegroup_conns)
 
-    _, bucket = zone_bucket[0]
+    zone, bucket = zone_bucket[0]
 
     # initiate a multipart upload
-    upload = bucket.initiate_multipart_upload('MULTIPART')
-    mp = boto.s3.multipart.MultiPartUpload(bucket)
-    mp.key_name = upload.key_name
-    mp.id = upload.id
-    part_size = 5 * 1024 * 1024 # 5M min part size
-    mp.upload_part_from_file(StringIO('a' * part_size), 1)
-    mp.upload_part_from_file(StringIO('b' * part_size), 2)
-    mp.upload_part_from_file(StringIO('c' * part_size), 3)
-    mp.upload_part_from_file(StringIO('d' * part_size), 4)
-    mp.complete_upload()
+    key_name = 'MULTIPART'
+    response = zone.s3_client.create_multipart_upload(Bucket=bucket.name, Key=key_name)
+    upload_id = response['UploadId']
+    
+    part_size = 5 * 1024 * 1024  # 5M min part size
+    parts = []
+    
+    for part_num, char in enumerate(['a', 'b', 'c', 'd'], start=1):
+        part_response = zone.s3_client.upload_part(
+            Bucket=bucket.name,
+            Key=key_name,
+            PartNumber=part_num,
+            UploadId=upload_id,
+            Body=char * part_size
+        )
+        parts.append({'PartNumber': part_num, 'ETag': part_response['ETag']})
+    
+    zone.s3_client.complete_multipart_upload(
+        Bucket=bucket.name,
+        Key=key_name,
+        UploadId=upload_id,
+        MultipartUpload={'Parts': parts}
+    )
 
     zonegroup_meta_checkpoint(zonegroup)
     zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
@@ -1620,45 +1910,50 @@ def test_encrypted_object_sync():
     zonegroup_conns = ZonegroupConns(zonegroup)
 
     if len(zonegroup.rw_zones) < 2:
-        raise SkipTest("test_zonegroup_remove skipped. Requires 2 or more zones in master zonegroup.")
+        raise SkipTest("test_encrypted_object_sync skipped. Requires 2 or more zones in master zonegroup.")
 
     (zone1, zone2) = zonegroup_conns.rw_zones[0:2]
 
-    # create a bucket on the first zone
     bucket_name = gen_bucket_name()
     log.info('create bucket zone=%s name=%s', zone1.name, bucket_name)
-    bucket = zone1.conn.create_bucket(bucket_name)
+    zone1.s3_client.create_bucket(Bucket=bucket_name)
 
+    data = 'A' * 512
+    
     # upload an object with sse-c encryption
-    sse_c_headers = {
-        'x-amz-server-side-encryption-customer-algorithm': 'AES256',
-        'x-amz-server-side-encryption-customer-key': 'pO3upElrwuEXSoFwCfnZPdSsmt/xWeFa0N9KgDijwVs=',
-        'x-amz-server-side-encryption-customer-key-md5': 'DWygnHRtgiJ77HCm+1rvHw=='
-    }
-    key = bucket.new_key('testobj-sse-c')
-    data = 'A'*512
-    key.set_contents_from_string(data, headers=sse_c_headers)
+    zone1.s3_client.put_object(
+        Bucket=bucket_name,
+        Key='testobj-sse-c',
+        Body=data,
+        SSECustomerAlgorithm='AES256',
+        SSECustomerKey='pO3upElrwuEXSoFwCfnZPdSsmt/xWeFa0N9KgDijwVs=',
+        SSECustomerKeyMD5='DWygnHRtgiJ77HCm+1rvHw=='
+    )
 
     # upload an object with sse-kms encryption
-    sse_kms_headers = {
-        'x-amz-server-side-encryption': 'aws:kms',
-        # testkey-1 must be present in 'rgw crypt s3 kms encryption keys' (vstart.sh adds this)
-        'x-amz-server-side-encryption-aws-kms-key-id': 'testkey-1',
-    }
-    key = bucket.new_key('testobj-sse-kms')
-    key.set_contents_from_string(data, headers=sse_kms_headers)
+    zone1.s3_client.put_object(
+        Bucket=bucket_name,
+        Key='testobj-sse-kms',
+        Body=data,
+        ServerSideEncryption='aws:kms',
+        SSEKMSKeyId='testkey-1'
+    )
 
-    # wait for the bucket metadata and data to sync
     zonegroup_meta_checkpoint(zonegroup)
     zone_bucket_checkpoint(zone2.zone, zone1.zone, bucket_name)
 
     # read the encrypted objects from the second zone
-    bucket2 = get_bucket(zone2, bucket_name)
-    key = bucket2.get_key('testobj-sse-c', headers=sse_c_headers)
-    eq(data, key.get_contents_as_string(headers=sse_c_headers, encoding='ascii'))
+    response = zone2.s3_client.get_object(
+        Bucket=bucket_name,
+        Key='testobj-sse-c',
+        SSECustomerAlgorithm='AES256',
+        SSECustomerKey='pO3upElrwuEXSoFwCfnZPdSsmt/xWeFa0N9KgDijwVs=',
+        SSECustomerKeyMD5='DWygnHRtgiJ77HCm+1rvHw=='
+    )
+    eq(data, response['Body'].read().decode('ascii'))
 
-    key = bucket2.get_key('testobj-sse-kms')
-    eq(data, key.get_contents_as_string(encoding='ascii'))
+    response = zone2.s3_client.get_object(Bucket=bucket_name, Key='testobj-sse-kms')
+    eq(data, response['Body'].read().decode('ascii'))
 
 @attr('bucket_trim')
 def test_bucket_index_log_trim():
@@ -1671,10 +1966,9 @@ def test_bucket_index_log_trim():
     def make_test_bucket():
         name = gen_bucket_name()
         log.info('create bucket zone=%s name=%s', zone.name, name)
-        bucket = zone.conn.create_bucket(name)
+        bucket = zone.create_bucket(name)
         for objname in ('a', 'b', 'c', 'd'):
-            k = new_key(zone, name, objname)
-            k.set_contents_from_string('foo')
+            zone.s3_client.put_object(Bucket=bucket.name, Key=objname, Body='foo')
         zonegroup_meta_checkpoint(zonegroup)
         zonegroup_bucket_checkpoint(zonegroup_conns, name)
         return bucket
@@ -1729,10 +2023,9 @@ def test_bucket_reshard_index_log_trim():
     def make_test_bucket():
         name = gen_bucket_name()
         log.info('create bucket zone=%s name=%s', zone.name, name)
-        bucket = zone.conn.create_bucket(name)
+        bucket = zone.create_bucket(name)
         for objname in ('a', 'b', 'c', 'd'):
-            k = new_key(zone, name, objname)
-            k.set_contents_from_string('foo')
+            zone.s3_client.put_object(Bucket=bucket.name, Key=objname, Body='foo')
         zonegroup_meta_checkpoint(zonegroup)
         zonegroup_bucket_checkpoint(zonegroup_conns, name)
         return bucket
@@ -1766,8 +2059,8 @@ def test_bucket_reshard_index_log_trim():
 
     # upload more objects
     for objname in ('e', 'f', 'g', 'h'):
-        k = new_key(zone, test_bucket.name, objname)
-        k.set_contents_from_string('foo')
+        zone.s3_client.put_object(Bucket=test_bucket.name, Key=objname, Body='foo')
+
     zonegroup_bucket_checkpoint(zonegroup_conns, test_bucket.name)
 
     # Resharding the bucket again
@@ -1798,8 +2091,8 @@ def test_bucket_reshard_index_log_trim():
 
     # upload more objects
     for objname in ('i', 'j', 'k', 'l'):
-        k = new_key(zone, test_bucket.name, objname)
-        k.set_contents_from_string('foo')
+        zone.s3_client.put_object(Bucket=test_bucket.name, Key=objname, Body='foo')
+
     zonegroup_bucket_checkpoint(zonegroup_conns, test_bucket.name)
 
     # verify the bucket has non-empty bilog
@@ -1817,11 +2110,10 @@ def test_bucket_log_trim_after_delete_bucket_primary_reshard():
     # create a test bucket, upload some objects, and wait for sync
     def make_test_bucket():
         name = gen_bucket_name()
-        log.info('create bucket zone=%s name=%s', primary.name, name)
-        bucket = primary.conn.create_bucket(name)
+        log.info('create bucket zone=%s name=%s', primary.zone.name, name)
+        bucket = primary.create_bucket(name)
         for objname in ('a', 'b', 'c', 'd'):
-            k = new_key(primary, name, objname)
-            k.set_contents_from_string('foo')
+            primary.s3_client.put_object(Bucket=bucket.name, Key=objname, Body='foo')
         zonegroup_meta_checkpoint(zonegroup)
         zonegroup_bucket_checkpoint(zonegroup_conns, name)
         return bucket
@@ -1842,7 +2134,7 @@ def test_bucket_log_trim_after_delete_bucket_primary_reshard():
         primary.zone.cluster.admin(cmd)
 
     # delete bucket and test bilog autotrim
-    primary.conn.delete_bucket(test_bucket.name)
+    primary.s3_client.delete_bucket(Bucket=test_bucket.name)
     zonegroup_data_checkpoint(zonegroup_conns)
 
     bilog_autotrim(primary.zone, ['--rgw-sync-log-trim-max-buckets', '50'],)
@@ -1879,11 +2171,10 @@ def test_bucket_log_trim_after_delete_bucket_secondary_reshard():
     # create a test bucket, upload some objects, and wait for sync
     def make_test_bucket():
         name = gen_bucket_name()
-        log.info('create bucket zone=%s name=%s', primary.name, name)
-        bucket = primary.conn.create_bucket(name)
+        log.info('create bucket zone=%s name=%s', primary.zone.name, name)
+        bucket = primary.create_bucket(name)
         for objname in ('a', 'b', 'c', 'd'):
-            k = new_key(primary, name, objname)
-            k.set_contents_from_string('foo')
+            primary.s3_client.put_object(Bucket=bucket.name, Key=objname, Body='foo')
         zonegroup_meta_checkpoint(zonegroup)
         zonegroup_bucket_checkpoint(zonegroup_conns, name)
         return bucket
@@ -1895,17 +2186,17 @@ def test_bucket_log_trim_after_delete_bucket_secondary_reshard():
     secondary.zone.cluster.admin(['bucket', 'reshard',
         '--bucket', test_bucket.name,
         '--num-shards', '13',
-        '--yes-i-really-mean-it'])
+        '--yes-i-really-mean-it'] + secondary.zone.zone_args())
 
     # Delete the objects
     for obj in ('a', 'b', 'c', 'd'):
         cmd = ['object', 'rm'] + primary.zone.zone_args()
         cmd += ['--bucket', test_bucket.name]
         cmd += ['--object', obj]
-        primary.zone.cluster.admin(cmd)
+        primary.zone.cluster.admin(cmd + primary.zone.zone_args())
 
     # delete bucket and test bilog autotrim
-    primary.conn.delete_bucket(test_bucket.name)
+    primary.s3_client.delete_bucket(Bucket=test_bucket.name)
     zonegroup_data_checkpoint(zonegroup_conns)
 
     bilog_autotrim(secondary.zone, ['--rgw-sync-log-trim-max-buckets', '50'],)
@@ -1932,21 +2223,227 @@ def test_bucket_log_trim_after_delete_bucket_secondary_reshard():
             assert check_bucket_instance_metadata(zone.zone, test_bucket.name)
 
 
+@attr('bucket_trim')
+def test_bucket_log_trim_enoent_race_after_reshard():
+    zonegroup = realm.master_zonegroup()
+    zonegroup_conns = ZonegroupConns(zonegroup)
+
+    primary = zonegroup_conns.rw_zones[0]
+    secondary = zonegroup_conns.rw_zones[1]
+
+    all_clusters = set()
+    for zg in realm.current_period.zonegroups:
+        for zone in zg.zones:
+            all_clusters.add(zone.cluster)
+
+    def set_meta_sync_delay(delay_sec):
+        for cluster in all_clusters:
+            if delay_sec > 0:
+                cluster.ceph_admin(
+                    ['config', 'set', 'client', 'rgw_inject_delay_sec', str(delay_sec)])
+                cluster.ceph_admin(
+                    ['config', 'set', 'client', 'rgw_inject_delay_pattern', 'delay_meta_sync_bucket_instance_store'])
+            else:
+                cluster.ceph_admin(
+                    ['config', 'rm', 'client', 'rgw_inject_delay_sec'])
+                cluster.ceph_admin(
+                    ['config', 'rm', 'client', 'rgw_inject_delay_pattern'])
+
+    def make_test_bucket():
+        name = gen_bucket_name()
+        log.info('create bucket zone=%s name=%s', primary.zone.name, name)
+        bucket = primary.create_bucket(name)
+        for objname in ('a', 'b', 'c', 'd'):
+            primary.s3_client.put_object(Bucket=bucket.name, Key=objname, Body='foo')
+        zonegroup_meta_checkpoint(zonegroup)
+        zonegroup_bucket_checkpoint(zonegroup_conns, name)
+        return bucket
+
+    test_bucket = make_test_bucket()
+
+    # reshard on secondary to create a generation mismatch
+    secondary.zone.cluster.admin(['bucket', 'reshard',
+        '--bucket', test_bucket.name,
+        '--num-shards', '13',
+        '--yes-i-really-mean-it'] + secondary.zone.zone_args())
+
+    for obj in ('a', 'b', 'c', 'd'):
+        cmd = ['object', 'rm'] + primary.zone.zone_args()
+        cmd += ['--bucket', test_bucket.name]
+        cmd += ['--object', obj]
+        primary.zone.cluster.admin(cmd + primary.zone.zone_args())
+
+    log.info('setting metadata sync delay to reproduce ENOENT trim race')
+    set_meta_sync_delay(30)
+    time.sleep(10)  # let the delay config reach the radosgws before deleting
+
+    try:
+        primary.s3_client.delete_bucket(Bucket=test_bucket.name)
+        zonegroup_data_checkpoint(zonegroup_conns)
+
+        # run autotrim on primary first — primary has the Deleted flag
+        # so it will fully clean up including removing its own
+        # bucket.instance metadata
+        bilog_autotrim(primary.zone, ['--rgw-sync-log-trim-max-buckets', '50'],)
+        time.sleep(config.checkpoint_delay)
+        bilog_autotrim(primary.zone, ['--rgw-sync-log-trim-max-buckets', '50'],)
+        time.sleep(config.checkpoint_delay)
+
+        # now autotrim on secondary — secondary queries primary, but
+        # primary's instance metadata is gone so primary responds -ENOENT.
+        # secondary doesn't have the Deleted flag yet (metadata sync is
+        # stalled). In #70858, this leaves StatusShards{gen=0, shards=[]}
+        # causing take_min_status() to fail with -EINVAL.
+        bilog_autotrim(secondary.zone, ['--rgw-sync-log-trim-max-buckets', '50'],)
+        time.sleep(config.checkpoint_delay)
+        bilog_autotrim(secondary.zone, ['--rgw-sync-log-trim-max-buckets', '50'],)
+    finally:
+        log.info('removing metadata sync delay')
+        set_meta_sync_delay(0)
+
+    for zonegroup in realm.current_period.zonegroups:
+        zonegroup_conns = ZonegroupConns(zonegroup)
+        zonegroup_meta_checkpoint(zonegroup)
+
+        for zone in zonegroup_conns.zones:
+            log.info('trimming on zone=%s', zone.name)
+            bilog_autotrim(zone.zone, ['--rgw-sync-log-trim-max-buckets', '50'],)
+            time.sleep(config.checkpoint_delay)
+
+    bilog_autotrim(secondary.zone, ['--rgw-sync-log-trim-max-buckets', '50'],)
+    time.sleep(config.checkpoint_delay)
+
+    for zonegroup in realm.current_period.zonegroups:
+        zonegroup_conns = ZonegroupConns(zonegroup)
+        for zone in zonegroup_conns.zones:
+            assert check_bucket_instance_metadata(zone.zone, test_bucket.name)
+
+
+@attr('bucket_trim')
+def test_bucket_log_trim_live_empty_bucket_not_removed():
+    # A live bucket with no data written yet also returns -ENOENT for its bucket sync
+    # status on every peer as sync status is not initialized until data flows.
+    # autotrim must NOT mistake that for a deletion and remove the bucket
+    # instance metadata. This is a guard testcase for the -ENOENT disambiguation
+    # (tracker #70858): i.e., if the entrypoint still exists, so the bucket is live.
+    zonegroup = realm.master_zonegroup()
+    zonegroup_conns = ZonegroupConns(zonegroup)
+    primary = zonegroup_conns.rw_zones[0]
+
+    # create a bucket but write no objects, so no bucket sync status is created
+    name = gen_bucket_name()
+    log.info('create empty bucket zone=%s name=%s', primary.zone.name, name)
+    bucket = primary.create_bucket(name)
+
+    # make sure the entrypoint and instance metadata reach every zone
+    zonegroup_meta_checkpoint(zonegroup)
+
+    # run autotrim everywhere; peers return -ENOENT for sync status, but the
+    # bucket is live (entrypoint present) and must be left intact.
+    for zg in realm.current_period.zonegroups:
+        zg_conns = ZonegroupConns(zg)
+        for zone in zg_conns.zones:
+            log.info('trimming on zone=%s', zone.name)
+            bilog_autotrim(zone.zone, ['--rgw-sync-log-trim-max-buckets', '50'])
+            time.sleep(config.checkpoint_delay)
+
+    # the bucket instance metadata must still be present on every zone.
+    # check_bucket_instance_metadata() returns False when the instance is still
+    # present (i.e. it was NOT trimmed away).
+    for zg in realm.current_period.zonegroups:
+        zg_conns = ZonegroupConns(zg)
+        for zone in zg_conns.zones:
+            assert not check_bucket_instance_metadata(zone.zone, bucket.name), \
+                'live bucket %s instance wrongly removed on zone %s' % (bucket.name, zone.name)
+
+
+@attr('bucket_trim')
+def test_bucket_log_trim_new_bucket_entrypoint_not_synced():
+    # A bucket freshly created on the primary syncs its INSTANCE metadata to the
+    # secondary before its ENTRYPOINT (creation writes the instance first, see
+    # put_linked_bucket_info() in rgw_rados.cc). If autotrim runs on the secondary
+    # in that window, every peer returns -ENOENT (new, data-less bucket => sync
+    # status uninitialized). autotrim must confirm the deletion against the
+    # metadata master (which already has the entrypoint) rather than the secondary's
+    # not-yet-synced local copy, and so must leave the live bucket's instance intact.
+    #
+    # Force the window described above by delaying entrypoint ("bucket" section) metadata
+    # sync on the secondary while letting the instance ("bucket.instance") go through.
+    zonegroup = realm.master_zonegroup()
+    zonegroup_conns = ZonegroupConns(zonegroup)
+    primary = zonegroup_conns.rw_zones[0]
+    secondary = zonegroup_conns.rw_zones[1]
+
+    def set_entrypoint_sync_delay(delay_sec):
+        cluster = secondary.zone.cluster
+        if delay_sec > 0:
+            cluster.ceph_admin(['config', 'set', 'client', 'rgw_inject_delay_sec', str(delay_sec)])
+            cluster.ceph_admin(['config', 'set', 'client', 'rgw_inject_delay_pattern', 'delay_meta_sync_bucket_entrypoint_store'])
+        else:
+            cluster.ceph_admin(['config', 'rm', 'client', 'rgw_inject_delay_sec'])
+            cluster.ceph_admin(['config', 'rm', 'client', 'rgw_inject_delay_pattern'])
+
+    # metadata list is per-zone, so this reads the secondary's LOCAL entrypoints
+    def secondary_has_entrypoint(name):
+        cmd = ['metadata', 'list', 'bucket'] + secondary.zone.zone_args()
+        out, _ = secondary.zone.cluster.admin(cmd, check_retcode=False, read_only=True)
+        try:
+            return name in json.loads(out)
+        except ValueError:
+            return False
+
+    with override_config(checkpoint_retries=30, checkpoint_delay=2):
+        set_entrypoint_sync_delay(config.checkpoint_retries * config.checkpoint_delay)
+        try:
+            time.sleep(10)  # let the delay config reach the radosgws before creating
+
+            name = gen_bucket_name()
+            log.info('create bucket zone=%s name=%s (no objects)', primary.zone.name, name)
+            primary.create_bucket(name)
+
+            # wait until the INSTANCE has synced to the secondary
+            # while its ENTRYPOINT is still delayed (absent)
+            window_hit = False
+            for _ in range(config.checkpoint_retries):
+                time.sleep(config.checkpoint_delay)
+                inst_present = not check_bucket_instance_metadata(secondary.zone, name)
+                ep_present = secondary_has_entrypoint(name)
+                log.info('secondary sync state: instance=%s entrypoint=%s', inst_present, ep_present)
+                if inst_present and not ep_present:
+                    window_hit = True
+                    break
+                if inst_present and ep_present:
+                    break  # entrypoint arrived too; window missed
+            assert window_hit, \
+                'could not reproduce instance-synced-but-entrypoint-not window on secondary'
+
+            # autotrim on the secondary while its local entrypoint is still absent
+            log.info('running autotrim on secondary while entrypoint is not yet synced')
+            bilog_autotrim(secondary.zone, ['--rgw-sync-log-trim-max-buckets', '50'])
+            time.sleep(config.checkpoint_delay)
+
+            # the instance metadata must NOT have been removed since the bucket is live
+            assert not check_bucket_instance_metadata(secondary.zone, name), \
+                'live (mid-sync) bucket %s instance wrongly removed on secondary zone' % name
+        finally:
+            set_entrypoint_sync_delay(0)
+            # let metadata sync catch up so the entrypoint lands and state is consistent
+            zonegroup_meta_checkpoint(zonegroup)
+
+
 @attr('bucket_reshard')
 def test_bucket_reshard_incremental():
     zonegroup = realm.master_zonegroup()
     zonegroup_conns = ZonegroupConns(zonegroup)
     zone = zonegroup_conns.rw_zones[0]
 
-    # create a bucket
     bucket = zone.create_bucket(gen_bucket_name())
     log.debug('created bucket=%s', bucket.name)
     zonegroup_meta_checkpoint(zonegroup)
 
     # upload some objects
     for objname in ('a', 'b', 'c', 'd'):
-        k = new_key(zone, bucket.name, objname)
-        k.set_contents_from_string('foo')
+        zone.s3_client.put_object(Bucket=bucket.name, Key=objname, Body='foo')
     zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
 
     # reshard in each zone
@@ -1958,8 +2455,7 @@ def test_bucket_reshard_incremental():
 
     # upload more objects
     for objname in ('e', 'f', 'g', 'h'):
-        k = new_key(zone, bucket.name, objname)
-        k.set_contents_from_string('foo')
+        zone.s3_client.put_object(Bucket=bucket.name, Key=objname, Body='foo')
     zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
 
 @attr('bucket_reshard')
@@ -1981,8 +2477,7 @@ def test_bucket_reshard_full():
     try:
         # upload some objects
         for objname in ('a', 'b', 'c', 'd'):
-            k = new_key(zone, bucket.name, objname)
-            k.set_contents_from_string('foo')
+            zone.s3_client.put_object(Bucket=bucket.name, Key=objname, Body='foo')
 
         # reshard on first zone
         zone.zone.cluster.admin(['bucket', 'reshard',
@@ -1992,8 +2487,7 @@ def test_bucket_reshard_full():
 
         # upload more objects
         for objname in ('e', 'f', 'g', 'h'):
-            k = new_key(zone, bucket.name, objname)
-            k.set_contents_from_string('foo')
+            zone.s3_client.put_object(Bucket=bucket.name, Key=objname, Body='foo')
     finally:
         for z in zonegroup_conns.rw_zones[1:]:
             z.zone.start()
@@ -2003,14 +2497,17 @@ def test_bucket_reshard_full():
 def test_bucket_creation_time():
     zonegroup = realm.master_zonegroup()
     zonegroup_conns = ZonegroupConns(zonegroup)
-
     zonegroup_meta_checkpoint(zonegroup)
 
-    zone_buckets = [zone.get_connection().get_all_buckets() for zone in zonegroup_conns.rw_zones]
+    zone_buckets = []
+    for zone in zonegroup_conns.rw_zones:
+        response = zone.s3_client.list_buckets()
+        zone_buckets.append(response['Buckets'])
+    
     for z1, z2 in combinations(zone_buckets, 2):
         for a, b in zip(z1, z2):
-            eq(a.name, b.name)
-            eq(a.creation_date, b.creation_date)
+            eq(a['Name'], b['Name'])
+            eq(a['CreationDate'], b['CreationDate'])
 
 def get_bucket_shard_objects(zone, num_shards):
     """
@@ -2031,8 +2528,7 @@ def write_most_shards(zone, bucket_name, num_shards):
     random.shuffle(objs)
     del objs[-(len(objs)//10):]
     for obj in objs:
-        k = new_key(zone, bucket_name, obj)
-        k.set_contents_from_string('foo')
+        zone.s3_client.put_object(Bucket=bucket_name, Key=obj, Body='foo')
 
 def reshard_bucket(zone, bucket_name, num_shards):
     """
@@ -2159,8 +2655,7 @@ def test_zap_init_bucket_sync_run():
 
     # Write zeroth generation
     for obj in range(1, 6):
-        k = new_key(primary, bucket.name, f'obj{obj * 11}')
-        k.set_contents_from_string('foo')
+        primary.s3_client.put_object(Bucket=bucket.name, Key=f'obj{obj * 11}', Body='foo')
     zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
 
     # Write several more generations
@@ -2168,8 +2663,7 @@ def test_zap_init_bucket_sync_run():
     for num_shards in generations:
         reshard_bucket(primary.zone, bucket.name, num_shards)
         for obj in range(1, 6):
-            k = new_key(primary, bucket.name, f'obj{obj * num_shards}')
-            k.set_contents_from_string('foo')
+            primary.s3_client.put_object(Bucket=bucket.name, Key=f'obj{obj * num_shards}', Body='foo')
         zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
 
 
@@ -2196,7 +2690,82 @@ def test_zap_init_bucket_sync_run():
             secondary.zone.start()
 
     zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
+
+def get_bucket_sync_state(zone, source_zone, bucket_name):
+    cmd = ['bucket', 'sync', 'status'] + zone.zone_args()
+    cmd += ['--bucket', bucket_name]
+    cmd += ['--source-zone', source_zone.name]
+    cmd += ['--format', 'json']
+    status_json, retcode = zone.cluster.admin(cmd, check_retcode=False, read_only=True)
+    if retcode != 0:
+        return None
+    status = json.loads(status_json)
+    sources = status.get('sources', [])
+    if not sources:
+        return None
+    # 'status' field is set for non-incremental states. It is absent
+    # when the bucket is in incremental sync.
+    source_status = sources[0].get('status', '')
+    if not source_status:
+        return 'incremental-sync'
+    if source_status.startswith('full sync'):
+        return 'full-sync'
+    if source_status.startswith('init'):
+        return 'init'
+    if source_status.startswith('stopped'):
+        return 'stopped'
+    return source_status
+
+@attr('bucket_sync_disable')
+def test_bucket_sync_run_during_full_sync():
+    """
+    Test that 'bucket sync run' completes full sync and transitions the bucket
+    to incremental-sync state, even when the background sync is running
+    concurrently and may hold the bucket-wide lock.
+    """
+    zonegroup = realm.master_zonegroup()
+    zonegroup_conns = ZonegroupConns(zonegroup)
+    primary = zonegroup_conns.rw_zones[0]
+    secondary = zonegroup_conns.rw_zones[1]
+    num_objects = 1000
+
+    # 1. Create bucket on primary.
+    bucket = primary.create_bucket(gen_bucket_name())
+    log.debug('created bucket=%s', bucket.name)
+    zonegroup_meta_checkpoint(zonegroup)
+
+    # 2. Disable bucket sync so objects do not replicate while we upload.
+    disable_bucket_sync(realm.meta_master_zone(), bucket.name)
+    zonegroup_meta_checkpoint(zonegroup)
+
+    # 3. Upload 1000 objects to the primary while sync is disabled.
+    log.debug('uploading %d objects to bucket=%s', num_objects, bucket.name)
+    for i in range(num_objects):
+        primary.s3_client.put_object(Bucket=bucket.name, Key=f'obj{i}', Body=b'data')
+
+    # 4. Re-enable bucket sync. This resets the secondary to full sync state.
+    enable_bucket_sync(realm.meta_master_zone(), bucket.name)
+    zonegroup_meta_checkpoint(zonegroup)
+
+    # 5. Immediately run 'bucket sync run' on the secondary.
+    log.debug('running bucket sync run on secondary zone=%s', secondary.name)
+    cmd = ['bucket', 'sync', 'run'] + secondary.zone.zone_args()
+    cmd += ['--bucket', bucket.name, '--source-zone', primary.name]
+    secondary.zone.cluster.admin(cmd)
     
+    zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
+
+    # 6. Validate all 1000 objects are present on the secondary.
+    bucket_keys_eq(primary.zone, secondary.zone, bucket.name)
+
+    # 7. Validate that sync state has moved to incremental-sync.
+    state = get_bucket_sync_state(secondary.zone, primary.zone, bucket.name)
+    log.debug('bucket sync state after bucket sync run: %s', state)
+    assert state == 'incremental-sync', \
+        f'Expected incremental-sync after bucket sync run, got: {state}'
+
+    zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
+
 def test_list_bucket_key_marker_encoding():
     zonegroup = realm.master_zonegroup()
     zonegroup_conns = ZonegroupConns(zonegroup)
@@ -2209,8 +2778,7 @@ def test_list_bucket_key_marker_encoding():
 
     # test for object names with '%' character.
     for obj in range(1, 1100):
-        k = new_key(primary, bucket.name, f'obj%{obj * 11}')
-        k.set_contents_from_string('foo')
+        primary.s3_client.put_object(Bucket=bucket.name, Key=f'obj%{obj * 11}', Body='foo')
 
     # wait for the secondary to catch up
     zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
@@ -2226,12 +2794,11 @@ def test_list_bucket_key_marker_encoding():
     
     # write an object during incremental sync.
     objname = 'test_incremental'
-    k = new_key(primary, bucket, objname)
-    k.set_contents_from_string('foo')
+    primary.s3_client.put_object(Bucket=bucket.name, Key=objname, Body='foo')
     zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
     
     # the object uploaded after bucket sync init should be replicated
-    check_object_exists(bucket, objname)
+    check_object_exists(secondary, bucket.name, objname)
     
 
 def test_role_sync():
@@ -2265,10 +2832,12 @@ def test_role_delete_sync():
     zonegroup_conns.master_zone.iam_conn.attach_role_policy(RoleName=role_name, PolicyArn=policy_arn)
 
     for zone in zonegroup_conns.zones:
-        e = assert_raises(zone.iam_conn.exceptions.DeleteConflictException,
-                          zone.iam_conn.delete_role, RoleName=role_name)
-        assert e.response['Error']['Code'] == 'DeleteConflict'
-        assert e.response['Error']['Message']
+        try:
+            zone.iam_conn.delete_role(RoleName=role_name)
+            assert False, "Expected DeleteConflictException"
+        except zone.iam_conn.exceptions.DeleteConflictException as e:
+            assert e.response['Error']['Code'] == 'DeleteConflict'
+            assert e.response['Error']['Message']
 
     zonegroup_conns.master_zone.iam_conn.detach_role_policy(RoleName=role_name, PolicyArn=policy_arn)
 
@@ -2278,8 +2847,11 @@ def test_role_delete_sync():
 
     for zone in zonegroup_conns.zones:
         log.info(f'checking if zone: {zone.name} does not have role: {role_name}')
-        assert_raises(zone.iam_conn.exceptions.NoSuchEntityException,
-                      zone.iam_conn.get_role, RoleName=role_name)
+        try:
+            zone.iam_conn.get_role(RoleName=role_name)
+            assert False, "Expected NoSuchEntityException"
+        except zone.iam_conn.exceptions.NoSuchEntityException:
+            pass  # expected
         log.info(f'success, zone: {zone.name} does not have role: {role_name}')
 
 def test_forwarded_put_bucket_policy_error():
@@ -2296,10 +2868,12 @@ def test_forwarded_put_bucket_policy_error():
     policy = 'Invalid policy document'
     try:
         for zone in zonegroup_conns.rw_zones:
-            e = assert_raises(ClientError, zone.s3_client.put_bucket_policy,
-                              Bucket=bucket, Policy=policy)
-            eq(e.response['Error']['Code'], 'InvalidArgument')
-            assert e.response['Error']['Message']
+            try:
+                zone.s3_client.put_bucket_policy(Bucket=bucket, Policy=policy)
+                assert False, "Expected InvalidArgument error"
+            except ClientError as e:
+                eq(e.response['Error']['Code'], 'InvalidArgument')
+                assert e.response['Error']['Message']
     finally:
         zonegroup_conns.rw_zones[0].delete_bucket(bucket)
         realm_meta_checkpoint(realm)
@@ -2309,10 +2883,9 @@ def test_replication_status():
     zonegroup_conns = ZonegroupConns(zonegroup)
     zone = zonegroup_conns.rw_zones[0]
 
-    bucket = zone.conn.create_bucket(gen_bucket_name())
+    bucket = zone.create_bucket(gen_bucket_name())
     obj_name = "a"
-    k = new_key(zone, bucket.name, obj_name)
-    k.set_contents_from_string('foo')
+    zone.s3_client.put_object(Bucket=bucket.name, Key=obj_name, Body='foo')
     zonegroup_meta_checkpoint(zonegroup)
     zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
 
@@ -2342,26 +2915,24 @@ def test_object_acl():
     log.debug('created bucket=%s', bucket.name)
 
     # upload a dummy object and wait for sync.
-    k = new_key(primary, bucket, 'dummy')
-    k.set_contents_from_string('foo')
+    objname = 'dummy'
+    primary.s3_client.put_object(Bucket=bucket.name, Key=objname, Body='foo')
     zonegroup_meta_checkpoint(zonegroup)
     zonegroup_data_checkpoint(zonegroup_conns)
 
-    #check object on secondary before setacl
-    bucket2 = get_bucket(secondary, bucket.name)
-    before_set_acl = bucket2.get_acl(k)
-    assert(len(before_set_acl.acl.grants) == 1)
+    # check object on secondary before setacl
+    before_acl = secondary.s3_client.get_object_acl(Bucket=bucket.name, Key=objname)
+    assert len(before_acl['Grants']) == 1
 
-    #set object acl on secondary and wait for sync.
-    bucket2.set_canned_acl('public-read', key_name=k)
-    log.debug('set acl=%s', bucket2.name)
+    # set object acl on secondary and wait for sync
+    secondary.s3_client.put_object_acl(Bucket=bucket.name, Key=objname, ACL='public-read')
+    log.debug('set acl on bucket=%s', bucket.name)
     zonegroup_data_checkpoint(zonegroup_conns)
-    zonegroup_bucket_checkpoint(zonegroup_conns, bucket2.name)
+    zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
 
-    #check object on primary after setacl
-    bucket2 = get_bucket(primary, bucket.name)
-    after_set_acl = bucket2.get_acl(k)
-    assert(len(after_set_acl.acl.grants) == 2) # read grant added on AllUsers
+    # check object on primary after setacl
+    after_acl = primary.s3_client.get_object_acl(Bucket=bucket.name, Key=objname)
+    assert len(after_acl['Grants']) == 2  # read grant added on AllUsers
 
 def test_assume_role_after_sync():
     zonegroup = realm.master_zonegroup()
@@ -2416,8 +2987,7 @@ def test_bucket_full_sync_after_data_sync_init():
 
         # write some objects that don't sync yet
         for obj in range(1, 6):
-            k = new_key(primary, bucket.name, f'obj{obj * 11}')
-            k.set_contents_from_string('foo')
+            primary.s3_client.put_object(Bucket=bucket.name, Key=f'obj{obj * 11}', Body='foo')
 
         cmd = ['data', 'sync', 'init'] + secondary.zone.zone_args()
         cmd += ['--source-zone', primary.name]
@@ -2449,16 +3019,14 @@ def test_resharded_bucket_full_sync_after_data_sync_init():
 
         # Write zeroth generation
         for obj in range(1, 6):
-            k = new_key(primary, bucket.name, f'obj{obj * 11}')
-            k.set_contents_from_string('foo')
+            primary.s3_client.put_object(Bucket=bucket.name, Key=f'obj{obj * 11}', Body='foo')
 
         # Write several more generations
         generations = [17, 19, 23, 29, 31, 37]
         for num_shards in generations:
             reshard_bucket(primary.zone, bucket.name, num_shards)
             for obj in range(1, 6):
-                k = new_key(primary, bucket.name, f'obj{obj * num_shards}')
-                k.set_contents_from_string('foo')
+                primary.s3_client.put_object(Bucket=bucket.name, Key=f'obj{obj * num_shards}', Body='foo')
 
         cmd = ['data', 'sync', 'init'] + secondary.zone.zone_args()
         cmd += ['--source-zone', primary.name]
@@ -2485,8 +3053,7 @@ def test_bucket_incremental_sync_after_data_sync_init():
 
     # upload a dummy object and wait for sync. this forces each zone to finish
     # a full sync and switch to incremental
-    k = new_key(primary, bucket, 'dummy')
-    k.set_contents_from_string('foo')
+    primary.s3_client.put_object(Bucket=bucket.name, Key='dummy', Body='foo')
     zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
 
     try:
@@ -2495,8 +3062,7 @@ def test_bucket_incremental_sync_after_data_sync_init():
 
         # Write more objects to primary
         for obj in range(1, 6):
-            k = new_key(primary, bucket.name, f'obj{obj * 11}')
-            k.set_contents_from_string('foo')
+            primary.s3_client.put_object(Bucket=bucket.name, Key=f'obj{obj * 11}', Body='foo')
 
         cmd = ['data', 'sync', 'init'] + secondary.zone.zone_args()
         cmd += ['--source-zone', primary.name]
@@ -2524,16 +3090,15 @@ def test_resharded_bucket_incremental_sync_latest_after_data_sync_init():
 
     # Write zeroth generation to primary
     for obj in range(1, 6):
-        k = new_key(primary, bucket.name, f'obj{obj * 11}')
-        k.set_contents_from_string('foo')
+        primary.s3_client.put_object(Bucket=bucket.name, Key=f'obj{obj * 11}', Body='foo')
 
     # Write several more generations
     generations = [17, 19, 23, 29, 31, 37]
     for num_shards in generations:
         reshard_bucket(primary.zone, bucket.name, num_shards)
         for obj in range(1, 6):
-            k = new_key(primary, bucket.name, f'obj{obj * num_shards}')
-            k.set_contents_from_string('foo')
+            primary.s3_client.put_object(Bucket=bucket.name, Key=f'obj{obj * num_shards}', Body='foo')
+
 
     # wait for the secondary to catch up to the latest gen
     zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
@@ -2544,8 +3109,7 @@ def test_resharded_bucket_incremental_sync_latest_after_data_sync_init():
 
         # write some more objects to the last gen
         for obj in range(1, 6):
-            k = new_key(primary, bucket.name, f'obj{obj * generations[-1]}')
-            k.set_contents_from_string('foo')
+            primary.s3_client.put_object(Bucket=bucket.name, Key=f'obj{obj * generations[-1]}', Body='foo')
 
         cmd = ['data', 'sync', 'init'] + secondary.zone.zone_args()
         cmd += ['--source-zone', primary.name]
@@ -2573,8 +3137,7 @@ def test_resharded_bucket_incremental_sync_oldest_after_data_sync_init():
 
     # Write zeroth generation to primary
     for obj in range(1, 6):
-        k = new_key(primary, bucket.name, f'obj{obj * 11}')
-        k.set_contents_from_string('foo')
+        primary.s3_client.put_object(Bucket=bucket.name, Key=f'obj{obj * 11}', Body='foo')
 
     # wait for the secondary to catch up
     zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
@@ -2588,8 +3151,8 @@ def test_resharded_bucket_incremental_sync_oldest_after_data_sync_init():
         for num_shards in generations:
             reshard_bucket(primary.zone, bucket.name, num_shards)
             for obj in range(1, 6):
-                k = new_key(primary, bucket.name, f'obj{obj * num_shards}')
-                k.set_contents_from_string('foo')
+                primary.s3_client.put_object(Bucket=bucket.name, Key=f'obj{obj * num_shards}', Body='foo')
+
 
         cmd = ['data', 'sync', 'init'] + secondary.zone.zone_args()
         cmd += ['--source-zone', primary.name]
@@ -2740,30 +3303,49 @@ def create_zone_bucket(zone):
     return bucket
 
 def create_object(zone_conn, bucket, objname, content):
-    k = new_key(zone_conn, bucket.name, objname)
-    k.set_contents_from_string(content)
+    bucket_name = bucket.name if hasattr(bucket, 'name') else bucket
+    zone_conn.s3_client.put_object(Bucket=bucket_name, Key=objname, Body=content)
 
 def create_objects(zone_conn, bucket, obj_arr, content):
+    bucket_name = bucket.name if hasattr(bucket, 'name') else bucket
     for objname in obj_arr:
-        create_object(zone_conn, bucket, objname, content)
+        zone_conn.s3_client.put_object(Bucket=bucket_name, Key=objname, Body=content)
 
-def check_object_exists(bucket, objname, content = None):
-    k = bucket.get_key(objname)
-    assert_not_equal(k, None)
-    if (content != None):
-        assert_equal(k.get_contents_as_string(encoding='ascii'), content)
+def check_object_exists(zone_or_client, bucket_name, objname, content=None):
+    # handle both zone connection and direct client request
+    client = zone_or_client.s3_client if hasattr(zone_or_client, 's3_client') else zone_or_client
 
-def check_objects_exist(bucket, obj_arr, content = None):
+    try:
+        response = client.get_object(Bucket=bucket_name, Key=objname)
+        if content is not None:
+            actual_content = response['Body'].read()
+            if isinstance(content, str):
+                actual_content = actual_content.decode('utf-8')
+            assert_equal(actual_content, content)
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'NoSuchKey':
+            assert False, f"Object {objname} does not exist in bucket {bucket_name}"
+        raise
+
+def check_objects_exist(zone_or_client, bucket_name, obj_arr, content=None):
+    if isinstance(obj_arr, str):
+        obj_arr = [obj_arr]
     for objname in obj_arr:
-        check_object_exists(bucket, objname, content)
+        check_object_exists(zone_or_client, bucket_name, objname, content)
 
-def check_object_not_exists(bucket, objname):
-    k = bucket.get_key(objname)
-    assert_equal(k, None)
+def check_object_not_exists(zone_or_client, bucket_name, objname):
+    client = zone_or_client.s3_client if hasattr(zone_or_client, 's3_client') else zone_or_client
+    try:
+        client.head_object(Bucket=bucket_name, Key=objname)
+        assert False, f"Object {objname} should not exist in bucket {bucket_name}"
+    except ClientError as e:
+        assert e.response['Error']['Code'] == '404'
 
-def check_objects_not_exist(bucket, obj_arr):
+def check_objects_not_exist(zone_or_client, bucket_name, obj_arr):
+    if isinstance(obj_arr, str):
+        obj_arr = [obj_arr]
     for objname in obj_arr:
-        check_object_not_exists(bucket, objname)
+        check_object_not_exists(zone_or_client, bucket_name, objname)
 
 @attr('fails_with_rgw')
 @attr('sync_policy')
@@ -2866,31 +3448,22 @@ def test_sync_flow_symmetrical_zonegroup_all():
     zonegroup.period.update(zoneA, commit=True)
     get_sync_policy(c1)
 
-    objnames = [ 'obj1', 'obj2' ]
+    objnames = ['obj1', 'obj2']
     content = 'asdasd'
-    buckets = []
 
     # create bucket & object in all zones
     bucketA = create_zone_bucket(zcA)
-    buckets.append(bucketA)
-    create_object(zcA, bucketA, objnames[0], content)
+    zcA.s3_client.put_object(Bucket=bucketA.name, Key=objnames[0], Body=content)
 
     bucketB = create_zone_bucket(zcB)
-    buckets.append(bucketB)
-    create_object(zcB, bucketB, objnames[1], content)
+    zcB.s3_client.put_object(Bucket=bucketB.name, Key=objnames[1], Body=content)
 
     zonegroup_meta_checkpoint(zonegroup)
-    # 'zonegroup_data_checkpoint' currently fails for the zones not
-    # allowed to sync. So as a workaround, data checkpoint is done
-    # for only the ones configured.
     zone_data_checkpoint(zoneB, zoneA)
 
-    # verify if objects are synced accross the zone
-    bucket = get_bucket(zcB, bucketA.name)
-    check_object_exists(bucket, objnames[0], content)
-
-    bucket = get_bucket(zcA, bucketB.name)
-    check_object_exists(bucket, objnames[1], content)
+    # verify objects synced
+    check_object_exists(zcB, bucketA.name, objnames[0], content)
+    check_object_exists(zcA, bucketB.name, objnames[1], content)
 
     remove_sync_policy_group(c1, "sync-group")
     return
@@ -2932,13 +3505,13 @@ def test_sync_flow_symmetrical_zonegroup_select():
     content = 'asdasd'
 
     # create bucketA & objects in zoneA
-    objnamesA = [ 'obj1', 'obj2', 'obj3' ]
+    objnamesA = ['obj1', 'obj2', 'obj3']
     bucketA = create_zone_bucket(zcA)
     buckets.append(bucketA)
     create_objects(zcA, bucketA, objnamesA, content)
 
     # create bucketB & objects in zoneB
-    objnamesB = [ 'obj4', 'obj5', 'obj6' ]
+    objnamesB = ['obj4', 'obj5', 'obj6']
     bucketB = create_zone_bucket(zcB)
     buckets.append(bucketB)
     create_objects(zcB, bucketB, objnamesB, content)
@@ -2948,18 +3521,12 @@ def test_sync_flow_symmetrical_zonegroup_select():
     zone_data_checkpoint(zoneA, zoneB)
 
     # verify if objnamesA synced to only zoneB but not zoneC
-    bucket = get_bucket(zcB, bucketA.name)
-    check_objects_exist(bucket, objnamesA, content)
-
-    bucket = get_bucket(zcC, bucketA.name)
-    check_objects_not_exist(bucket, objnamesA)
+    check_objects_exist(zcB, bucketA.name, objnamesA, content)
+    check_objects_not_exist(zcC, bucketA.name, objnamesA)
 
     # verify if objnamesB synced to only zoneA but not zoneC
-    bucket = get_bucket(zcA, bucketB.name)
-    check_objects_exist(bucket, objnamesB, content)
-
-    bucket = get_bucket(zcC, bucketB.name)
-    check_objects_not_exist(bucket, objnamesB)
+    check_objects_exist(zcA, bucketB.name, objnamesB, content)
+    check_objects_not_exist(zcC, bucketB.name, objnamesB)
 
     remove_sync_policy_group(c1, "sync-group")
     return
@@ -2979,7 +3546,7 @@ def test_sync_flow_directional_zonegroup_select():
     zonegroup_conns = ZonegroupConns(zonegroup)
 
     if len(zonegroup.zones) < 3:
-        raise SkipTest("test_sync_flow_symmetrical_zonegroup_select skipped. Requires 3 or more zones in master zonegroup.")
+        raise SkipTest("test_sync_flow_directional_zonegroup_select skipped. Requires 3 or more zones in master zonegroup.")
 
     zonegroup_meta_checkpoint(zonegroup)
 
@@ -3018,18 +3585,12 @@ def test_sync_flow_directional_zonegroup_select():
     zone_data_checkpoint(zoneB, zoneA)
 
     # verify if objnamesA synced to only zoneB but not zoneC
-    bucket = get_bucket(zcB, bucketA.name)
-    check_objects_exist(bucket, objnamesA, content)
-
-    bucket = get_bucket(zcC, bucketA.name)
-    check_objects_not_exist(bucket, objnamesA)
+    check_objects_exist(zcB, bucketA.name, objnamesA, content)
+    check_objects_not_exist(zcC, bucketA.name, objnamesA)
 
     # verify if objnamesB are not synced to either zoneA or zoneC
-    bucket = get_bucket(zcA, bucketB.name)
-    check_objects_not_exist(bucket, objnamesB)
-
-    bucket = get_bucket(zcC, bucketB.name)
-    check_objects_not_exist(bucket, objnamesB)
+    check_objects_not_exist(zcA, bucketB.name, objnamesB)
+    check_objects_not_exist(zcC, bucketB.name, objnamesB)
 
     """
         verify the same at bucketA level
@@ -3071,16 +3632,15 @@ def test_sync_flow_directional_zonegroup_select():
     zone_data_checkpoint(zoneB, zoneA)
 
     # verify that objnamesC are synced to bucketA in zoneB
-    bucket = get_bucket(zcB, bucketA.name)
-    check_objects_exist(bucket, objnamesC, content)
+    check_objects_exist(zcB, bucketA.name, objnamesC, content)
 
     # verify that objnamesD are not synced to bucketA in zoneA
-    bucket = get_bucket(zcA, bucketA.name)
-    check_objects_not_exist(bucket, objnamesD)
+    check_objects_not_exist(zcA, bucketA.name, objnamesD)
 
     remove_sync_policy_group(c1, "sync-bucket", bucketA.name)
     remove_sync_policy_group(c1, "sync-group")
     return
+
 
 @attr('fails_with_rgw')
 @attr('sync_policy')
@@ -3144,12 +3704,10 @@ def test_sync_single_bucket():
     zone_data_checkpoint(zoneB, zoneA)
 
     # verify if bucketA objects are synced
-    bucket = get_bucket(zcB, bucketA.name)
-    check_objects_exist(bucket, objnames, content)
+    check_objects_exist(zcB, bucketA.name, objnames, content)
 
     # bucketB objects should not be synced
-    bucket = get_bucket(zcB, bucketB.name)
-    check_objects_not_exist(bucket, objnames)
+    check_objects_not_exist(zcB, bucketB.name, objnames)
 
 
     """
@@ -3184,12 +3742,10 @@ def test_sync_single_bucket():
     zone_data_checkpoint(zoneB, zoneA)
 
     # verify if bucketA objects are synced
-    bucket = get_bucket(zcB, bucketA.name)
-    check_object_exists(bucket, objnames[2], content)
+    check_object_exists(zcB, bucketA.name, objnames[2], content)
 
     # bucketB objects should not be synced
-    bucket = get_bucket(zcB, bucketB.name)
-    check_object_not_exists(bucket, objnames[2])
+    check_object_not_exists(zcB, bucketB.name, objnames[2])
 
     remove_sync_policy_group(c1, "sync-bucket", bucketA.name)
     remove_sync_policy_group(c1, "sync-group")
@@ -3258,11 +3814,9 @@ def test_sync_different_buckets():
 
     # verify that objects are synced to bucketB in zoneB
     # but not to bucketA
-    bucket = get_bucket(zcB, bucketA.name)
-    check_objects_not_exist(bucket, objnames)
+    check_objects_not_exist(zcB, bucketA.name, objnames)
+    check_objects_exist(zcB, bucketB.name, objnames, content)
 
-    bucket = get_bucket(zcB, bucketB.name)
-    check_objects_exist(bucket, objnames, content)
     """
         Method (b): configure policy at only bucketA level with pipe
         set to bucketB in target zone
@@ -3299,11 +3853,8 @@ def test_sync_different_buckets():
     # verify that objects are synced to bucketB in zoneB
     # but not to bucketA
     """
-    bucket = get_bucket(zcB, bucketA.name)
-    check_objects_not_exist(bucket, objnamesC)
-
-    bucket = get_bucket(zcB, bucketB.name)
-    check_objects_exist(bucket, objnamesC, content)
+    check_objects_not_exist(zcB, bucketA.name, objnamesC)
+    check_objects_exist(zcB, bucketB.name, objnamesC, content)
 
     remove_sync_policy_group(c1, "sync-bucket", bucketA.name)
     zonegroup_meta_checkpoint(zonegroup)
@@ -3337,9 +3888,8 @@ def test_sync_different_buckets():
     # verify that objects from only bucketB are synced to
     # bucketA in zoneA
     """
-    bucket = get_bucket(zcA, bucketA.name)
-    check_objects_not_exist(bucket, objnamesD)
-    check_objects_exist(bucket, objnamesE, content)
+    check_objects_not_exist(zcA, bucketA.name, objnamesD)
+    check_objects_exist(zcA, bucketA.name, objnamesE, content)
 
     remove_sync_policy_group(c1, "sync-bucket", bucketA.name)
     remove_sync_policy_group(c1, "sync-group")
@@ -3406,13 +3956,11 @@ def test_sync_multiple_buckets_to_single():
 
     # verify that both zoneA bucketA & bucketB objects are synced to
     # bucketB in zoneB but not to bucketA
-    bucket = get_bucket(zcB, bucketA.name)
-    check_objects_not_exist(bucket, objnamesA)
-    check_objects_not_exist(bucket, objnamesB)
+    check_objects_not_exist(zcB, bucketA.name, objnamesA)
+    check_objects_not_exist(zcB, bucketA.name, objnamesB)
 
-    bucket = get_bucket(zcB, bucketB.name)
-    check_objects_exist(bucket, objnamesA, content)
-    check_objects_exist(bucket, objnamesB, content)
+    check_objects_exist(zcB, bucketB.name, objnamesA, content)
+    check_objects_exist(zcB, bucketB.name, objnamesB, content)
 
     """
         Method (b): configure at bucket level
@@ -3455,13 +4003,11 @@ def test_sync_multiple_buckets_to_single():
 
     # verify that both zoneA bucketA & bucketB objects are synced to
     # bucketA in zoneB but not to bucketB
-    bucket = get_bucket(zcB, bucketB.name)
-    check_objects_not_exist(bucket, objnamesC)
-    check_objects_not_exist(bucket, objnamesD)
+    check_objects_not_exist(zcB, bucketB.name, objnamesC)
+    check_objects_not_exist(zcB, bucketB.name, objnamesD)
 
-    bucket = get_bucket(zcB, bucketA.name)
-    check_objects_exist(bucket, objnamesD, content)
-    check_objects_exist(bucket, objnamesD, content)
+    check_objects_exist(zcB, bucketA.name, objnamesC, content)
+    check_objects_exist(zcB, bucketA.name, objnamesD, content)
 
     remove_sync_policy_group(c1, "sync-bucket", bucketA.name)
     remove_sync_policy_group(c1, "sync-group")
@@ -3528,11 +4074,8 @@ def test_sync_single_bucket_to_multiple():
 
     # verify that objects from zoneA bucketA are synced to both
     # bucketA & bucketB in zoneB
-    bucket = get_bucket(zcB, bucketA.name)
-    check_objects_exist(bucket, objnamesA, content)
-
-    bucket = get_bucket(zcB, bucketB.name)
-    check_objects_exist(bucket, objnamesA, content)
+    check_objects_exist(zcB, bucketA.name, objnamesA, content)
+    check_objects_exist(zcB, bucketB.name, objnamesA, content)
 
     """
         Method (b): configure at bucket level
@@ -3569,11 +4112,8 @@ def test_sync_single_bucket_to_multiple():
 
     # verify that objects from zoneA bucketA are synced to both
     # bucketA & bucketB in zoneB
-    bucket = get_bucket(zcB, bucketA.name)
-    check_objects_exist(bucket, objnamesB, content)
-
-    bucket = get_bucket(zcB, bucketB.name)
-    check_objects_exist(bucket, objnamesB, content)
+    check_objects_exist(zcB, bucketA.name, objnamesB, content)
+    check_objects_exist(zcB, bucketB.name, objnamesB, content)
 
     remove_sync_policy_group(c1, "sync-bucket", bucketA.name)
     remove_sync_policy_group(c1, "sync-group")
@@ -3630,7 +4170,7 @@ def test_bucket_remove_rgw_down():
             assert check_all_buckets_exist(zone, buckets)
 
         for zone, bucket_name in zone_bucket:
-            zone.conn.delete_bucket(bucket_name)
+            zone.s3_client.delete_bucket(Bucket=bucket.name)
 
         zonegroup_meta_checkpoint(zonegroup)
 
@@ -3910,8 +4450,9 @@ def test_account_metadata_sync():
         iam.create_role(RoleName=name, AssumeRolePolicyDocument=json.dumps({'Version': '2012-10-17', 'Statement': [{'Effect': 'Allow', 'Principal': {'AWS': 'arn:aws:iam:::user/testuser'}, 'Action': ['sts:AssumeRole']}]}))
         iam.put_role_policy(RoleName=name, PolicyName='Allow', PolicyDocument=inline_policy)
         iam.attach_role_policy(RoleName=name, PolicyArn=managed_policy_arn)
-        # TODO: test oidc provider
-        #iam.create_open_id_connect_provider(ClientIDList=['clientid'], ThumbprintList=['3768084dfb3d2b68b7897bf5f565da8efEXAMPLE'], Url=f'http://{name}.example.com')
+        iam.create_open_id_connect_provider(ClientIDList=['clientid'],
+                                            ThumbprintList=['3768084dfb3d2b68b7897bf5f565da8efEXAMPLE'],
+                                            Url=f'http://{name}.example.com')
 
     realm_meta_checkpoint(realm)
 
@@ -3927,7 +4468,8 @@ def test_account_metadata_sync():
         iam = source_conn.iam_conn
         name = source_conn.name
 
-        #iam.delete_open_id_connect_provider(OpenIDConnectProviderArn=f'arn:aws:iam::RGW11111111111111111:oidc-provider/{name}.example.com')
+        iam.delete_open_id_connect_provider(
+            OpenIDConnectProviderArn=f'arn:aws:iam::RGW11111111111111111:oidc-provider/{name}.example.com')
 
         iam.detach_role_policy(RoleName=name, PolicyArn=managed_policy_arn)
         iam.delete_role_policy(RoleName=name, PolicyName='Allow')
@@ -3968,8 +4510,7 @@ def test_copy_object_same_bucket():
     objname = 'dummy'
 
     # upload a dummy object and wait for sync.
-    k = new_key(primary, bucket, objname)
-    k.set_contents_from_string('foo')
+    primary.s3_client.put_object(Bucket=bucket.name, Key=objname, Body='foo')
     zonegroup_meta_checkpoint(zonegroup)
 
     zonegroup_data_checkpoint(zonegroup_conns)
@@ -3978,18 +4519,50 @@ def test_copy_object_same_bucket():
     zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
 
     # copy object on primary zone
-    primary.s3_client.copy_object(Bucket=bucket.name,
-        CopySource=bucket.name + '/'+ objname,
-        Key= objname + '-copy1')
+    primary.s3_client.copy_object(
+        Bucket=bucket.name,
+        CopySource={'Bucket': bucket.name, 'Key': objname},
+        Key=objname + '-copy1'
+    )
 
     zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
 
     # copy object on secondary zone
-    secondary.s3_client.copy_object(Bucket=bucket.name,
-        Key= objname + '-copy2', 
-        CopySource=bucket.name + '/'+ objname)
+    secondary.s3_client.copy_object(
+        Bucket=bucket.name,
+        Key=objname + '-copy2',
+        CopySource={'Bucket': bucket.name, 'Key': objname}
+    )
 
     zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
+
+@attr('copy_object')
+def test_copy_object_replacing_tagging():
+    zonegroup = realm.master_zonegroup()
+    zonegroup_conns = ZonegroupConns(zonegroup)
+    primary = zonegroup_conns.rw_zones[0]
+
+    bucket = primary.create_bucket(gen_bucket_name())
+    objname = 'dummy'
+
+    primary.s3_client.put_object(Bucket=bucket.name, Key=objname, Body='foo', Tagging='key1=value1&key2=value2')
+    zonegroup_meta_checkpoint(zonegroup)
+    zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
+
+    primary.s3_client.copy_object(
+        Bucket=bucket.name,
+        CopySource={'Bucket': bucket.name, 'Key': objname},
+        Key=objname + '-copy',
+        TaggingDirective='REPLACE',
+        Tagging='key3=value3&key4=value4'
+    )
+
+    zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
+
+    expected = [{'Key': 'key3', 'Value': 'value3'}, {'Key': 'key4', 'Value': 'value4'}]
+    for zone in zonegroup_conns.rw_zones:
+        response = zone.s3_client.get_object_tagging(Bucket=bucket.name, Key=objname + '-copy')
+        assert_equal(response['TagSet'], expected)
 
 @attr('copy_object')
 def test_copy_object_different_bucket():
@@ -4004,8 +4577,7 @@ def test_copy_object_different_bucket():
     objname = 'dummy'
 
     # upload a dummy object and wait for sync.
-    k = new_key(primary, source_bucket, objname)
-    k.set_contents_from_string('foo')
+    primary.s3_client.put_object(Bucket=source_bucket.name, Key=objname, Body='foo')
     zonegroup_meta_checkpoint(zonegroup)
     
     zonegroup_bucket_checkpoint(zonegroup_conns, source_bucket.name)
@@ -4017,9 +4589,11 @@ def test_copy_object_different_bucket():
     zonegroup_meta_checkpoint(zonegroup)
             
     # copy object on primary zone
-    primary.s3_client.copy_object(Bucket = dest_bucket.name,
-        Key = objname + '-copy',
-        CopySource = source_bucket.name + '/' + objname)
+    primary.s3_client.copy_object(
+        Bucket=dest_bucket.name,
+        Key=objname + '-copy',
+        CopySource={'Bucket': source_bucket.name, 'Key': objname}
+    )
     
     zonegroup_bucket_checkpoint(zonegroup_conns, dest_bucket.name)
 
@@ -4037,11 +4611,13 @@ def test_bucket_create_location_constraint():
                 assert_equal(response['LocationConstraint'], zg.name)
             else:
                 # other zonegroup should fail with 400
-                e = assert_raises(ClientError,
-                                  z.s3_client.create_bucket,
-                                    Bucket=bucket_name,
-                                    CreateBucketConfiguration={'LocationConstraint': zg.name})
-                assert e.response['ResponseMetadata']['HTTPStatusCode'] == 400
+                try:
+                    z.s3_client.create_bucket(
+                        Bucket=bucket_name,
+                        CreateBucketConfiguration={'LocationConstraint': zg.name})
+                    assert False, "expected 400 error"
+                except ClientError as e:
+                    assert e.response['ResponseMetadata']['HTTPStatusCode'] == 400
 
 def test_timestamp_based_epochs():
     """
@@ -4189,6 +4765,87 @@ def test_timestamp_based_epochs():
             else:
                 assert False, f"Object {name}: found {out_of_order_versions} versions which are out of order"
 
+def bucket_check_olh(zone, bucket, args = None):
+    cmd = ['bucket', 'check', 'olh', '--bucket', bucket, '--dump-keys', '--hide-progress'] + (args or [])
+    keys, _ = zone.cluster.admin(cmd + zone.zone_args(), read_only=True)
+    return json.loads(keys)
+
+def bucket_check_unlinked(zone, bucket, args = None):
+    cmd = ['bucket', 'check', 'unlinked', '--bucket', bucket, '--dump-keys', '--hide-progress'] + (args or [])
+    keys, _ = zone.cluster.admin(cmd + zone.zone_args(), read_only=True)
+    return json.loads(keys)
+
+def bucket_lc_process(zone, bucket, args = None):
+    cmd = ['lc', 'process', '--bucket', bucket] + (args or [])
+    zone.cluster.admin(cmd + zone.zone_args())
+
+def test_versioned_lifecycle_deletes():
+    zonegroup = realm.master_zonegroup()
+    zonegroup_conns = ZonegroupConns(zonegroup)
+
+    # use a lifecycle policy that removes all versions
+    lifecycle = {
+        "Rules": [{
+            "ID": "ExpireVersions",
+            "Status": "Enabled",
+            "Prefix": "",
+            "Expiration": {
+                "ExpiredObjectDeleteMarker": True
+            },
+            "NoncurrentVersionExpiration": {
+                "NoncurrentDays": 1
+            }
+        }]
+    }
+
+    # create a versioned bucket on each zone
+    buckets, zone_bucket = create_bucket_per_zone(zonegroup_conns)
+
+    for zone, bucket in zone_bucket:
+        zone.s3_client.put_bucket_versioning(Bucket=bucket.name, VersioningConfiguration={'Status': 'Enabled'})
+    realm_meta_checkpoint(realm)
+
+    for zone, bucket in zone_bucket:
+        zone.s3_client.put_bucket_lifecycle_configuration(Bucket=bucket.name, LifecycleConfiguration=lifecycle)
+    realm_meta_checkpoint(realm)
+
+    # upload lots of objects/versions
+    NUM_OBJECTS = 20
+    NUM_VERSIONS = 20
+
+    for zone, bucket in zone_bucket:
+        for i in range(0, NUM_OBJECTS):
+            key = f"obj-{i}.txt"
+            for vid in range(0, NUM_VERSIONS):
+                zone.s3_client.put_object(Bucket=bucket.name, Key=key, Body=f"This is version {vid}")
+            # create a delete marker for each name
+            zone.s3_client.delete_object(Bucket=bucket.name, Key=key)
+        log.info(f"Finished uploads on zone={zone.name} bucket={bucket.name}")
+
+    # wait for all uploads to sync
+    for _, bucket in zone_bucket:
+        zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
+
+    # run lifecycle on each zone to expire all versions. lifecycle changes aren't replicated,
+    # so we don't wait for bucket checkpoints before validating the results
+    for zone, bucket in zone_bucket:
+        # apply NoncurrentVersionExpiration and verify that all Versions were removed
+        bucket_lc_process(zone.zone, bucket.name, ['--rgw-lc-debug-interval=1'])
+        response = zone.s3_client.list_object_versions(Bucket=bucket.name)
+        assert 'Versions' not in response
+        assert 'DeleteMarkers' in response
+
+        # apply ExpiredObjectDeleteMarker and verify that all DeleteMarkers were removed
+        bucket_lc_process(zone.zone, bucket.name, ['--rgw-lc-debug-interval=1'])
+        response = zone.s3_client.list_object_versions(Bucket=bucket.name)
+        assert 'Versions' not in response
+        assert 'DeleteMarkers' not in response
+
+        # check for orphaned index entries
+        olh = bucket_check_olh(zone.zone, bucket.name)
+        assert len(olh) == 0
+        unlinked = bucket_check_unlinked(zone.zone, bucket.name)
+        assert len(unlinked) == 0
 
 def run_per_zonegroup(func):
     def wrapper(*args, **kwargs):
@@ -4296,14 +4953,13 @@ def test_bucket_replication_normal_delete():
 
     # upload an object and wait for sync.
     objname = 'dummy'
-    k = new_key(source, source_bucket, objname)
-    k.set_contents_from_string('foo')
+    source.s3_client.put_object(Bucket=source_bucket.name, Key=objname, Body='foo')
     time.sleep(config.checkpoint_delay)
     zone_data_checkpoint(dest.zone, source.zone)
 
     # check that object exists in destination bucket
-    k = get_key(dest, dest_bucket, objname)
-    assert_equal(k.get_contents_as_string().decode('utf-8'), 'foo')
+    response = dest.s3_client.get_object(Bucket=dest_bucket.name, Key=objname)
+    assert_equal(response['Body'].read().decode('utf-8'), 'foo')
 
     # delete object on source
     source.s3_client.delete_object(Bucket=source_bucket.name, Key=objname)
@@ -4311,8 +4967,11 @@ def test_bucket_replication_normal_delete():
     zone_data_checkpoint(dest.zone, source.zone)
 
     # check that object does not exist in destination bucket
-    e = assert_raises(ClientError, dest.s3_client.get_object, Bucket=dest_bucket.name, Key=objname)
-    assert e.response['Error']['Code'] == 'NoSuchKey'
+    try:
+        dest.s3_client.get_object(Bucket=dest_bucket.name, Key=objname)
+        assert False, "Expected NoSuchKey error"
+    except ClientError as e:
+        assert e.response['Error']['Code'] == 'NoSuchKey'
 
 @allow_bucket_replication
 def test_bucket_replication_normal_deletemarker():
@@ -4355,13 +5014,12 @@ def test_bucket_replication_normal_deletemarker():
 
     # upload an object and wait for sync.
     objname = 'dummy'
-    k = new_key(source, source_bucket, objname)
-    k.set_contents_from_string('foo')
+    source.s3_client.put_object(Bucket=source_bucket.name, Key=objname, Body='foo')
     zone_data_checkpoint(dest.zone, source.zone)
 
     # check that object exists in destination bucket
-    k = get_key(dest, dest_bucket, objname)
-    assert_equal(k.get_contents_as_string().decode('utf-8'), 'foo')
+    response = dest.s3_client.get_object(Bucket=dest_bucket.name, Key=objname)
+    assert_equal(response['Body'].read().decode('utf-8'), 'foo')
 
     # delete object on source
     source.s3_client.delete_object(Bucket=source_bucket.name, Key=objname)
@@ -4369,8 +5027,11 @@ def test_bucket_replication_normal_deletemarker():
     zone_data_checkpoint(dest.zone, source.zone)
 
     # check that object does not exist in destination bucket
-    e = assert_raises(ClientError, dest.s3_client.get_object, Bucket=dest_bucket.name, Key=objname)
-    assert e.response['Error']['Code'] == 'NoSuchKey'
+    try:
+        dest.s3_client.get_object(Bucket=dest_bucket.name, Key=objname)
+        assert False, "Expected NoSuchKey error"
+    except ClientError as e:
+        assert e.response['Error']['Code'] == 'NoSuchKey'
 
 @allow_bucket_replication
 def test_bucket_replication_alt_user_forbidden():
@@ -4403,13 +5064,15 @@ def test_bucket_replication_alt_user_forbidden():
 
     # upload an object and wait for sync.
     objname = 'dummy'
-    k = new_key(source, source_bucket, objname)
-    k.set_contents_from_string('foo')
+    source.s3_client.put_object(Bucket=source_bucket.name, Key=objname, Body='foo')
     zone_data_checkpoint(dest.zone, source.zone)
 
     # check that object does not exist in destination bucket
-    e = assert_raises(ClientError, dest.s3_client.get_object, Bucket=dest_bucket.name, Key=objname)
-    assert e.response['Error']['Code'] == 'NoSuchKey'
+    try:
+        dest.s3_client.get_object(Bucket=dest_bucket.name, Key=objname)
+        assert False, "Expected NoSuchKey error"
+    except ClientError as e:
+        assert e.response['Error']['Code'] == 'NoSuchKey'
 
 @allow_bucket_replication
 def test_bucket_replication_alt_user():
@@ -4483,20 +5146,22 @@ def test_bucket_replication_reject_versioning_identical():
     zonegroup_meta_checkpoint(zonegroup)
 
     # create replication configuration
-    e = assert_raises(ClientError,
-                      source.s3_client.put_bucket_replication,
-                      Bucket=source_bucket.name,
-                      ReplicationConfiguration={
-                          'Role': '',
-                          'Rules': [{
-                              'ID': 'rule1',
-                              'Status': 'Enabled',
-                              'Destination': {
-                                  'Bucket': f'arn:aws:s3:::{dest_bucket.name}',
-                              }
-                          }]
-                      })
-    assert e.response['ResponseMetadata']['HTTPStatusCode'] == 400
+    try:
+        source.s3_client.put_bucket_replication(
+            Bucket=source_bucket.name,
+            ReplicationConfiguration={
+                'Role': '',
+                'Rules': [{
+                    'ID': 'rule1',
+                    'Status': 'Enabled',
+                    'Destination': {
+                        'Bucket': f'arn:aws:s3:::{dest_bucket.name}',
+                    }
+                }]
+            })
+        assert False, "Expected 400 error"
+    except ClientError as e:
+        assert e.response['ResponseMetadata']['HTTPStatusCode'] == 400
 
 @allow_bucket_replication
 def test_bucket_replication_reject_objectlock_identical():
@@ -4512,20 +5177,22 @@ def test_bucket_replication_reject_objectlock_identical():
     zonegroup_meta_checkpoint(zonegroup)
 
     # create replication configuration
-    e = assert_raises(ClientError,
-                      source.s3_client.put_bucket_replication,
-                      Bucket=source_bucket.name,
-                      ReplicationConfiguration={
-                          'Role': '',
-                          'Rules': [{
-                              'ID': 'rule1',
-                              'Status': 'Enabled',
-                              'Destination': {
-                                  'Bucket': f'arn:aws:s3:::{dest_bucket_name}',
-                              }
-                          }]
-                      })
-    assert e.response['ResponseMetadata']['HTTPStatusCode'] == 400
+    try:
+        source.s3_client.put_bucket_replication(
+            Bucket=source_bucket.name,
+            ReplicationConfiguration={
+                'Role': '',
+                'Rules': [{
+                    'ID': 'rule1',
+                    'Status': 'Enabled',
+                    'Destination': {
+                        'Bucket': f'arn:aws:s3:::{dest_bucket_name}',
+                    }
+                }]
+            })
+        assert False, "Expected 400 error"
+    except ClientError as e:
+        assert e.response['ResponseMetadata']['HTTPStatusCode'] == 400
 
 @allow_bucket_replication
 def test_bucket_replication_non_versioned_to_versioned():
@@ -4567,13 +5234,15 @@ def test_bucket_replication_non_versioned_to_versioned():
 
     # upload an object and wait for sync.
     objname = 'dummy'
-    k = new_key(source, source_bucket, objname)
-    k.set_contents_from_string('foo')
+    source.s3_client.put_object(Bucket=source_bucket.name, Key=objname, Body='foo')
     zone_data_checkpoint(dest.zone, source.zone)
 
     # check that object not exists in destination bucket
-    e = assert_raises(ClientError, dest.s3_client.get_object, Bucket=dest_bucket.name, Key=objname)
-    assert e.response['Error']['Code'] == 'NoSuchKey'
+    try:
+        dest.s3_client.get_object(Bucket=dest_bucket.name, Key=objname)
+        assert False, "Expected NoSuchKey error"
+    except ClientError as e:
+        assert e.response['Error']['Code'] == 'NoSuchKey'
 
 @allow_bucket_replication
 def test_bucket_replication_versioned_to_non_versioned():
@@ -4615,13 +5284,15 @@ def test_bucket_replication_versioned_to_non_versioned():
 
     # upload an object and wait for sync.
     objname = 'dummy'
-    k = new_key(source, source_bucket, objname)
-    k.set_contents_from_string('foo')
+    source.s3_client.put_object(Bucket=source_bucket.name, Key=objname, Body='foo')
     zone_data_checkpoint(dest.zone, source.zone)
 
     # check that object not exists in destination bucket
-    e = assert_raises(ClientError, dest.s3_client.get_object, Bucket=dest_bucket.name, Key=objname)
-    assert e.response['Error']['Code'] == 'NoSuchKey'
+    try:
+        dest.s3_client.get_object(Bucket=dest_bucket.name, Key=objname)
+        assert False, "Expected NoSuchKey error"
+    except ClientError as e:
+        assert e.response['Error']['Code'] == 'NoSuchKey'
 
 @allow_bucket_replication
 def test_bucket_replication_lock_enabled_to_lock_disabled():
@@ -4679,13 +5350,15 @@ def test_bucket_replication_lock_enabled_to_lock_disabled():
 
     # upload an object and wait for sync.
     objname = 'dummy'
-    k = new_key(source, source_bucket_name, objname)
-    k.set_contents_from_string('foo')
+    source.s3_client.put_object(Bucket=source_bucket_name, Key=objname, Body='foo')
     zone_data_checkpoint(dest.zone, source.zone)
 
     # check that object does not exist in destination bucket
-    e = assert_raises(ClientError, dest.s3_client.get_object, Bucket=dest_bucket.name, Key=objname)
-    assert e.response['Error']['Code'] == 'NoSuchKey'
+    try:
+        dest.s3_client.get_object(Bucket=dest_bucket.name, Key=objname)
+        assert False, "Expected NoSuchKey error"
+    except ClientError as e:
+        assert e.response['Error']['Code'] == 'NoSuchKey'
 
 @allow_bucket_replication
 def test_bucket_replication_lock_disabled_to_lock_enabled():
@@ -4743,21 +5416,21 @@ def test_bucket_replication_lock_disabled_to_lock_enabled():
 
     # upload an object and wait for sync.
     objname = 'dummy'
-    k = new_key(source, source_bucket.name, objname)
-    k.set_contents_from_string('foo')
+    source.s3_client.put_object(Bucket=source_bucket.name, Key=objname, Body='foo')
     zone_data_checkpoint(dest.zone, source.zone)
 
     # check that object does not exist in destination bucket
-    e = assert_raises(ClientError, dest.s3_client.get_object, Bucket=dest_bucket_name, Key=objname)
-    assert e.response['Error']['Code'] == 'NoSuchKey'
+    try:
+        dest.s3_client.get_object(Bucket=dest_bucket_name, Key=objname)
+        assert False, "Expected NoSuchKey error"
+    except ClientError as e:
+        assert e.response['Error']['Code'] == 'NoSuchKey'
 
 @attr('sync_policy')
 @attr('fails_with_rgw')
 def test_bucket_delete_with_zonegroup_sync_policy_directional():
-
     zonegroup = realm.master_zonegroup()
     zonegroup_conns = ZonegroupConns(zonegroup)
-
     zonegroup_meta_checkpoint(zonegroup)
 
     (zoneA, zoneB) = zonegroup.zones[0:2]
@@ -4765,7 +5438,6 @@ def test_bucket_delete_with_zonegroup_sync_policy_directional():
 
     c1 = zoneA.cluster
 
-    # configure sync policy
     zones = zoneA.name + ',' + zoneB.name
     c1.admin(['sync', 'policy', 'get'])
     create_sync_policy_group(c1, "sync-group")
@@ -4776,74 +5448,61 @@ def test_bucket_delete_with_zonegroup_sync_policy_directional():
     zonegroup.period.update(zoneA, commit=True)
     get_sync_policy(c1)
 
-    # configure sync policy for only bucketA and enable it
     bucketA = create_zone_bucket(zcA)
-    buckets = []
-    buckets.append(bucketA)
 
     time.sleep(config.checkpoint_delay)
     zonegroup_meta_checkpoint(zonegroup)
 
-    # create bucketA and objects in zoneA and zoneB
     objnameA = 'a'
     objnameB = 'b'
 
-    # upload object in each zone and wait for sync.
-    k = new_key(zcA, bucketA, objnameA)
-    k.set_contents_from_string('foo')
-    k = new_key(zcB, bucketA, objnameB)
-    k.set_contents_from_string('foo')
+    zcA.s3_client.put_object(Bucket=bucketA.name, Key=objnameA, Body='foo')
+    zcB.s3_client.put_object(Bucket=bucketA.name, Key=objnameB, Body='foo')
 
     zonegroup_meta_checkpoint(zonegroup)
-    zone_bucket_checkpoint(zoneA, zoneB, bucketA.name)
+    zone_bucket_checkpoint(zoneB, zoneA, bucketA.name)
     zone_data_checkpoint(zoneB, zoneA)
 
-    # verify that objnameA is synced to bucketA in zoneB
-    bucket = get_bucket(zcB, bucketA.name)
-    check_objects_exist(bucket, objnameA)
-
-    # verify that objnameB is not synced to bucketA in zoneA
-    bucket = get_bucket(zcA, bucketA.name)
-    check_objects_not_exist(bucket, objnameB)
+    # verify sync
+    check_object_exists(zcB, bucketA.name, objnameA, 'foo')
+    check_object_not_exists(zcA, bucketA.name, objnameB)
 
     log.debug('deleting object on zone A')
-    k = get_key(zcA, bucket, objnameA)
-    k.delete()
+    zcA.s3_client.delete_object(Bucket=bucketA.name, Key=objnameA)
+    zone_bucket_checkpoint(zoneB, zoneA, bucketA.name)
 
-    zone_bucket_checkpoint(zoneA, zoneB, bucketA.name)
-
-    # delete bucket on zoneA. it should fail to delete
+    # delete bucket - should fail
     log.debug('deleting bucket')
-    assert_raises(boto.exception.S3ResponseError, zcA.delete_bucket, bucketA.name)
+    try:
+        zcA.s3_client.delete_bucket(Bucket=bucketA.name)
+        assert False, "Expected BucketNotEmpty error"
+    except ClientError as e:
+        assert e.response['Error']['Code'] == 'BucketNotEmpty'
 
-    assert check_all_buckets_exist(zcA, buckets)
-    assert check_all_buckets_exist(zcB, buckets)
+    assert check_all_buckets_exist(zcA, [bucketA.name])
+    assert check_all_buckets_exist(zcB, [bucketA.name])
 
-    # retry deleting bucket after removing the object from zone B. should succeed
+    # retry after deleting object from zone B
     log.debug('deleting object on zone B')
-    k = get_key(zcB, bucket, objnameB)
-    k.delete()
+    zcB.s3_client.delete_object(Bucket=bucketA.name, Key=objnameB)
     time.sleep(config.checkpoint_delay)
 
     log.debug('retry deleting bucket')
-    zcA.delete_bucket(bucketA.name)
+    zcA.s3_client.delete_bucket(Bucket=bucketA.name)
 
     zonegroup_meta_checkpoint(zonegroup)
 
-    assert check_all_buckets_dont_exist(zcA, buckets)
-    assert check_all_buckets_dont_exist(zcB, buckets)
+    assert check_all_buckets_dont_exist(zcA, [bucketA.name])
+    assert check_all_buckets_dont_exist(zcB, [bucketA.name])
 
     remove_sync_policy_group(c1, "sync-group")
-
     return
 
 @attr('sync_policy')
 @attr('fails_with_rgw')
 def test_bucket_delete_with_bucket_sync_policy_directional():
-
     zonegroup = realm.master_zonegroup()
     zonegroup_conns = ZonegroupConns(zonegroup)
-
     zonegroup_meta_checkpoint(zonegroup)
 
     (zoneA, zoneB) = zonegroup.zones[0:2]
@@ -4851,7 +5510,6 @@ def test_bucket_delete_with_bucket_sync_policy_directional():
 
     c1 = zoneA.cluster
 
-    # configure sync policy
     zones = zoneA.name + ',' + zoneB.name
     c1.admin(['sync', 'policy', 'get'])
     create_sync_policy_group(c1, "sync-group")
@@ -4862,20 +5520,9 @@ def test_bucket_delete_with_bucket_sync_policy_directional():
     zonegroup.period.update(zoneA, commit=True)
     get_sync_policy(c1)
 
-    """
-        configure policy at bucketA level with src and dest
-        zones specified to zoneA and zoneB resp.
-
-        verify zoneA bucketA syncs to zoneB BucketA but not viceversa.
-    """
-
-    # configure sync policy for only bucketA and enable it
     bucketA = create_zone_bucket(zcA)
-    buckets = []
-    buckets.append(bucketA)
     create_sync_policy_group(c1, "sync-bucket", "allowed", bucketA.name)
     create_sync_group_flow_directional(c1, "sync-bucket", "sync-flow-bucket", zoneA.name, zoneB.name, bucketA.name)
-    #create_sync_group_flow_symmetrical(c1, "sync-bucket", "sync-flow-bucket", zones, bucketA.name)
     create_sync_group_pipe(c1, "sync-bucket", "sync-pipe", zoneA.name, zoneB.name, bucketA.name)
     set_sync_policy_group_status(c1, "sync-bucket", "enabled", bucketA.name)
 
@@ -4884,55 +5531,45 @@ def test_bucket_delete_with_bucket_sync_policy_directional():
 
     zonegroup_meta_checkpoint(zonegroup)
 
-    # create bucketA and objects in zoneA and zoneB
     objnameA = 'a'
     objnameB = 'b'
 
-    # upload object in each zone and wait for sync.
-    k = new_key(zcA, bucketA, objnameA)
-    k.set_contents_from_string('foo')
-    k = new_key(zcB, bucketA, objnameB)
-    k.set_contents_from_string('foo')
+    zcA.s3_client.put_object(Bucket=bucketA.name, Key=objnameA, Body='foo')
+    zcB.s3_client.put_object(Bucket=bucketA.name, Key=objnameB, Body='foo')
 
     zonegroup_meta_checkpoint(zonegroup)
     zone_data_checkpoint(zoneB, zoneA)
 
-    # verify that objnameA is synced to bucketA in zoneB
-    bucket = get_bucket(zcB, bucketA.name)
-    check_objects_exist(bucket, objnameA)
-
-    # verify that objnameB is not synced to bucketA in zoneA
-    bucket = get_bucket(zcA, bucketA.name)
-    check_objects_not_exist(bucket, objnameB)
+    check_object_exists(zcB, bucketA.name, objnameA, 'foo')
+    check_object_not_exists(zcA, bucketA.name, objnameB)
 
     log.debug('deleting object on zone A')
-    k = get_key(zcA, bucket, objnameA)
-    k.delete()
+    zcA.s3_client.delete_object(Bucket=bucketA.name, Key=objnameA)
+    zone_bucket_checkpoint(zoneB, zoneA, bucketA.name)
 
-    zone_bucket_checkpoint(zoneA, zoneB, bucketA.name)
-
-    # delete bucket on zoneA. it should fail to delete
     log.debug('deleting bucket')
-    assert_raises(boto.exception.S3ResponseError, zcA.delete_bucket, bucketA.name)
+    try:
+        zcA.s3_client.delete_bucket(Bucket=bucketA.name)
+        assert False, "Expected BucketNotEmpty error"
+    except ClientError as e:
+        assert e.response['Error']['Code'] == 'BucketNotEmpty'
 
-    assert check_all_buckets_exist(zcA, buckets)
-    assert check_all_buckets_exist(zcB, buckets)
+    assert check_all_buckets_exist(zcA, [bucketA.name])
+    assert check_all_buckets_exist(zcB, [bucketA.name])
 
     log.debug('deleting object on zone B')
-    k = get_key(zcB, bucket, objnameB)
-    k.delete()
+    zcB.s3_client.delete_object(Bucket=bucketA.name, Key=objnameB)
     time.sleep(config.checkpoint_delay)
 
-    # retry deleting bucket after removing the object from zone B. should succeed
     log.debug('retry deleting bucket')
-    zcA.delete_bucket(bucketA.name)
+    zcA.s3_client.delete_bucket(Bucket=bucketA.name)
 
     zonegroup_meta_checkpoint(zonegroup)
 
-    assert check_all_buckets_dont_exist(zcA, buckets)
-    assert check_all_buckets_dont_exist(zcB, buckets)
+    assert check_all_buckets_dont_exist(zcA, [bucketA.name])
+    assert check_all_buckets_dont_exist(zcB, [bucketA.name])
+    
     remove_sync_policy_group(c1, "sync-group")
-
     return
 
 @attr('sync_policy')
@@ -4983,32 +5620,28 @@ def test_bucket_delete_with_bucket_sync_policy_symmetric():
     objnameB = 'b'
 
     # upload object in each zone and wait for sync.
-    k = new_key(zcA, bucketA, objnameA)
-    k.set_contents_from_string('foo')
-    k = new_key(zcB, bucketA, objnameB)
-    k.set_contents_from_string('foo')
+    zcA.s3_client.put_object(Bucket=bucketA.name, Key=objnameA, Body='foo')
+    zcB.s3_client.put_object(Bucket=bucketA.name, Key=objnameB, Body='foo')
 
     zone_bucket_checkpoint(zoneA, zoneB, bucketA.name)
     zone_data_checkpoint(zoneB, zoneA)
 
     log.debug('deleting object A')
-    k = get_key(zcA, bucketA, objnameA)
-    k.delete()
+    zcA.s3_client.delete_object(Bucket=bucketA.name, Key=objnameA)
 
     log.debug('deleting object B')
-    k = get_key(zcA, bucketA, objnameB)
-    k.delete()
+    zcA.s3_client.delete_object(Bucket=bucketA.name, Key=objnameB)
 
     zone_bucket_checkpoint(zoneA, zoneB, bucketA.name)
     zone_data_checkpoint(zoneB, zoneA)
 
     # delete bucket on zoneA.
     log.debug('deleting bucket')
-    zcA.delete_bucket(bucketA.name)
+    zcA.s3_client.delete_bucket(Bucket=bucketA.name)
     zonegroup_meta_checkpoint(zonegroup)
 
-    assert check_all_buckets_dont_exist(zcA, buckets)
-    assert check_all_buckets_dont_exist(zcB, buckets)
+    assert check_all_buckets_dont_exist(zcA, [bucketA.name])
+    assert check_all_buckets_dont_exist(zcB, [bucketA.name])
     remove_sync_policy_group(c1, "sync-group")
     return
 
@@ -5050,32 +5683,28 @@ def test_bucket_delete_with_zonegroup_sync_policy_symmetric():
     objnameB = 'b'
 
     # upload object in each zone and wait for sync.
-    k = new_key(zcA, bucketA, objnameA)
-    k.set_contents_from_string('foo')
-    k = new_key(zcB, bucketA, objnameB)
-    k.set_contents_from_string('foo')
+    zcA.s3_client.put_object(Bucket=bucketA.name, Key=objnameA, Body='foo')
+    zcB.s3_client.put_object(Bucket=bucketA.name, Key=objnameB, Body='foo')
 
     zone_data_checkpoint(zoneB, zoneA)
     zone_bucket_checkpoint(zoneA, zoneB, bucketA.name)
 
     log.debug('deleting object A')
-    k = get_key(zcA, bucketA, objnameA)
-    k.delete()
+    zcA.s3_client.delete_object(Bucket=bucketA.name, Key=objnameA)
 
     log.debug('deleting object B')
-    k = get_key(zcA, bucketA, objnameB)
-    k.delete()
+    zcA.s3_client.delete_object(Bucket=bucketA.name, Key=objnameB)
 
     zone_bucket_checkpoint(zoneA, zoneB, bucketA.name)
     zone_data_checkpoint(zoneB, zoneA)
 
     # delete bucket on zoneA.
     log.debug('deleting bucket')
-    zcA.delete_bucket(bucketA.name)
+    zcA.s3_client.delete_bucket(Bucket=bucketA.name)
     zonegroup_meta_checkpoint(zonegroup)
 
-    assert check_all_buckets_dont_exist(zcA, buckets)
-    assert check_all_buckets_dont_exist(zcB, buckets)
+    assert check_all_buckets_dont_exist(zcA, [bucketA.name])
+    assert check_all_buckets_dont_exist(zcB, [bucketA.name])
 
     remove_sync_flow(c1, "sync-group", "sync-flow", "symmetrical")
     remove_sync_policy_group(c1, "sync-group")
@@ -5127,48 +5756,43 @@ def test_delete_bucket_with_zone_opt_out():
     objnameB = 'b'
 
     # upload object in zone A and zone C
-    k = new_key(zcA, bucketA, objnameA)
-    k.set_contents_from_string('foo')
-    k = new_key(zcC, bucketA, objnameB)
-    k.set_contents_from_string('foo')
+    zcA.s3_client.put_object(Bucket=bucketA.name, Key=objnameA, Body='foo')
+    zcC.s3_client.put_object(Bucket=bucketA.name, Key=objnameB, Body='foo')
 
     zonegroup_meta_checkpoint(zonegroup)
     zone_data_checkpoint(zoneB, zoneA)
 
     # verify that objnameA is synced to zoneB but not zoneC
-    bucket = get_bucket(zcB, bucketA.name)
-    check_objects_exist(bucket, objnameA)
-
-    bucket = get_bucket(zcC, bucketA.name)
-    check_objects_not_exist(bucket, objnameA)
+    check_object_exists(zcB, bucketA.name, objnameA, 'foo')
+    check_object_not_exists(zcC, bucketA.name, objnameA)
+    
     # verify that objnameB is not synced to either zoneA or zoneB
-    bucket = get_bucket(zcA, bucketA.name)
-    check_objects_not_exist(bucket, objnameB)
-
-    bucket = get_bucket(zcB, bucketA.name)
-    check_objects_not_exist(bucket, objnameB)
+    check_object_not_exists(zcA, bucketA.name, objnameB)
+    check_object_not_exists(zcB, bucketA.name, objnameB)
 
     log.debug('deleting object on zone A')
-    k = get_key(zcA, bucket, objnameA)
-    k.delete()
+    zcA.s3_client.delete_object(Bucket=bucketA.name, Key=objnameA)
 
     zone_bucket_checkpoint(zoneA, zoneB, bucketA.name)
 
     # delete bucket on zoneA. it should fail to delete because zoneC still has objnameB
     log.debug('deleting bucket')
-    assert_raises(boto.exception.S3ResponseError, zcA.delete_bucket, bucketA.name)
+    try:
+        zcA.s3_client.delete_bucket(Bucket=bucketA.name)
+        assert False, "Expected BucketNotEmpty error"
+    except ClientError as e:
+        assert e.response['Error']['Code'] == 'BucketNotEmpty'
 
     assert check_all_buckets_exist(zcA, buckets)
     assert check_all_buckets_exist(zcC, buckets)
 
     # retry deleting bucket after removing the object from zone C. should succeed
     log.debug('deleting object on zone C')
-    k = get_key(zcC, bucket, objnameB)
-    k.delete()
+    zcC.s3_client.delete_object(Bucket=bucketA.name, Key=objnameB)
     time.sleep(config.checkpoint_delay)
 
     log.debug('retry deleting bucket')
-    zcA.delete_bucket(bucketA.name)
+    zcA.s3_client.delete_bucket(Bucket=bucketA.name)
 
     zonegroup_meta_checkpoint(zonegroup)
 
@@ -5176,6 +5800,7 @@ def test_delete_bucket_with_zone_opt_out():
     assert check_all_buckets_dont_exist(zcC, buckets)
 
     remove_sync_policy_group(c1, "sync-group")
+
     return
 
 @attr('sync_policy')
@@ -5227,31 +5852,31 @@ def test_bucket_delete_with_sync_policy_object_prefix():
     objnameB = 'b'
 
     # upload object in each zone and wait for sync.
-    k = new_key(zcA, bucketA, objnameA)
-    k.set_contents_from_string('foo')
-    k = new_key(zcB, bucketA, objnameB)
-    k.set_contents_from_string('foo')
+    zcA.s3_client.put_object(Bucket=bucketA.name, Key=objnameA, Body='foo')
+    zcB.s3_client.put_object(Bucket=bucketA.name, Key=objnameB, Body='foo')
 
     zone_bucket_checkpoint(zoneA, zoneB, bucketA.name)
     zone_data_checkpoint(zoneB, zoneA)
+    
     # verify that objnameA is synced to zoneB
-    bucket = get_bucket(zcB, bucketA.name)
-    check_object_exists(bucket, objnameA)
+    check_object_exists(zcB, bucketA.name, objnameA, 'foo')
 
     # verify that objnameB is not synced to zoneA
-    bucket = get_bucket(zcA, bucketA.name)
-    check_object_not_exists(bucket, objnameB)
+    check_object_not_exists(zcA, bucketA.name, objnameB)
 
     log.debug('deleting object A')
-    k = get_key(zcA, bucketA, objnameA)
-    k.delete()
+    zcA.s3_client.delete_object(Bucket=bucketA.name, Key=objnameA)
 
     zone_bucket_checkpoint(zoneA, zoneB, bucketA.name)
     zone_data_checkpoint(zoneB, zoneA)
 
     # delete bucket on zoneA. it should fail to delete because zoneB still has objnameB
     log.debug('deleting bucket')
-    assert_raises(boto.exception.S3ResponseError, zcA.delete_bucket, bucketA.name)
+    try:
+        zcA.s3_client.delete_bucket(Bucket=bucketA.name)
+        assert False, "Expected BucketNotEmpty error"
+    except ClientError as e:
+        assert e.response['Error']['Code'] == 'BucketNotEmpty'
 
     assert check_all_buckets_exist(zcA, buckets)
     assert check_all_buckets_exist(zcB, buckets)
@@ -5278,13 +5903,9 @@ def test_copy_obj_between_zonegroups(zonegroup):
         dest_bucket = dest_zone.create_bucket(gen_bucket_name())
         realm_meta_checkpoint(realm)
 
-        # try object sizes of 4K and 8MiB
-        # 4K to test no progress case
-        # 8MiB to test progress case
         obj_sizes = [4096, 8 * 1024 * 1024]
         for size in obj_sizes:
-            k = new_key(source_zone, source_bucket.name, objname)
-            k.set_contents_from_string('x' * size)
+            source_zone.s3_client.put_object(Bucket=source_bucket.name, Key=objname, Body='x' * size)
 
             # copy object
             dest_zone.s3_client.copy_object(
@@ -5293,9 +5914,9 @@ def test_copy_obj_between_zonegroups(zonegroup):
                 Key=objname
             )
 
-            # check that object exists in destination bucket
-            k = get_key(dest_zone, dest_bucket, objname)
-            assert_equal(k.get_contents_as_string().decode('utf-8'), 'x' * size)
+            # verify
+            response = dest_zone.s3_client.get_object(Bucket=dest_bucket.name, Key=objname)
+            assert_equal(response['Body'].read().decode('utf-8'), 'x' * size)
 
 @allow_bucket_replication
 def test_bucket_replication_alt_user_delete_forbidden():
@@ -5344,13 +5965,12 @@ def test_bucket_replication_alt_user_delete_forbidden():
 
     # upload an object and wait for sync.
     objname = 'dummy'
-    k = new_key(source, source_bucket, objname)
-    k.set_contents_from_string('foo')
+    source.s3_client.put_object(Bucket=source_bucket.name, Key=objname, Body='foo')
     zone_data_checkpoint(dest.zone, source.zone)
 
     # check that object exists in destination bucket
-    k = get_key(dest, dest_bucket, objname)
-    assert_equal(k.get_contents_as_string().decode('utf-8'), 'foo')
+    response = dest.s3_client.get_object(Bucket=dest_bucket.name, Key=objname)
+    assert_equal(response['Body'].read().decode('utf-8'), 'foo')
 
     # delete object on source
     source.s3_client.delete_object(Bucket=source_bucket.name, Key=objname)
@@ -5358,8 +5978,8 @@ def test_bucket_replication_alt_user_delete_forbidden():
     zone_data_checkpoint(dest.zone, source.zone)
 
     # check that object does exist in destination bucket
-    k = get_key(dest, dest_bucket, objname)
-    assert_equal(k.get_contents_as_string().decode('utf-8'), 'foo')
+    response = dest.s3_client.get_object(Bucket=dest_bucket.name, Key=objname)
+    assert_equal(response['Body'].read().decode('utf-8'), 'foo')
 
 @allow_bucket_replication
 def test_bucket_replication_alt_user_delete():
@@ -5408,13 +6028,12 @@ def test_bucket_replication_alt_user_delete():
 
     # upload an object and wait for sync.
     objname = 'dummy'
-    k = new_key(source, source_bucket, objname)
-    k.set_contents_from_string('foo')
+    source.s3_client.put_object(Bucket=source_bucket.name, Key=objname, Body='foo')
     zone_data_checkpoint(dest.zone, source.zone)
 
     # check that object exists in destination bucket
-    k = get_key(dest, dest_bucket, objname)
-    assert_equal(k.get_contents_as_string().decode('utf-8'), 'foo')
+    response = dest.s3_client.get_object(Bucket=dest_bucket.name, Key=objname)
+    assert_equal(response['Body'].read().decode('utf-8'), 'foo')
 
     # delete object on source
     source.s3_client.delete_object(Bucket=source_bucket.name, Key=objname)
@@ -5422,8 +6041,11 @@ def test_bucket_replication_alt_user_delete():
     zone_data_checkpoint(dest.zone, source.zone)
 
     # check that object does not exist in destination bucket
-    e = assert_raises(ClientError, dest.s3_client.get_object, Bucket=dest_bucket.name, Key=objname)
-    assert e.response['Error']['Code'] == 'NoSuchKey'
+    try:
+        dest.s3_client.get_object(Bucket=dest_bucket.name, Key=objname)
+        assert False, "Expected NoSuchKey error"
+    except ClientError as e:
+        assert e.response['Error']['Code'] == 'NoSuchKey'
 
 @allow_bucket_replication
 def test_bucket_replication_alt_user_deletemarker_forbidden():
@@ -5482,13 +6104,12 @@ def test_bucket_replication_alt_user_deletemarker_forbidden():
 
     # upload an object and wait for sync.
     objname = 'dummy'
-    k = new_key(source, source_bucket, objname)
-    k.set_contents_from_string('foo')
+    source.s3_client.put_object(Bucket=source_bucket.name, Key=objname, Body='foo')
     zone_data_checkpoint(dest.zone, source.zone)
 
     # check that object exists in destination bucket
-    k = get_key(dest, dest_bucket, objname)
-    assert_equal(k.get_contents_as_string().decode('utf-8'), 'foo')
+    response = dest.s3_client.get_object(Bucket=dest_bucket.name, Key=objname)
+    assert_equal(response['Body'].read().decode('utf-8'), 'foo')
 
     # delete object on source
     source.s3_client.delete_object(Bucket=source_bucket.name, Key=objname)
@@ -5496,8 +6117,8 @@ def test_bucket_replication_alt_user_deletemarker_forbidden():
     zone_data_checkpoint(dest.zone, source.zone)
 
     # check that object does exist in destination bucket
-    k = get_key(dest, dest_bucket, objname)
-    assert_equal(k.get_contents_as_string().decode('utf-8'), 'foo')
+    response = dest.s3_client.get_object(Bucket=dest_bucket.name, Key=objname)
+    assert_equal(response['Body'].read().decode('utf-8'), 'foo')
 
 @allow_bucket_replication
 def test_bucket_replication_alt_user_deletemarker():
@@ -5556,13 +6177,12 @@ def test_bucket_replication_alt_user_deletemarker():
 
     # upload an object and wait for sync.
     objname = 'dummy'
-    k = new_key(source, source_bucket, objname)
-    k.set_contents_from_string('foo')
+    source.s3_client.put_object(Bucket=source_bucket.name, Key=objname, Body='foo')
     zone_data_checkpoint(dest.zone, source.zone)
 
     # check that object exists in destination bucket
-    k = get_key(dest, dest_bucket, objname)
-    assert_equal(k.get_contents_as_string().decode('utf-8'), 'foo')
+    response = dest.s3_client.get_object(Bucket=dest_bucket.name, Key=objname)
+    assert_equal(response['Body'].read().decode('utf-8'), 'foo')
 
     # delete object on source
     source.s3_client.delete_object(Bucket=source_bucket.name, Key=objname)
@@ -5570,8 +6190,11 @@ def test_bucket_replication_alt_user_deletemarker():
     zone_data_checkpoint(dest.zone, source.zone)
 
     # check that object does not exist in destination bucket
-    e = assert_raises(ClientError, dest.s3_client.get_object, Bucket=dest_bucket.name, Key=objname)
-    assert e.response['Error']['Code'] == 'NoSuchKey'
+    try:
+        dest.s3_client.get_object(Bucket=dest_bucket.name, Key=objname)
+        assert False, "Expected NoSuchKey error"
+    except ClientError as e:
+        assert e.response['Error']['Code'] == 'NoSuchKey'
 
 @allow_bucket_replication
 def test_bucket_replication_alt_user_deny_tagreplication():
@@ -5680,13 +6303,15 @@ def test_bucket_replication_source_forbidden():
 
     # upload an object and wait for sync.
     objname = 'dummy'
-    k = new_key(source, source_bucket, objname)
-    k.set_contents_from_string('foo')
+    source.s3_client.put_object(Bucket=source_bucket.name, Key=objname, Body='foo')
     zone_data_checkpoint(dest.zone, source.zone)
 
     # check that object does not exist in destination bucket
-    e = assert_raises(ClientError, dest.s3_client.get_object, Bucket=dest_bucket.name, Key=objname)
-    assert e.response['Error']['Code'] == 'NoSuchKey'
+    try:
+        dest.s3_client.get_object(Bucket=dest_bucket.name, Key=objname)
+        assert False, "Expected NoSuchKey error"
+    except ClientError as e:
+        assert e.response['Error']['Code'] == 'NoSuchKey'
 
     # remove bucket policy so I can check for replication status
     source.s3_client.delete_bucket_policy(Bucket=source_bucket.name)
@@ -5745,13 +6370,15 @@ def test_bucket_replication_source_forbidden_versioned():
 
     # upload an object and wait for sync.
     objname = 'dummy'
-    k = new_key(source, source_bucket, objname)
-    k.set_contents_from_string('foo')
+    source.s3_client.put_object(Bucket=source_bucket.name, Key=objname, Body='foo')
     zone_data_checkpoint(dest.zone, source.zone)
 
     # check that object does not exist in destination bucket
-    e = assert_raises(ClientError, dest.s3_client.get_object, Bucket=dest_bucket.name, Key=objname)
-    assert e.response['Error']['Code'] == 'NoSuchKey'
+    try:
+        dest.s3_client.get_object(Bucket=dest_bucket.name, Key=objname)
+        assert False, "Expected NoSuchKey error"
+    except ClientError as e:
+        assert e.response['Error']['Code'] == 'NoSuchKey'
 
     # remove bucket policy so I can check for replication status
     source.s3_client.delete_bucket_policy(Bucket=source_bucket.name)
@@ -5805,8 +6432,7 @@ def test_bucket_replication_source_allow_either_getobject_or_getobjectversionfor
 
     # upload an object and wait for sync.
     objname = 'dummy'
-    k = new_key(source, source_bucket, objname)
-    k.set_contents_from_string('foo')
+    source.s3_client.put_object(Bucket=source_bucket.name, Key=objname, Body='foo')
     zone_data_checkpoint(dest.zone, source.zone)
 
     # check that object exists in destination bucket
@@ -5862,8 +6488,7 @@ def test_bucket_replication_source_allow_either_getobjectversion_or_getobjectver
 
     # upload an object and wait for sync.
     objname = 'dummy'
-    k = new_key(source, source_bucket, objname)
-    k.set_contents_from_string('foo')
+    source.s3_client.put_object(Bucket=source_bucket.name, Key=objname, Body='foo')
     zone_data_checkpoint(dest.zone, source.zone)
 
     # check that object exists in destination bucket
@@ -5910,13 +6535,15 @@ def test_bucket_replication_source_forbidden_objretention():
     zonegroup_meta_checkpoint(zonegroup)
     # upload an object and wait for sync.
     objname = 'dummy'
-    k = new_key(source, source_bucket_name, objname)
-    k.set_contents_from_string('foo')
+    source.s3_client.put_object(Bucket=source_bucket.name, Key=objname, Body='foo')
     zone_data_checkpoint(dest.zone, source.zone)
 
     # check that object does not exist in destination bucket
-    e = assert_raises(ClientError, dest.s3_client.get_object, Bucket=dest_bucket.name, Key=objname)
-    assert e.response['Error']['Code'] == 'NoSuchKey'
+    try:
+        dest.s3_client.get_object(Bucket=dest_bucket.name, Key=objname)
+        assert False, "Expected NoSuchKey error"
+    except ClientError as e:
+        assert e.response['Error']['Code'] == 'NoSuchKey'
 
     # check the source object has replication status set to FAILED
     # uncomment me in https://github.com/ceph/ceph/pull/62147
@@ -5963,13 +6590,15 @@ def test_bucket_replication_source_forbidden_legalhold():
     zonegroup_meta_checkpoint(zonegroup)
     # upload an object and wait for sync.
     objname = 'dummy'
-    k = new_key(source, source_bucket_name, objname)
-    k.set_contents_from_string('foo')
+    source.s3_client.put_object(Bucket=source_bucket.name, Key=objname, Body='foo')
     zone_data_checkpoint(dest.zone, source.zone)
 
     # check that object does not exist in destination bucket
-    e = assert_raises(ClientError, dest.s3_client.get_object, Bucket=dest_bucket.name, Key=objname)
-    assert e.response['Error']['Code'] == 'NoSuchKey'
+    try:
+        dest.s3_client.get_object(Bucket=dest_bucket.name, Key=objname)
+        assert False, "Expected NoSuchKey error"
+    except ClientError as e:
+        assert e.response['Error']['Code'] == 'NoSuchKey'
 
     # check the source object has replication status set to FAILED
 
@@ -6091,8 +6720,7 @@ def test_copy_obj_perm_check_between_zonegroups(zonegroup):
     source_bucket = source_zone.create_bucket(gen_bucket_name())
 
     objname = 'dummy'
-    k = new_key(source_zone, source_bucket.name, objname)
-    k.set_contents_from_string('foo')
+    source_zone.s3_client.put_object(Bucket=source_bucket.name, Key=objname, Body='foo')
 
     for zg in realm.current_period.zonegroups:
         if zg.name == zonegroup.name:
@@ -6103,47 +6731,382 @@ def test_copy_obj_perm_check_between_zonegroups(zonegroup):
         realm_meta_checkpoint(realm)
 
         # copy object returns 403
-        e = assert_raises(ClientError, dest_zone.s3_client.copy_object,
-                          Bucket=dest_bucket.name,
-                          CopySource={'Bucket': source_bucket.name, 'Key': objname},
-                          Key=objname)
-        assert e.response['Error']['Code'] == 'AccessDenied'
+        try:
+            dest_zone.s3_client.copy_object(
+                Bucket=dest_bucket.name,
+                CopySource={'Bucket': source_bucket.name, 'Key': objname},
+                Key=objname)
+            assert False, "Expected AccessDenied error"
+        except ClientError as e:
+            assert e.response['Error']['Code'] == 'AccessDenied'
 
 
 def test_object_lock_sync():
-
-    zonegroup = realm.master_zonegroup()
-    zonegroup_conns = ZonegroupConns(zonegroup)
-    primary = zonegroup_conns.rw_zones[0]
-    secondary = zonegroup_conns.rw_zones[1]
-
-    bucket = primary.create_bucket(gen_bucket_name())
-    log.debug('created bucket=%s', bucket.name)
-
-    # enable versioning
-    bucket.configure_versioning(True)
-    zonegroup_meta_checkpoint(zonegroup)
-
     lock_config = {
-    'ObjectLockEnabled': 'Enabled',
-    'Rule': {
-        'DefaultRetention': {
-            'Mode': 'COMPLIANCE',
-            'Days': 1
+        'ObjectLockEnabled': 'Enabled',
+        'Rule': {
+            'DefaultRetention': {
+                'Mode': 'COMPLIANCE',
+                'Days': 1
             }
         }
     }
 
-    # enable object lock on bucket
-    primary.s3_client.put_object_lock_configuration(
-        Bucket=bucket.name,
-        ObjectLockConfiguration = lock_config)
+    buckets, zone_bucket = create_bucket_per_zone_in_realm()
+    for zone, bucket in zone_bucket:
+        # enable versioning
+        zone.s3_client.put_bucket_versioning(
+            Bucket=bucket.name,
+            VersioningConfiguration={'Status': 'Enabled'}
+        )
+        zone.s3_client.put_object_lock_configuration(
+            Bucket=bucket.name,
+            ObjectLockConfiguration=lock_config
+        )
+
+    realm_meta_checkpoint(realm)
+
+    for zone, bucket in zone_bucket:
+        # cross-zonegroup redirects don't work, so we only test zones in the bucket's zonegroup
+        for z in zone.zone.zonegroup.zones:
+            conn = z.get_conn(user.credentials)
+            response = conn.s3_client.get_object_lock_configuration(Bucket=bucket.name)
+            assert response['ObjectLockConfiguration'] == lock_config
+
+def test_period_update_commit():
+    wkld_concurrency = 10
+    num_objects_to_upload = 1000
+    number_of_period_updates = 3
+    test_passed = False
+
+    # get client connection to generate s3 wkld
+    zonegroup = realm.master_zonegroup()
+    zonegroup_conns = ZonegroupConns(zonegroup)
+    primary_zone_client_conn = zonegroup_conns.master_zone
+
+    # get cluster connection to another zone in the group
+    # to issue period update commits and verify replication
+    secondary_zone_cluster_conn = None
+    for zg in realm.current_period.zonegroups:
+        if zonegroup != zg:
+            continue
+        for zone in zg.zones:
+            if zone != zonegroup.master_zone:
+                secondary_zone_cluster_conn = zone
+                break
+        if secondary_zone_cluster_conn is not None:
+            break
+    else:
+        raise SkipTest("test_period_update_commit is skipped.")
+
+    bucket = primary_zone_client_conn.create_bucket(gen_bucket_name())
+    log.info(f"created bucket={bucket.name}")
+
+    def run_client_wkld(stop_event: threading.Event, key_range):
+        log.info(f"upload objects within range {key_range} to bucket={bucket.name}")
+        num_uploads = 0
+        while not stop_event.is_set():
+            start, end = key_range
+            for i in range(start, end + 1):
+                try:
+                    primary_zone_client_conn.s3_client.put_object(
+                        Bucket=bucket.name, Key=f"obj-{i:04d}", Body="..."
+                    )
+                    num_uploads += 1
+                    if stop_event.is_set():
+                        break
+                    time.sleep(0.01)
+                except Exception as e:
+                    log.debug(f"failed to upload object to bucket={bucket.name}: {e}")
+        log.info(
+            f"uploaded {num_uploads} times for the range {key_range} to bucket={bucket.name}"
+        )
+
+    try:
+        log.info("verify cluster is healthy before moving on")
+        try:
+            zonegroup_data_checkpoint(zonegroup_conns)
+        except:
+            log.info("restart gateways for a clean start")
+            for z in zonegroup_conns.rw_zones:
+                z.zone.start()
+
+        log.info("start client write-only workload to generate replication traffic")
+        client_write_only_wkld_thread_stop = threading.Event()
+        step = num_objects_to_upload // wkld_concurrency
+        key_ranges = [(i * step, (i + 1) * step - 1) for i in range(wkld_concurrency)]
+        client_write_only_wkld_threads = []
+        for key_range in key_ranges:
+            thread = threading.Thread(
+                target=run_client_wkld,
+                args=(client_write_only_wkld_thread_stop, key_range),
+                daemon=False,
+            )
+            thread.start()
+            client_write_only_wkld_threads.append(thread)
+
+        log.info("run period-update-commits and verify rgw instances reload properly")
+        for _ in range(number_of_period_updates):
+            log.info("issue period update commit")
+            zonegroup.period.update(secondary_zone_cluster_conn, commit=True)
+            log.info("verify data sync is making progress")
+            with override_config(checkpoint_retries=10, checkpoint_delay=60):
+                if not data_sync_making_progress(secondary_zone_cluster_conn):
+                    break  # the issue of realm reload freezing reproduced
+        client_write_only_wkld_thread_stop.set()  # stop client wkld
+        with override_config(checkpoint_retries=10, checkpoint_delay=60):
+            zonegroup_data_checkpoint(zonegroup_conns)
+        test_passed = True
+    except Exception as e:
+        log.error(f"test_period_update_commit failed: {e}")
+        raise
+    finally:
+        client_write_only_wkld_thread_stop.set()
+        for t in client_write_only_wkld_threads:
+            t.join()
+
+        # without a fix, an rgw instance may crash or freeze
+        # so restart all instances before further cleaning up
+        if not test_passed:
+            for z in zonegroup_conns.rw_zones:
+                z.zone.start()
+
+        log.info(f"delete {num_objects_to_upload} objects from bucket={bucket.name}")
+        for i in range(num_objects_to_upload):
+            primary_zone_client_conn.s3_client.delete_object(
+                Bucket=bucket.name,
+                Key=f"obj-{i:04d}",
+            )
+        log.info(f"delete bucket={bucket.name}")
+        primary_zone_client_conn.s3_client.delete_bucket(Bucket=bucket.name)
+
+def test_bucket_full_sync_when_the_bucket_is_deleted_in_the_meantime():
+    num_objects_to_upload = (
+        3000  # must be more than 1000 to have pagination at full sync
+    )
+    bucket_full_sync_listing_inject_delay_sec = 100
+    bucket_full_sync_listing_inject_delay_pattern = "delay_bucket_full_sync_loop"
+
+    # get client connection
+    master_zonegroup = realm.master_zonegroup()
+    zonegroup_conns = ZonegroupConns(master_zonegroup)
+    primary_zone_client_conn = zonegroup_conns.master_zone
+
+    # get cluster connections
+    primary_zone_cluster_conn = master_zonegroup.master_zone
+    secondary_zone_cluster_conn = None
+    for zg in realm.current_period.zonegroups:
+        for zone in zg.zones:
+            if zone.cluster != primary_zone_cluster_conn.cluster and zone != zg.master_zone:
+                secondary_zone_cluster_conn = zone
+                break
+        if secondary_zone_cluster_conn is not None:
+            break
+    else:
+        raise SkipTest("test_bucket_full_sync_when_the_bucket_is_deleted_in_the_meantime is skipped. "
+                       "Requires a secondary zone in a different cluster.")
+
+    bucket = primary_zone_client_conn.create_bucket(gen_bucket_name())
+    log.info(f"created bucket={bucket.name}")
+
+    log.info(f"disable sync for bucket={bucket.name}")
+    disable_bucket_sync(realm.meta_master_zone(), bucket.name)
+
+    try:
+        log.info(f"upload {num_objects_to_upload} objects to bucket={bucket.name}")
+        num_objects_to_uploaded = 0
+        for i in range(num_objects_to_upload):
+            if i % 100 == 0:
+                log.debug(f"uploaded {i} objects to bucket={bucket.name}...")
+            try:
+                primary_zone_client_conn.s3_client.put_object(
+                    Bucket=bucket.name, Key=f"obj-{i:04d}", Body="..."
+                )
+                num_objects_to_uploaded += 1
+            except Exception as e:
+                log.debug(f"failed to upload object to bucket={bucket.name}: {e}")
+        log.info(
+            f"successfully uploaded {num_objects_to_uploaded} objects to bucket={bucket.name}"
+        )
+
+        log.info("trim bucket bilog to avoid any incremental sync happening")
+        primary_zone_cluster_conn.cluster.admin(["bilog", "trim", "--bucket", bucket.name])
+        log.info("set rgw_inject_delay_sec and rgw_inject_delay_pattern to slow down bucket full sync")
+        secondary_zone_cluster_conn.cluster.ceph_admin(
+            ["config", "set", "client", "rgw_inject_delay_sec", str(bucket_full_sync_listing_inject_delay_sec)]
+        )
+        secondary_zone_cluster_conn.cluster.ceph_admin(
+            ["config", "set", "client", "rgw_inject_delay_pattern", bucket_full_sync_listing_inject_delay_pattern]
+        )
+        log.info("enable bucket sync to initiate full sync")
+        enable_bucket_sync(realm.meta_master_zone(), bucket.name)
+
+        # Since incremenetal sync is not possible and full sync is stalled,
+        # we should see that the bucket's sync is stalled.
+        log.info("verify that bucket sync is stalled")
+        deadline = time.time() + bucket_full_sync_listing_inject_delay_sec
+        oldest_inc_change = None
+        while True:
+            if time.time() > deadline:
+                raise Exception("failed to verify the stall of bucket sync")
+            new_reading = get_oldest_incremental_change_not_applied_epoch(
+                secondary_zone_cluster_conn
+            )
+            if new_reading is not None:
+                if oldest_inc_change is None or oldest_inc_change != new_reading:
+                    oldest_inc_change = new_reading
+                elif (
+                    oldest_inc_change == new_reading
+                ):  # 2 back-to-back readings are the same
+                    break
+            time.sleep(10)
+        log.info(
+            f"verified that bucket sync is stalled, oldest incremental change not applied epoch: {oldest_inc_change}"
+        )
+
+        # while bucket sync is stalled, delete all objects and the bucket.
+        log.info(f"delete {num_objects_to_upload} objects from bucket={bucket.name}")
+        for i in range(num_objects_to_upload):
+            primary_zone_client_conn.s3_client.delete_object(
+                Bucket=bucket.name,
+                Key=f"obj-{i:04d}",
+            )
+        log.info(f"delete bucket={bucket.name}")
+        primary_zone_client_conn.s3_client.delete_bucket(Bucket=bucket.name)
+
+        log.info(f"verify that bucket={bucket.name} is deleted on secondary zone")
+        for zg in realm.current_period.zonegroups:
+            zonegroup_meta_checkpoint(zg)
+
+        log.info(
+            "removing rgw_inject_delay_sec and rgw_inject_delay_pattern to allow bucket full sync to run normally to the completion"
+        )
+        secondary_zone_cluster_conn.cluster.ceph_admin(
+            ["config", "rm", "client", "rgw_inject_delay_sec"]
+        )
+        secondary_zone_cluster_conn.cluster.ceph_admin(
+            ["config", "rm", "client", "rgw_inject_delay_pattern"]
+        )
+        time.sleep(
+            bucket_full_sync_listing_inject_delay_sec
+        )  # wait to make sure bucket sync loop resumes to normal pace
+
+        log.info("wait for data sync to complete")
+        zonegroup_data_checkpoint(zonegroup_conns)
+    except Exception as e:
+        log.error(f"test_bucket_full_sync_when_the_bucket_is_deleted_in_the_meantime failed: {e}")
+        log.info(f"delete {num_objects_to_upload} objects from bucket={bucket.name}")
+        for i in range(num_objects_to_upload):
+            try:
+                primary_zone_client_conn.s3_client.delete_object(
+                    Bucket=bucket.name,
+                    Key=f"obj-{i:04d}",
+                )
+            except:
+                pass
+        log.info(f"delete bucket={bucket.name}")
+        try:
+            primary_zone_client_conn.s3_client.delete_bucket(Bucket=bucket.name)
+        except:
+            pass
+        log.info(
+            "reset rgw_inject_delay settings"
+        )
+        try:
+            secondary_zone_cluster_conn.cluster.ceph_admin(
+                ["config", "rm", "client", "rgw_inject_delay_sec"]
+            )
+            secondary_zone_cluster_conn.cluster.ceph_admin(
+                ["config", "rm", "client", "rgw_inject_delay_pattern"]
+            )
+        except:
+            pass
+        raise
+
+def test_stale_bucket_owner_after_concurrent_chown():
+    """ Integration test for https://tracker.ceph.com/issues/77731 """
+    zonegroup = realm.master_zonegroup()
+    zonegroup_conns = ZonegroupConns(zonegroup)
+    if len(zonegroup_conns.rw_zones) < 2:
+        raise SkipTest('test_stale_bucket_owner_after_concurrent_chown requires at least 2 read-write zones')
+
+    master = zonegroup_conns.master_zone
+    secondary = next(z for z in zonegroup_conns.rw_zones if z != master)
+
+    uid_a = run_prefix + '-chown-a'
+    uid_b1 = run_prefix + '-chown-b1'
+    uid_b2 = run_prefix + '-chown-b2'
+    ak_a, sk_a = uid_a + 'AK', uid_a + 'SK'
+    ak_b1, sk_b1 = uid_b1 + 'AK', uid_b1 + 'SK'
+    ak_b2, sk_b2 = uid_b2 + 'AK', uid_b2 + 'SK'
+
+    for uid, ak, sk in ((uid_a, ak_a, sk_a), (uid_b1, ak_b1, sk_b1), (uid_b2, ak_b2, sk_b2)):
+        master.zone.cluster.admin(['user', 'create',
+                                   '--uid', uid, '--display-name', uid,
+                                   '--access-key', ak, '--secret-key', sk])
 
     zonegroup_meta_checkpoint(zonegroup)
-    zone_data_checkpoint(secondary.zone, primary.zone)
+    bucket_name = gen_bucket_name()
 
-    response = secondary.s3_client.get_object_lock_configuration(Bucket=bucket.name)
-    assert(response['ObjectLockConfiguration'] == lock_config)
+    try:
+        region = zonegroup.name
+        owner_a_conn = get_gateway_connection(master.zone.gateways[0], Credentials(ak_a, sk_a), region)
+        owner_a_conn.create_bucket(Bucket=bucket_name)
+        owner_a_conn.head_bucket(Bucket=bucket_name)
 
+        zonegroup_meta_checkpoint(zonegroup)
 
-    
+        instance_list_json, _ = master.zone.cluster.admin(
+            ['metadata', 'list', 'bucket.instance'] + master.zone.zone_args(),
+            read_only=True)
+        instance_key = next(k for k in json.loads(instance_list_json)
+                            if k.startswith(bucket_name + ':'))
+
+        errors = []
+
+        def link_b2():
+            try:
+                master.zone.cluster.admin(['bucket', 'link',
+                                           '--bucket', bucket_name, '--uid', uid_b2,
+                                           '--rgw-inject-delay-sec=1',
+                                           '--rgw-inject-delay-pattern=delay_distribute_cache'])
+            except Exception as e:
+                errors.append(e)
+
+        def link_b1():
+            try:
+                time.sleep(0.2)
+                master.zone.cluster.admin(['bucket', 'link',
+                                           '--bucket', bucket_name, '--uid', uid_b1])
+            except Exception as e:
+                errors.append(e)
+
+        t1 = threading.Thread(target=link_b1)
+        t2 = threading.Thread(target=link_b2)
+        t2.start()
+        t1.start()
+        t1.join()
+        t2.join()
+
+        assert not errors, 'bucket link failed: %s' % errors
+
+        zonegroup_meta_checkpoint(zonegroup)
+
+        def get_owner(zone_conn, key):
+            meta_json, _ = zone_conn.zone.cluster.admin(
+                ['metadata', 'get', 'bucket.instance:' + key] + zone_conn.zone.zone_args(),
+                read_only=True)
+            return json.loads(meta_json)['data']['bucket_info']['owner']
+
+        master_owner = get_owner(master, instance_key)
+        second_owner = get_owner(secondary, instance_key)
+
+        log.info('master owner=%s secondary owner=%s', master_owner, second_owner)
+        assert master_owner == uid_b1, \
+            'master has stale owner %r, expected %r' % (master_owner, uid_b1)
+        assert second_owner == uid_b1, \
+            'secondary has stale owner %r, expected %r' % (second_owner, uid_b1)
+    finally:
+        for uid in (uid_a, uid_b1, uid_b2):
+            master.zone.cluster.admin(['user', 'rm', '--uid', uid, '--purge-data'],
+                                      check_retcode=False)

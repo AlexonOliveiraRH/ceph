@@ -54,7 +54,8 @@ class TestVolumesHelper(CephFSTestCase):
     def _raw_cmd(self, *args):
         return self.get_ceph_cmd_stdout(args)
 
-    def __check_clone_state(self, states, clone, clone_group=None, timo=120):
+    def __check_clone_state(self, states, clone, clone_group=None, timo=120,
+                             sleep=1):
         if isinstance(states, str):
             states = (states, )
 
@@ -66,7 +67,7 @@ class TestVolumesHelper(CephFSTestCase):
         msg = (f'Executed cmd "{args}" {timo} times; clone was never in '
                f'"{states}" state(s).')
 
-        with safe_while(tries=timo, sleep=1, action=msg) as proceed:
+        with safe_while(tries=timo, sleep=sleep, action=msg) as proceed:
             while proceed():
                 result = json.loads(self._fs_cmd(*args))
                 current_state = result["status"]["state"]
@@ -106,8 +107,10 @@ class TestVolumesHelper(CephFSTestCase):
     def _wait_for_clone_to_fail(self, clone, clone_group=None, timo=120):
         self.__check_clone_state("failed", clone, clone_group, timo)
 
-    def _wait_for_clone_to_be_in_progress(self, clone, clone_group=None, timo=120):
-        self.__check_clone_state("in-progress", clone, clone_group, timo)
+    def _wait_for_clone_to_be_in_progress(self, clone, clone_group=None,
+                                          timo=120, sleep=1):
+        self.__check_clone_state("in-progress", clone, clone_group, timo,
+                                 sleep=sleep)
 
     def _check_clone_canceled(self, clone, clone_group=None):
         self.__check_clone_state("canceled", clone, clone_group, timo=1)
@@ -455,6 +458,9 @@ class TestVolumesHelper(CephFSTestCase):
         if root_snapped:
             self.mount_a.run_shell(['sudo', 'rmdir', './.snap/root_s1'])
             self.mount_a.run_shell(['sudo', 'rmdir', './.snap/root_s2'])
+        # Drain trash before tearDown/setUp deletes the FS and restarts MDS;
+        # otherwise mgr purge threads can hang awaiting replies and block later tests.
+        self._wait_for_trash_empty()
 
     def _create_subvolumes_and_snapshots(self, group, subvolname, snapshot, snap_root=False):
         # create group.
@@ -4431,6 +4437,51 @@ class TestSubvolumes(TestVolumesHelper):
         # verify trash dir is clean
         self._wait_for_trash_empty()
 
+    def test_subvolume_resize_valid_unit(self):
+        """
+        That a subvolume can be resized when provided with valid value
+        (both int and float accepted) and unit.
+        """
+        readable_values = {"10B": 10, "10K": 10240, "200KB": 204800,
+                           "300Ki": 307200, "300KiB": 307200,
+                           "300.67KiB": 307886, "10M": 10485760,
+                           "100MB": 104857600, "100Mi": 104857600,
+                           "100MiB": 104857600, "100.123MiB": 104986574,
+                           "2G": 2147483648, "2GB": 2147483648,
+                           "4Gi": 4294967296, "4GiB": 4294967296,
+                           "4.2GiB": 4509715660, "1T": 1099511627776,
+                           "2TB": 2199023255552, "2Ti": 2199023255552,
+                           "2TiB": 2199023255552, "2.2TiB": 2418925581107}
+        subvolume = self._gen_subvol_name()
+        self._fs_cmd("subvolume", "create", self.volname, subvolume)
+        for readable_value in readable_values:
+            self._fs_cmd("subvolume", "resize", self.volname, subvolume,
+                         readable_value)
+            subvol_info = json.loads(self._get_subvolume_info(self.volname, subvolume))
+            self.assertEqual(subvol_info["bytes_quota"], readable_values.get(readable_value))
+
+        self._fs_cmd("subvolume", "rm", self.volname, subvolume)
+        self._wait_for_trash_empty()
+
+    def test_subvolume_resize_invalid_unit(self):
+        """
+        That a subvolume resize fails when provided with invalid value
+        and/or unit.
+        """
+        invalid_values = ("10A", "1y00Ki", "af00", "G", "", " ", "-1t", "-1",
+                          "1GT", "2MM", "5Di", "8Bi", "i", "7iB", "1.K", ".MB",
+                          ".10.G", "10Ki.B", "1.0.3TiB", "20G/.", "Gi32Ki",
+                          "10.64B", "1.B", ".B", "B.1", "KB1", "GB.1", "TB1.1")
+        subvolume = self._gen_subvol_name()
+        self._fs_cmd("subvolume", "create", self.volname, subvolume)
+        for invalid_value in invalid_values:
+            with self.assertRaises(CommandFailedError):
+                self._fs_cmd("subvolume", "resize", self.volname, subvolume,
+                             invalid_value)
+
+        self._fs_cmd("subvolume", "rm", self.volname, subvolume)
+        self._wait_for_trash_empty()
+
     def test_subvolume_rm_force(self):
         # test removing non-existing subvolume with --force
         subvolume = self._gen_subvol_name()
@@ -8115,8 +8166,8 @@ class TestSubvolumeSnapshotClones(TestVolumesHelper):
         # create subvolume
         self._fs_cmd("subvolume", "create", self.volname, subvolume, "--mode=777")
 
-        # do some IO
-        self._do_subvolume_io(subvolume, number_of_files=200)
+        # do some IO (enough data so in-progress lasts longer than the poll interval)
+        self._do_subvolume_io(subvolume, number_of_files=1000)
 
         # snapshot subvolume
         self._fs_cmd("subvolume", "snapshot", "create", self.volname, subvolume, snapshot)
@@ -8136,8 +8187,9 @@ class TestSubvolumeSnapshotClones(TestVolumesHelper):
         else:
             self.fail("clone status shouldn't show failure for pending clone")
 
-        # check clone1 to be in-progress
-        self._wait_for_clone_to_be_in_progress(clone1)
+        # Poll faster so a short in-progress window is not missed; keep ~120s
+        # wall-clock timeout (timo is try count, not seconds).
+        self._wait_for_clone_to_be_in_progress(clone1, timo=600, sleep=0.2)
 
         # in-progress clone1 shouldn't show failure status
         clone1_result = self._get_clone_status(clone1)
@@ -10235,22 +10287,67 @@ class TestMisc(TestVolumesHelper):
         self.wait_until_evicted(sessions[0]['id'], timeout=90)
 
     def test_mgr_eviction(self):
-        # unmount any cephfs mounts
+        # unmount any cephfs mounts to start from a clean state
         for i in range(0, self.CLIENTS_REQUIRED):
             self.mounts[i].umount_wait()
-        sessions = self._session_list()
-        self.assertLessEqual(len(sessions), 1) # maybe mgr is already mounted
 
-        # Get the mgr to definitely mount cephfs
+        # Helper to get mgr-specific sessions (type 16)
+        def get_mgr_sessions():
+            all_sessions = self._session_list()
+            mgr_sessions = [s for s in all_sessions if s.get('auth_name', {}).get('type') == 16]
+            return all_sessions, mgr_sessions
+
+        def session_nonces(sessions):
+            nonces = set()
+            for s in sessions:
+                addr = (s.get('entity') or {}).get('addr') or {}
+                if 'nonce' in addr:
+                    nonces.add(addr['nonce'])
+            return nonces
+
+        def mgr_map_client_nonces():
+            mgr_map = self.mgr_cluster.get_mgr_map()
+            nonces = set()
+            for client in mgr_map.get('active_clients', []):
+                for addr in client.get('addrvec', []):
+                    if 'nonce' in addr:
+                        nonces.add(addr['nonce'])
+            return nonces
+
+        # Ensure we start with only mgr sessions (if any)
+        all_s, mgr_s = get_mgr_sessions()
+        self.assertEqual(len(all_s), len(mgr_s), f"Non-mgr sessions found: {all_s}")
+
+        # Trigger mgr activity to ensure sessions are active
         subvolume = self._gen_subvol_name()
         self._fs_cmd("subvolume", "create", self.volname, subvolume)
-        sessions = self._session_list()
-        self.assertEqual(len(sessions), 1)
 
-        # Now fail the mgr, check the session was evicted
-        mgr = self.mgr_cluster.get_active_id()
-        self.mgr_cluster.mgr_fail(mgr)
-        self.wait_until_evicted(sessions[0]['id'])
+        # Get updated session list and verify they are all mgr types
+        all_sessions, mgr_sessions = get_mgr_sessions()
+        self.assertGreaterEqual(len(mgr_sessions), 1)
+        self.assertEqual(len(all_sessions), len(mgr_sessions),
+                         f"Unexpected session types found: {all_sessions}")
+
+        # Store IDs for eviction check
+        mgr_session_ids = [s['id'] for s in mgr_sessions]
+
+        # ceph mgr fail blocklists MgrMap.active_clients from the last
+        # beacon. Wait until the mon has learned the current CephFS
+        # client addrs so eviction is not raced by a stale client list.
+        needed_nonces = session_nonces(mgr_sessions)
+        self.assertTrue(needed_nonces,
+                        f"Missing session nonces in: {mgr_sessions}")
+        self.wait_until_true(
+            lambda: needed_nonces.issubset(mgr_map_client_nonces()),
+            timeout=30)
+
+        # Fail the mgr
+        mgr_id = self.mgr_cluster.get_active_id()
+        self.mgr_cluster.mgr_fail(mgr_id)
+
+        # Assert all identified mgr session IDs are evicted
+        for s_id in mgr_session_ids:
+            self.wait_until_evicted(s_id)
 
     def test_names_can_only_be_goodchars(self):
         """
@@ -10798,3 +10895,67 @@ class TestPerModuleFinsherThread(TestVolumesHelper):
 
         # verify trash dir is clean
         self._wait_for_trash_empty()
+
+class TestCorruptedSubvolumes(TestVolumesHelper):
+    '''
+    Test that certain cases like subvolume deletion and clone cancellations and
+    deletions are handled well on a corrupted subvolume as well.
+    '''
+
+    def test_rm_subvol_with_missing_UUID_dir(self):
+        sv1 = 'sv1'
+
+        self.run_ceph_cmd(f'fs subvolume create {self.volname} {sv1}')
+
+        sv_path = self.get_ceph_cmd_stdout(f'fs subvolume getpath {self.volname} '
+                                           f'{sv1}').strip()[1:]
+        sv_path = os.path.join(self.mount_a.hostfs_mntpt, sv_path)
+        self.mount_a.run_shell(f'sudo rmdir {sv_path}', omit_sudo=False)
+
+        self.negtest_ceph_cmd(f'fs subvolume rm {self.volname} {sv1}',
+                              retval=errno.ENOENT,
+                              errmsgs='mount path missing for subvolume')
+        self.run_ceph_cmd(f'fs subvolume rm {self.volname} {sv1} --force')
+
+    def test_rm_subvol_that_has_snap_and_missing__UUID_dir(self):
+        sv1 = 'sv1'
+        ss1 = 'ss1'
+
+        self.run_ceph_cmd(f'fs subvolume create {self.volname} {sv1}')
+        self.run_ceph_cmd(f'fs subvolume snapshot create {self.volname} {sv1} {ss1}')
+
+        sv_path = self.get_ceph_cmd_stdout('fs subvolume getpath '
+                                           f'{self.volname} {sv1}').strip()[1:]
+        self.mount_a.run_shell(f'sudo rmdir {sv_path}', omit_sudo=False)
+
+        self.negtest_ceph_cmd(f'fs subvolume snapshot rm {self.volname} {sv1} {ss1}',
+                              retval=errno.ENOENT,
+                              errmsgs='mount path missing for subvolume')
+        self.run_ceph_cmd(f'fs subvolume snapshot rm {self.volname} {sv1} {ss1} '
+                           '--force')
+
+        # cleanup
+        self.run_ceph_cmd(f'fs subvolume rm {self.volname} {sv1} --force')
+
+    def test_clone_when_src_subvol_has_missing_UUID_dir(self):
+        sv1 = 'sv1'
+        ss1 = 'ss1'
+        c1 = 'c1'
+
+        self.run_ceph_cmd(f'fs subvolume create {self.volname} {sv1}')
+        sv_path = self.get_ceph_cmd_stdout('fs subvolume getpath '
+                                           f'{self.volname} {sv1}').strip()
+        sv_path = sv_path[1:]
+        self.run_ceph_cmd(f'fs subvolume snapshot create {self.volname} {sv1} {ss1}')
+        self.run_ceph_cmd('config set mgr mgr/volumes/snapshot_clone_delay 2')
+        self.run_ceph_cmd(f'fs subvolume snapshot clone {self.volname} {sv1} {ss1} {c1}')
+
+        self.mount_a.run_shell(f'sudo rmdir {sv_path}', omit_sudo=False)
+
+        time.sleep(2)
+        self._wait_for_clone_to_fail(c1, timo=20)
+
+        # cleanup
+        self.run_ceph_cmd(f'fs subvolume snapshot rm {self.volname} {sv1} {ss1} '
+                           '--force')
+        self.run_ceph_cmd(f'fs subvolume rm {self.volname} {sv1} --force')

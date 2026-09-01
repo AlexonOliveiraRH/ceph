@@ -321,6 +321,37 @@ export class TaskMessageService {
       this.rbd_mirroring.pool_peer,
       () => ({})
     ),
+    // CephFS mirroring tasks
+    'cephfs/mirroring/setup': this.newTaskMessage(
+      new TaskMessageOperation(
+        $localize`Setting up`,
+        $localize`set up`,
+        $localize`Successfully set up`
+      ),
+      (metadata) => $localize`filesystem mirroring for '${metadata.fsName}'`
+    ),
+    'cephfs/mirroring/path/remove': this.newTaskMessage(
+      this.commonOperations.remove,
+      (metadata) => $localize`mirror path '${metadata.path}' from '${metadata.fsName}'`
+    ),
+    'cephfs/mirroring/checkpoint/add': this.newTaskMessage(
+      this.commonOperations.create,
+      (metadata) =>
+        $localize`checkpoint for snapshot '${metadata.snapName}' on path '${metadata.path}'`
+    ),
+    'cephfs/mirroring/checkpoint/remove': this.newTaskMessage(
+      this.commonOperations.remove,
+      (metadata) =>
+        $localize`checkpoint for snapshot '${metadata.snapName}' on path '${metadata.path}'`
+    ),
+    'cephfs/mirroring/disable': this.newTaskMessage(
+      new TaskMessageOperation(
+        $localize`Disabling`,
+        $localize`disable`,
+        $localize`Successfully disabled`
+      ),
+      (metadata) => $localize`mirroring for '${metadata.fsName}'`
+    ),
     // RGW operations
     'rgw/bucket/delete': this.newTaskMessage(this.commonOperations.delete, (metadata) => {
       return $localize`${metadata.bucket_names[0]}`;
@@ -378,6 +409,13 @@ export class TaskMessageService {
     'nvmeof/gateway/delete': this.newTaskMessage(this.commonOperations.delete, (metadata) =>
       this.nvmeofGateway(metadata)
     ),
+    'nvmeof/gateway/node/add': this.newTaskMessage(this.commonOperations.add, (metadata) =>
+      this.nvmeofGatewayNode(metadata)
+    ),
+    'nvmeof/gateway-node/delete': this.newTaskMessage(
+      this.commonOperations.remove,
+      (metadata) => $localize`gateway node '${metadata.hostname}'`
+    ),
     'nvmeof/subsystem/create': this.newTaskMessage(this.commonOperations.create, (metadata) =>
       this.nvmeofSubsystem(metadata)
     ),
@@ -386,6 +424,9 @@ export class TaskMessageService {
     ),
     'nvmeof/listener/create': this.newTaskMessage(this.commonOperations.create, (metadata) =>
       this.nvmeofListener(metadata)
+    ),
+    'nvmeof/listener/add': this.newTaskMessage(this.commonOperations.add, (metadata) =>
+      this.nvmeofListenerPlural(metadata)
     ),
     'nvmeof/listener/delete': this.newTaskMessage(this.commonOperations.delete, (metadata) =>
       this.nvmeofListener(metadata)
@@ -400,6 +441,9 @@ export class TaskMessageService {
       this.nvmeofNamespace(metadata)
     ),
     'nvmeof/initiator/add': this.newTaskMessage(this.commonOperations.add, (metadata) =>
+      this.nvmeofInitiator(metadata)
+    ),
+    'nvmeof/initiator/edit': this.newTaskMessage(this.commonOperations.update, (metadata) =>
       this.nvmeofInitiator(metadata)
     ),
     'nvmeof/initiator/remove': this.newTaskMessage(this.commonOperations.remove, (metadata) =>
@@ -461,6 +505,10 @@ export class TaskMessageService {
     ),
     'cephfs/subvolume/edit': this.newTaskMessage(this.commonOperations.update, (metadata) =>
       this.subvolume(metadata)
+    ),
+    'cephfs/subvolume/snapshot_visibility/set': this.newTaskMessage(
+      this.commonOperations.update,
+      (metadata) => $localize`subvolume snapshot visibility for '${metadata.subVolumeName}'`
     ),
     'cephfs/subvolume/remove': this.newTaskMessage(this.commonOperations.remove, (metadata) =>
       this.subvolume(metadata)
@@ -548,6 +596,13 @@ export class TaskMessageService {
     'cephfs/smb/standalone/delete': this.newTaskMessage(
       this.commonOperations.delete,
       (metadata: { usersGroupsId: string }) => this.smbUsersgroups(metadata)
+    ),
+    'ceph-user/create': this.newTaskMessage(
+      this.commonOperations.create,
+      (metadata: { userEntity: string }) => this.cephUser(metadata)
+    ),
+    'mirroring/token/create': this.newTaskMessage(this.commonOperations.create, () =>
+      this.bootstrap()
     )
   };
 
@@ -589,8 +644,16 @@ export class TaskMessageService {
   nvmeofGateway(metadata: any) {
     return $localize`Gateway group '${metadata.group}'`;
   }
+
+  nvmeofGatewayNode(metadata: any) {
+    return $localize`hosts to gateway group '${metadata.group_name}'`;
+  }
   nvmeofListener(metadata: any) {
-    return $localize`listener '${metadata.host_name} for subsystem ${metadata.nqn}`;
+    return $localize`listener '${metadata.host_name}' for subsystem ${metadata.nqn}`;
+  }
+
+  nvmeofListenerPlural(metadata: { count: number; nqn: string }) {
+    return $localize`${this.pluralize('listener', metadata.count)} to subsystem ${metadata.nqn}`;
   }
 
   nvmeofNamespace(metadata: { nqn: string; nsCount?: number; nsid?: string }) {
@@ -718,5 +781,13 @@ export class TaskMessageService {
 
   getRunningText(task: Task) {
     return this._getTaskTitle(task).operation.running;
+  }
+
+  cephUser(metadata: { userEntity: string }) {
+    return $localize`Ceph user  '${metadata.userEntity}'`;
+  }
+
+  bootstrap() {
+    return $localize`bootstrap token`;
   }
 }

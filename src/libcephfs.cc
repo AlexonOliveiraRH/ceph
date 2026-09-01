@@ -853,6 +853,7 @@ extern "C" int ceph_open_snapdiff(struct ceph_mount_info* cmount,
                                   const char* rel_path,
                                   const char* snap1,
                                   const char* snap2,
+				  unsigned diff_mask,
                                   struct ceph_snapdiff_info* out)
 {
   if (!cmount->is_mounted()) {
@@ -867,6 +868,7 @@ extern "C" int ceph_open_snapdiff(struct ceph_mount_info* cmount,
   }
   out->cmount = cmount;
   out->dir1 = out->dir_aux = nullptr;
+  out->mask = diff_mask;
 
   char full_path1[PATH_MAX];
   char snapdir[PATH_MAX];
@@ -939,6 +941,7 @@ extern "C" int ceph_readdir_snapdiff(struct ceph_snapdiff_info* snapdiff,
   int r = snapdiff->cmount->get_client()->readdir_snapdiff(
     d1,
     d2->inode->snapid,
+    snapdiff->mask,
     &(out->dir_entry),
     &snapid);
   if (r >= 0) {
@@ -1075,6 +1078,18 @@ extern "C" int ceph_rmsnap(struct ceph_mount_info *cmount, const char *path, con
   if (!cmount->is_mounted())
     return -ENOTCONN;
   return cmount->get_client()->rmsnap(path, name, cmount->default_perms, true);
+}
+
+extern "C" int ceph_do_snap_md_op(struct ceph_mount_info* cmount,
+                                  const char* path, const char* md_key,
+                                  const char* md_val,
+                                  const unsigned int op_flag)
+{
+  if (!cmount->is_mounted())
+    return -ENOTCONN;
+
+  return cmount->get_client()->do_snap_md_op(path, md_key, md_val, op_flag,
+                                             cmount->default_perms);
 }
 
 extern "C" int ceph_mkdirs(struct ceph_mount_info *cmount, const char *path, mode_t mode)
@@ -2393,6 +2408,12 @@ extern "C" int ceph_ll_setlk(struct ceph_mount_info *cmount,
 			     int sleep)
 {
   return (cmount->get_client()->ll_setlk(fh, fl, owner, sleep));
+}
+
+extern "C" int ceph_ll_flock(struct ceph_mount_info *cmount,
+			     Fh *fh, int operation, uint64_t owner)
+{
+  return (cmount->get_client()->ll_flock(fh, operation, owner));
 }
 
 extern "C" int ceph_ll_lazyio(class ceph_mount_info *cmount,

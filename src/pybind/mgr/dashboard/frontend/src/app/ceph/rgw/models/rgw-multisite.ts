@@ -48,6 +48,9 @@ export class RgwZone {
   realm_id: string;
   notif_pool: string;
   endpoints: string;
+  tier_type: string;
+  sync_from: string;
+  sync_from_all: boolean;
 }
 
 export class SystemKey {
@@ -80,4 +83,10 @@ export interface Zone {
 export interface RgwRealmToken {
   realm: string;
   token: string;
+}
+
+export interface RgwZoneTreeNode {
+  name: string;
+  parent: string;
+  second_parent: string;
 }

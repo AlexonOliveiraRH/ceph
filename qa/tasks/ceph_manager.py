@@ -1046,8 +1046,19 @@ class OSDThrasher(Thrasher):
                 self.log("chose to kill {n} OSDs".format(n=most_killable))
                 acting_set = self.get_rand_pg_acting_set(pool_id)
                 assert most_killable < len(acting_set)
+                # kill the selected osds first, then mark them out. This makes
+                # the error inject a single 'atomic' failure. It simulates what
+                # happens if multiple OSDs fail over a couple of minutes and
+                # then the mon marks them out mon_osd_down_out_interval (10 mins)
+                # later. In contrast if each osd is killed and marked out in turn
+                # then this simulates a rolling failure, here rebalancing and
+                # async recovery can start after the first osd is marked out
+                # further reducing redundancy. With this number of injects in
+                # quick succession this risks a PG in the pool becoming dead
                 for i in range(0, most_killable):
-                    self.kill_osd(osd=acting_set[i], mark_out=True)
+                    self.kill_osd(osd=acting_set[i])
+                for i in range(0, most_killable):
+                    self.out_osd(osd=acting_set[i])
                 self.log("dead_osds={d}, live_osds={ld}".format(d=self.dead_osds, ld=self.live_osds))
                 with safe_while(
                     sleep=25, tries=5,
@@ -2492,6 +2503,14 @@ class CephManager:
         return next((p['stats'] for p in j['pools'] if p['name'] == name),
                     None)
 
+    def get_cluster_df_stats(self):
+        """
+        Get the cluster df stats
+        """
+        out = self.raw_cluster_cmd('df', '--format=json')
+        j = json.loads('\n'.join(out.split('\n')[1:]))
+        return j['stats']
+
     def get_pgids_to_force(self, backfill):
         """
         Return the randomized list of PGs that can have their recovery/backfill forced
@@ -3374,14 +3393,39 @@ class CephManager:
             self.log('health:\n{h}'.format(h=out))
         return json.loads(out)
 
-    def wait_until_healthy(self, timeout=None):
+    def wait_until_healthy(self, timeout=None, expected_checks=[]):
         self.log("wait_until_healthy")
         start = time.time()
-        while self.get_mon_health()['status'] != 'HEALTH_OK':
+        found = set()
+        while True:
+            health = self.get_mon_health()
+            if health['status'] == 'HEALTH_OK':
+                break
+            found = set()
+            okay = True
+            unhealthy = []
+            for name, check in health['checks'].items():
+                if check['muted']:
+                    log.debug("{} is muted", name)
+                elif name in expected_checks:
+                    log.info("{} in expected_checks", name)
+                    found.add(name)
+                else:
+                    unhealthy.append(name)
+                    okay = False
+            if okay:
+                break
             if timeout is not None:
-                assert time.time() - start < timeout, \
-                    'timeout expired in wait_until_healthy'
+                if timeout < (time.time() - start):
+                    what = ", ".join(unhealthy)
+                    err = f"timeout {timeout}s expired waiting for healthy cluster with these unhealthy checks: {what}"
+                    raise RuntimeError(err)
             time.sleep(3)
+        if found != set(expected_checks):
+            exp = ", ".join(expected_checks)
+            fnd = ", ".join(found)
+            err = f"healthy cluster but expected_checks ({exp}) not equal to {fnd}"
+            raise RuntimeError(err)
         self.log("wait_until_healthy done")
 
     def get_filepath(self):

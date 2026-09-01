@@ -1,3 +1,4 @@
+# cython: language_level=3
 """
 This module is a thin wrapper around rgw_file.
 """
@@ -8,6 +9,20 @@ from libc.stdint cimport *
 from libc.stdlib cimport malloc, realloc, free
 from cstat cimport stat
 cimport libcpp
+
+# Platform-specific errno handling using C preprocessor
+cdef extern from *:
+    """
+    #include <errno.h>
+    #if defined(__FreeBSD__) || defined(__APPLE__)
+    // FreeBSD/Darwin use ENOATTR for "no data"
+    #define CEPH_ENODATA ENOATTR
+    #else
+    // Linux uses ENODATA
+    #define CEPH_ENODATA ENODATA
+    #endif
+    """
+    int CEPH_ENODATA
 
 {{if BUILD_DOC}}
 include "mock_rgw.pxi"
@@ -29,7 +44,6 @@ cdef extern from "Python.h":
     PyObject *PyBytes_FromStringAndSize(char *v, Py_ssize_t len) except NULL
     char* PyBytes_AsString(PyObject *string) except NULL
     int _PyBytes_Resize(PyObject **string, Py_ssize_t newsize) except -1
-    void PyEval_InitThreads()
 
 
 class Error(Exception):
@@ -92,35 +106,20 @@ class OutOfRange(Error):
     pass
 
 
-# Build errno mapping based on platform
-# FreeBSD uses ENOATTR while Linux uses ENODATA
-{{if UNAME_SYSNAME == "FreeBSD"}}
+# Build errno mapping
+# Use CEPH_ENODATA which resolves to ENOATTR on FreeBSD or ENODATA on Linux
 cdef errno_to_exception =  {
     errno.EPERM      : PermissionError,
     errno.ENOENT     : ObjectNotFound,
     errno.EIO        : IOError,
     errno.ENOSPC     : NoSpace,
     errno.EEXIST     : ObjectExists,
-    errno.ENOATTR    : NoData,
+    CEPH_ENODATA     : NoData,
     errno.EINVAL     : InvalidValue,
     errno.EOPNOTSUPP : OperationNotSupported,
     errno.ERANGE     : OutOfRange,
     errno.EWOULDBLOCK: WouldBlock,
 }
-{{else}}
-cdef errno_to_exception =  {
-    errno.EPERM      : PermissionError,
-    errno.ENOENT     : ObjectNotFound,
-    errno.EIO        : IOError,
-    errno.ENOSPC     : NoSpace,
-    errno.EEXIST     : ObjectExists,
-    errno.ENODATA    : NoData,
-    errno.EINVAL     : InvalidValue,
-    errno.EOPNOTSUPP : OperationNotSupported,
-    errno.ERANGE     : OutOfRange,
-    errno.EWOULDBLOCK: WouldBlock,
-}
-{{endif}}
 
 
 cdef class FileHandle(object):
@@ -200,7 +199,6 @@ cdef class LibRGWFS(object):
                                   "RGWFS object in state %s." % (self.state))
 
     def __cinit__(self, uid, key, secret):
-        PyEval_InitThreads()
         self.state = "umounted"
         ret = librgw_create(&self.cluster, 0, NULL)
         if ret != 0:

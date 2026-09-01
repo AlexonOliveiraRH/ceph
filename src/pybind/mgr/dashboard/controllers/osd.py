@@ -24,7 +24,7 @@ from . import APIDoc, APIRouter, CreatePermission, DeletePermission, Endpoint, \
 from ._version import APIVersion
 from .orchestrator import raise_if_no_orchestrator
 
-logger = logging.getLogger('controllers.osd')
+logger = logging.getLogger(__name__)
 
 SAFE_TO_DESTROY_SCHEMA = {
     "safe_to_destroy": ([str], "Is OSD safe to destroy?"),
@@ -218,7 +218,7 @@ class Osd(RESTController):
     def get_removing_osds() -> Optional[List[int]]:
         orch = OrchClient.instance()
         if orch.available(features=[OrchFeature.OSD_GET_REMOVE_STATUS]):
-            return [osd.osd_id for osd in orch.osds.removing_status()]
+            return [osd['osd_id'] for osd in orch.osds.removing_status()]
         return None
 
     @staticmethod
@@ -340,7 +340,7 @@ class Osd(RESTController):
         while True:
             removal_osds = orch.osds.removing_status()
             logger.info('Current removing OSDs %s', removal_osds)
-            pending = [osd for osd in removal_osds if osd.osd_id == int(svc_id)]
+            pending = [osd for osd in removal_osds if osd['osd_id'] == int(svc_id)]
             if not pending:
                 break
             logger.info('Wait until osd.%s is removed...', svc_id)

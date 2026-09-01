@@ -28,7 +28,6 @@
 #include "mon/MonClient.h"
 #include "include/ceph_features.h"
 #include "common/config.h"
-#include "extblkdev/ExtBlkDevPlugin.h"
 
 #include "mon/MonMap.h"
 
@@ -350,7 +349,7 @@ int main(int argc, const char **argv)
 	keyring.get_auth(ename, eauth)) {
       derr << "already have key in keyring " << keyring_path << dendl;
     } else {
-      eauth.key.create(g_ceph_context, CEPH_CRYPTO_AES);
+      eauth.key.create(g_ceph_context, CEPH_CRYPTO_AES256KRB5);
       keyring.add(ename, eauth);
       bufferlist bl;
       keyring.encode_plaintext(bl);
@@ -492,14 +491,6 @@ flushjournal_out:
       forker.exit(1);
     }
     forker.exit(0);
-  }
-  
-  {
-    int r = extblkdev::preload(g_ceph_context);
-    if (r < 0) {
-      derr << "Failed preloading extblkdev plugins, error code: " << r << dendl;
-      forker.exit(1);
-    }
   }
 
   string magic;

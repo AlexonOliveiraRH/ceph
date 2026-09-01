@@ -2,9 +2,11 @@ import { Component, NgZone, OnInit, ViewChild } from '@angular/core';
 import { CdTableAction } from '~/app/shared/models/cd-table-action';
 import { CdTableColumn } from '~/app/shared/models/cd-table-column';
 import { CdTableSelection } from '~/app/shared/models/cd-table-selection';
+import { CellTemplate } from '~/app/shared/enum/cell-template.enum';
 
 import { ListWithDetails } from '~/app/shared/classes/list-with-details.class';
 import {
+  AllZonesResponse,
   StorageClass,
   TIER_TYPE,
   TIER_TYPE_DISPLAY,
@@ -14,6 +16,7 @@ import { ActionLabelsI18n } from '~/app/shared/constants/app.constants';
 import { FinishedTask } from '~/app/shared/models/finished-task';
 import { Icons } from '~/app/shared/enum/icons.enum';
 import { RgwZonegroupService } from '~/app/shared/api/rgw-zonegroup.service';
+import { RgwZoneService } from '~/app/shared/api/rgw-zone.service';
 import { DeleteConfirmationModalComponent } from '~/app/shared/components/delete-confirmation-modal/delete-confirmation-modal.component';
 import { ModalCdsService } from '~/app/shared/services/modal-cds.service';
 import { TaskWrapperService } from '~/app/shared/services/task-wrapper.service';
@@ -23,8 +26,8 @@ import { URLBuilderService } from '~/app/shared/services/url-builder.service';
 import { Permission } from '~/app/shared/models/permissions';
 import { BucketTieringUtils } from '../utils/rgw-bucket-tiering';
 import { Router } from '@angular/router';
-import { Observable, Subscriber } from 'rxjs';
 import { TableComponent } from '~/app/shared/datatable/table/table.component';
+import { finalize, switchMap } from 'rxjs/operators';
 
 const BASE_URL = 'rgw/storage-class';
 @Component({
@@ -36,15 +39,16 @@ const BASE_URL = 'rgw/storage-class';
 })
 export class RgwStorageClassListComponent extends ListWithDetails implements OnInit {
   @ViewChild('table', { static: true })
-  table: TableComponent;
-  columns: CdTableColumn[];
+  table!: TableComponent;
+  columns: CdTableColumn[] = [];
   selection = new CdTableSelection();
   permission: Permission;
-  tableActions: CdTableAction[];
+  tableActions: CdTableAction[] = [];
   storageClassList: StorageClass[] = [];
 
   constructor(
     private rgwZonegroupService: RgwZonegroupService,
+    private rgwZoneService: RgwZoneService,
     public actionLabels: ActionLabelsI18n,
     private cdsModalService: ModalCdsService,
     private taskWrapper: TaskWrapperService,
@@ -68,6 +72,7 @@ export class RgwStorageClassListComponent extends ListWithDetails implements OnI
       {
         name: $localize`Name`,
         prop: 'storage_class',
+        cellTransformation: CellTemplate.routerLink,
         flexGrow: 2
       },
       {
@@ -134,7 +139,10 @@ export class RgwStorageClassListComponent extends ListWithDetails implements OnI
           const tierObj = BucketTieringUtils.filterAndMapTierTargets(data);
           const tierConfig = tierObj.map((tier) => ({
             ...tier,
-            tier_type: this.mapTierTypeDisplay(tier.tier_type)
+            tier_type: BucketTieringUtils.mapTierTypeDisplay(tier.tier_type),
+            storageClass: tier.storage_class,
+            placementTarget: tier.placement_target,
+            tierType: BucketTieringUtils.mapTierTypeDisplay(tier.tier_type)
           }));
 
           this.transformTierData(tierConfig);
@@ -148,56 +156,53 @@ export class RgwStorageClassListComponent extends ListWithDetails implements OnI
     });
   }
 
-  private mapTierTypeDisplay(tierType: string): string {
-    switch (tierType?.toLowerCase()) {
-      case TIER_TYPE.CLOUD_TIER:
-        return TIER_TYPE_DISPLAY.CLOUD_TIER;
-      case TIER_TYPE.LOCAL:
-        return TIER_TYPE_DISPLAY.LOCAL;
-      case TIER_TYPE.GLACIER:
-        return TIER_TYPE_DISPLAY.GLACIER;
-      default:
-        return tierType;
-    }
-  }
-
   transformTierData(tierConfig: any[]) {
     tierConfig.forEach((item, index) => {
       const zone_group = item?.zone_group;
       const storageClass = item?.storage_class;
       const uniqueId = `${zone_group}-${storageClass}-${index}`;
       item.uniqueId = uniqueId;
+      item.cdLink = `/${BASE_URL}/${encodeURIComponent(item.zonegroup_name)}/${encodeURIComponent(
+        item.placement_target
+      )}/${encodeURIComponent(item.storage_class)}/overview`;
     });
     return tierConfig;
   }
 
   removeStorageClassModal() {
-    const storage_class = this.selection.first().storage_class;
-    const placement_target = this.selection.first().placement_target;
+    const selectedItem = this.selection.first();
+    const { storageClass, placementTarget, tierType } = selectedItem;
+    const isLocalStorageClass =
+      tierType?.toLowerCase() === TIER_TYPE.LOCAL || tierType === TIER_TYPE_DISPLAY.LOCAL;
+
     this.cdsModalService.show(DeleteConfirmationModalComponent, {
       itemDescription: $localize`Storage class`,
-      itemNames: [storage_class],
+      itemNames: [storageClass],
       actionDescription: 'remove',
       submitActionObservable: () => {
-        return new Observable((observer: Subscriber<any>) => {
-          this.taskWrapper
-            .wrapTaskAroundCall({
-              task: new FinishedTask('rgw/zonegroup/storage-class', {
-                placement_target: placement_target,
-                storage_class: storage_class
-              }),
-              call: this.rgwStorageClassService.removeStorageClass(placement_target, storage_class)
-            })
-            .subscribe({
-              error: (error: any) => {
-                observer.error(error);
-              },
-              complete: () => {
-                observer.complete();
-                this.table.refreshBtn();
-              }
-            });
-        });
+        // For local storage classes, delete from both zone and zonegroup
+        const deleteObservable$ = isLocalStorageClass
+          ? this.rgwZoneService.getAllZonesInfo().pipe(
+              switchMap((data: AllZonesResponse) => {
+                const zoneInfo = BucketTieringUtils.getZoneInfoHelper(data.zones, selectedItem);
+                return this.rgwStorageClassService.removeStorageClass(
+                  placementTarget,
+                  storageClass,
+                  zoneInfo.zone_name || ''
+                );
+              })
+            )
+          : this.rgwStorageClassService.removeStorageClass(placementTarget, storageClass);
+
+        return this.taskWrapper
+          .wrapTaskAroundCall({
+            task: new FinishedTask('rgw/zonegroup/storage-class', {
+              placementTarget,
+              storageClass
+            }),
+            call: deleteObservable$
+          })
+          .pipe(finalize(() => this.table.refreshBtn()));
       }
     });
   }

@@ -61,12 +61,12 @@ class HealthTest(DashboardTestCase):
             'refuse_client_session': bool,
             'refuse_standby_for_another_fs': bool,
             'balance_automate': bool,
-            'allow_referent_inodes': bool,
         }),
         'ever_allowed_features': int,
         'root': int,
         'qdb_leader': int,
-        'qdb_cluster': JList(int)
+        'qdb_cluster': JList(int),
+        'standby_enable_host_anti_affinity': bool
     })
 
     def test_minimal_health(self):

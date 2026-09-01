@@ -18,6 +18,8 @@
 #include "PaxosService.h"
 #include "NVMeofGwMap.h"
 
+struct Subscription;
+
 struct LastBeacon {
   NvmeGwId gw_id;
   NvmeGroupKey group_key;
@@ -40,7 +42,7 @@ class NVMeofGwMon: public PaxosService,
   NVMeofGwMap map;  //NVMeGWMap
   NVMeofGwMap pending_map;
   std::map<LastBeacon, ceph::coarse_mono_clock::time_point> last_beacon;
-  ceph::coarse_mono_clock::time_point last_tick;
+  ceph::coarse_mono_clock::time_point last_beacon_check;
 
 public:
   NVMeofGwMon(Monitor &mn, Paxos &p, const std::string& service_name)
@@ -72,6 +74,9 @@ public:
   bool prepare_update(MonOpRequestRef op) override;
 
   bool preprocess_command(MonOpRequestRef op);
+  bool nvme_gw_show_command(ceph::Formatter* f,
+       bufferlist &rdata, const std::string  &pool,
+       const std::string &group);
   bool prepare_command(MonOpRequestRef op);
 
   void encode_full(MonitorDBStore::TransactionRef t) override {}
@@ -93,8 +98,7 @@ public:
 private:
   void synchronize_last_beacon();
   void process_gw_down(const NvmeGwId &gw_id,
-     const NvmeGroupKey& group_key, bool &propose_pending,
-     gw_availability_t avail);
+     const NvmeGroupKey& group_key, bool &propose_pending);
   bool get_gw_by_addr(const  entity_addr_t &sub_addr,
        NvmeGwId &gw_id, NvmeGroupKey& group_key);
   epoch_t get_ack_map_epoch(bool gw_created, const NvmeGroupKey& group_key);
@@ -108,6 +112,8 @@ private:
   void do_send_map_ack(MonOpRequestRef op, bool gw_created, bool gw_propose,
        uint64_t stored_sequence, bool is_correct_sequence,
        const NvmeGroupKey& group_key, const NvmeGwId &gw_id);
+  void check_beacon_timeout(ceph::coarse_mono_clock::time_point now,
+       bool &propose_pending);
 };
 
 #endif /* MON_NVMEGWMONITOR_H_ */

@@ -89,7 +89,7 @@ OpHistory::OpHistory(CephContext *c) : cct(c), opsvc(this) {
   b.set_prio_default(PerfCountersBuilder::PRIO_USEFUL);
 
   b.add_u64_counter(l_trackedop_slow_op_count, "slow_ops_count",
-					       "Number of operations taking over ten second");
+					       "Number of operations taking over ten seconds");
 
   logger.reset(b.create_perf_counters());
   cct->get_perfcounters_collection()->add(logger.get());
@@ -109,13 +109,17 @@ OpHistory::~OpHistory() {
 
 void OpHistory::on_shutdown()
 {
+  if (shutdown.exchange(true)) {   // idempotent; join is reached exactly once
+    return;
+  }
   opsvc.break_thread();
-  opsvc.join();
+  if (opsvc.is_started()) {
+    opsvc.join();
+  }
   std::lock_guard history_lock(ops_history_lock);
   arrived.clear();
   duration.clear();
   slow_op.clear();
-  shutdown = true;
 }
 
 void OpHistory::_insert_delayed(const utime_t& now, TrackedOpRef op)
@@ -190,7 +194,8 @@ void OpHistory::dump_ops(utime_t now, Formatter *f, set<string> filters, bool by
 struct ShardedTrackingData {
   ceph::mutex ops_in_flight_lock_sharded;
   TrackedOp::tracked_op_list_t ops_in_flight_sharded;
-  explicit ShardedTrackingData(string lock_name)
+  std::atomic<uint64_t> ops_in_flight_count{0};
+  explicit ShardedTrackingData(const char* lock_name)
     : ops_in_flight_lock_sharded(ceph::make_mutex(lock_name)) {}
 };
 
@@ -210,6 +215,13 @@ OpTracker::OpTracker(CephContext *cct_, bool tracking, uint32_t num_shards):
 }
 
 OpTracker::~OpTracker() {
+  // NOTE: on_shutdown() must be called before OpTracker destruction.
+  // This ensures the OpHistory service thread is stopped and all tracked
+  // operations are properly cleared before the OpTracker is destroyed.
+  // See usages in OSD::shutdown(), Monitor::shutdown(), MDSRank::~MDSRank(),
+  // and DaemonServer::~DaemonServer() for examples. This addition is a failsafe
+  history.on_shutdown();
+
   while (!sharded_in_flight_list.empty()) {
     ShardedTrackingData* sdata = sharded_in_flight_list.back();
     ceph_assert(NULL != sdata);
@@ -316,6 +328,21 @@ bool OpTracker::dump_ops_in_flight(Formatter *f, bool print_only_blocked, set<st
   return true;
 }
 
+uint64_t OpTracker::get_num_ops_in_flight()
+{
+  if (!tracking_enabled)
+    return 0;
+
+  std::shared_lock l{lock};
+  uint64_t total_ops_in_flight = 0;
+  for (uint32_t i = 0; i < num_optracker_shards; ++i) {
+    ShardedTrackingData* sdata = sharded_in_flight_list[i];
+    ceph_assert(nullptr != sdata);
+    total_ops_in_flight += sdata->ops_in_flight_count.load(std::memory_order_relaxed);
+  }
+  return total_ops_in_flight;
+}
+
 bool OpTracker::register_inflight_op(TrackedOp *i)
 {
   if (!tracking_enabled)
@@ -330,6 +357,7 @@ bool OpTracker::register_inflight_op(TrackedOp *i)
     std::lock_guard locker(sdata->ops_in_flight_lock_sharded);
     sdata->ops_in_flight_sharded.push_back(*i);
     i->seq = current_seq;
+    sdata->ops_in_flight_count.fetch_add(1, std::memory_order_relaxed);
   }
   return true;
 }
@@ -346,6 +374,7 @@ void OpTracker::unregister_inflight_op(TrackedOp* const i)
     std::lock_guard locker(sdata->ops_in_flight_lock_sharded);
     auto p = sdata->ops_in_flight_sharded.iterator_to(*i);
     sdata->ops_in_flight_sharded.erase(p);
+    sdata->ops_in_flight_count.fetch_sub(1, std::memory_order_relaxed);
   }
 }
 

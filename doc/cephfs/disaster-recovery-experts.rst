@@ -20,9 +20,8 @@ Advanced: Metadata repair tools
 .. note:: The Ceph file system must be offline before metadata repair tools can
    be used on it. The tools will complain if they are invoked when the file
    system is online. If any of the recovery steps do not complete successfully,
-   DO NOT proceeed to run any more recovery steps. If any recovery step fails,
-   seek help from experts via mailing lists and IRC channels and Slack
-   channels.
+   DO NOT proceed to run any more recovery steps. If any recovery step fails,
+   seek help from experts via mailing lists or IRC/Slack channels.
 
 Journal export
 --------------
@@ -67,6 +66,18 @@ are now in use. In simple cases, this will result in an entirely valid backing
 store state.
 
 .. warning::
+   
+    Large journal sizes can cause the tool's Resident Set Size (RSS) to spike
+    significantly. Use the ``--max-rss <bytes>`` flag to limit memory usage, keeping the following
+    in mind:
+
+    * **Performance Impact:** Do not set this value too low. Restricting memory excessively will
+        severely degrade runtime performance and prolong the recovery process.
+    * **30% Buffer Rule:** Maintain a safety buffer of at least 30% relative to the tool's total
+        memory budget. For example, if 100 GiB can be allotted to the tool, cap its RSS limit at
+        70 GiB: ``--max-rss 75161927680``.
+
+.. warning::
 
     The resulting state of the backing store is not guaranteed to be
     self-consistent, and an online MDS scrub will be required afterwards. The
@@ -90,7 +101,7 @@ file system has or had multiple active MDS daemons.
    journal data has been extracted by other means such as ``recover_dentries``.
    Resetting the journal is likely to leave orphaned objects in the data pool
    and could result in the re-allocation of already-written inodes resulting in
-   faulty behaviour of the file system (bugs, etc..).
+   faulty behavior of the file system (bugs, etc..).
 
 MDS table wipes
 ---------------
@@ -215,7 +226,7 @@ time for long running tasks.
     ceph -s
 
 The data scan tools (``scan_extents``, ``scan_inodes``, and ``scan_links``)
-will automatically report their progress to the Ceph manager if the ``cli_api``
+will automatically report their progress to the Ceph Manager if the ``cli_api``
 module is enabled. Progress updates include:
 
 - Number of objects processed and total objects
@@ -231,15 +242,15 @@ unique progress event identified by the operation name and process ID.
    to function. If progress updates are not appearing in ``ceph -s``, verify
    that:
 
-   - The ``cli_api`` manager module is enabled
+   - The ``cli_api`` Manager module is enabled
    - The ``ceph`` command is available in your PATH
    - Your ``CEPH_CONF`` environment variable (if set) points to a valid
      configuration file
 
 Progress updates will be automatically disabled if the system cannot
-communicate with the Ceph manager or if the required module is not available.
+communicate with the Ceph Manager or if the required module is not available.
 Console output will continue to show local progress information even if
-manager updates are disabled.
+Manager updates are disabled.
 
 If the root inode or MDS directory (``~mdsdir``) is missing or corrupt, run the following command: 
 
@@ -351,15 +362,17 @@ are confident that you can meet these challenges, study this list of
 limitations and pitfalls before attempting disaster recovery:
 
 #. The data-scan commands provide no way of estimating the time to completion
-   of their operation. A feature that will provide such an estimate is under
-   development. See https://tracker.ceph.com/issues/63191 for details.
+   of their operation. The ``scan_extents`` and ``scan_inodes`` steps scale
+   with the number of objects in the data pool, and ``scan_links`` iterates
+   over the metadata pool twice, so these steps can run for a very long time
+   on large file systems without giving any progress indication.
 #. It is important to perform a file system scrub after recovery before CephFS
    clients start using the file system.
 #. In general, we do not recommend that you change any MDS-related settings
    (for example, ``max_mds``) while things are broken.
-#. Disaster recovery is currently a manual process. There is a plan to automate
-   the recovery via the Disaster Recovery Super Tool. See
-   https://tracker.ceph.com/issues/71804 for details.
+#. Disaster recovery is a manual process. Each step must be chosen and run
+   by the operator according to the kind of metadata damage present; no tool
+   currently automates the sequence.
 #. A well-known trick (used by some community users) is to use the disaster
    recovery procedure (especially the ``recover_dentries`` step) when the MDS
    is somewhat stuck in the ``up_replay`` state due to a long journal. Before
@@ -402,7 +415,7 @@ at recovery since the existing metadata pool would not be modified.
 
 #. Create a recovery file system. This recovery file system will be used to
    recover the data in the damaged pool. First, the filesystem will have a data
-   pool deployed for it. Then you will attacha new metadata pool to the new
+   pool deployed for it. Then you will attach a new metadata pool to the new
    data pool. Then you will set the new metadata pool to be backed by the old
    data pool. 
 
@@ -417,7 +430,7 @@ at recovery since the existing metadata pool would not be modified.
       The ``--recover`` flag prevents any MDS daemon from joining the new file
       system.
 
-#. Create the intial metadata for the file system:
+#. Create the initial metadata for the file system:
 
    .. prompt:: bash #
 
@@ -499,9 +512,7 @@ at recovery since the existing metadata pool would not be modified.
 
    .. note::
 
-      The `Symbolic link recovery <https://tracker.ceph.com/issues/46166>`_ is
-      supported starting in the Quincy release.
-
+      Symbolic link recovery is supported starting in the Quincy release.
       Symbolic links were recovered as empty regular files before.
 
    It is recommended that you migrate any data from the recovery file system as
@@ -516,4 +527,3 @@ at recovery since the existing metadata pool would not be modified.
        data pool), the recovered files will contain holes in place of the
        missing data.
 
-.. _Symbolic link recovery: https://tracker.ceph.com/issues/46166

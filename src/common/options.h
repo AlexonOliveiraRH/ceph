@@ -167,7 +167,7 @@ struct Option {
   const level_t level;
 
   std::string desc;
-  std::string long_desc;
+  const char *long_desc = "";
 
   unsigned flags = 0;
 
@@ -434,4 +434,4 @@ constexpr unsigned long long operator""_T (unsigned long long n) {
   return n << 40;
 }
 
-const std::vector<Option>& get_ceph_options();
+extern const std::vector<Option> ceph_options;

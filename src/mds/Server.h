@@ -26,6 +26,8 @@
 #include "include/Context.h" // for C_GatherBase
 #include "include/mempool.h"
 
+#include "messages/MClientReclaimReply.h"
+
 #ifdef WITH_CRIMSON
 #include "crimson/common/perf_counters_collection.h"
 #else
@@ -71,7 +73,6 @@ class MClientRequest;
 class MClientSession;
 class MClientSnap;
 class MClientReclaim;
-class MClientReclaimReply;
 class MLock;
 class MMDSPeerRequest;
 class filepath;
@@ -111,6 +112,7 @@ enum {
   l_mdss_req_snapdiff_latency,
   l_mdss_req_rmdir_latency,
   l_mdss_req_rmsnap_latency,
+  l_mdss_req_snap_md_op_latency,
   l_mdss_req_rmxattr_latency,
   l_mdss_req_setattr_latency,
   l_mdss_req_setdirlayout_latency,
@@ -120,7 +122,6 @@ enum {
   l_mdss_req_symlink_latency,
   l_mdss_req_unlink_latency,
   l_mdss_cap_revoke_eviction,
-  l_mdss_cache_trim_throttle,
   l_mdss_session_recall_throttle,
   l_mdss_session_recall_throttle2o,
   l_mdss_global_recall_throttle,
@@ -230,7 +231,7 @@ public:
   bool _check_access(Session *session, CInode *in, unsigned mask, int caller_uid, int caller_gid, int setattr_uid, int setattr_gid);
   CDentry *prepare_stray_dentry(const MDRequestRef& mdr, CInode *in);
   CInode* prepare_new_inode(const MDRequestRef& mdr, CDir *dir, inodeno_t useino, unsigned mode,
-			    const file_layout_t *layout=nullptr, bool referent_inode=false);
+			    const file_layout_t *layout=nullptr);
   void journal_allocated_inos(const MDRequestRef& mdr, EMetaBlob *blob);
   void apply_allocated_inos(const MDRequestRef& mdr, Session *session);
 
@@ -302,12 +303,12 @@ public:
   // link
   void handle_client_link(const MDRequestRef& mdr);
   void _link_local(const MDRequestRef& mdr, CDentry *dn, CInode *targeti, SnapRealm *target_realm);
-  void _link_local_finish(const MDRequestRef& mdr, CDentry *dn, CInode *targeti, CInode *referenti,
+  void _link_local_finish(const MDRequestRef& mdr, CDentry *dn, CInode *targeti,
 			  version_t, version_t, bool);
 
-  void _link_remote(const MDRequestRef& mdr, bool inc, CDentry *dn, CInode *targeti, CDentry *straydn);
+  void _link_remote(const MDRequestRef& mdr, bool inc, CDentry *dn, CInode *targeti);
   void _link_remote_finish(const MDRequestRef& mdr, bool inc, CDentry *dn, CInode *targeti,
-                           CInode *referenti, CDentry *sd, version_t);
+			   version_t);
 
   void handle_peer_link_prep(const MDRequestRef& mdr);
   void _logged_peer_link(const MDRequestRef& mdr, CInode *targeti, bool adjust_realm);
@@ -346,7 +347,8 @@ public:
   void handle_client_rmsnap(const MDRequestRef& mdr);
   void _rmsnap_finish(const MDRequestRef& mdr, CInode *diri, snapid_t snapid);
   void handle_client_renamesnap(const MDRequestRef& mdr);
-  void _renamesnap_finish(const MDRequestRef& mdr, CInode *diri, snapid_t snapid);
+  void handle_client_snap_md_op(const MDRequestRef& mdr);
+  void _snap_mutate_generic_finish(const MDRequestRef& mdr, CInode *diri, snapid_t snapid);
   void handle_client_readdir_snapdiff(const MDRequestRef& mdr);
   void handle_client_file_blockdiff(const MDRequestRef& mdr);
   void handle_file_blockdiff_finish(const MDRequestRef& mdr, CInode *in, const BlockDiff &block_diff,
@@ -571,6 +573,7 @@ private:
     const std::string& offset_str,
     uint32_t offset_hash,
     unsigned req_flags,
+    unsigned diff_mask,
     bufferlist& dirbl);
   bool build_snap_diff(
     const MDRequestRef& mdr,
@@ -579,6 +582,7 @@ private:
     dentry_key_t* skip_key,
     snapid_t snapid_before,
     snapid_t snapid,
+    unsigned diff_mask,
     const bufferlist& dnbl,
     std::function<bool(CDentry*, CInode*, bool)> add_result_cb);
 

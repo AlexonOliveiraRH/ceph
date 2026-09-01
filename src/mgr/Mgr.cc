@@ -38,8 +38,10 @@
 
 #include "MgrContext.h"
 #include "DaemonServer.h"
+#include "JSONCommand.h"
 #include "PyModule.h"
 #include "Mgr.h"
+#include "DaemonHealthMetric.h" // for accessing DaemonState::daemon_health_metrics
 
 #include <sstream>
 
@@ -70,7 +72,8 @@ Mgr::Mgr(MonClient *monc_, const MgrMap& mgrmap,
   clog(clog_),
   audit_clog(audit_clog_),
   initialized(false),
-  initializing(false)
+  initializing(false),
+  initialization_start_time(ceph::coarse_mono_clock::zero())
 {
   cluster_state.set_objecter(objecter);
 }
@@ -78,6 +81,34 @@ Mgr::Mgr(MonClient *monc_, const MgrMap& mgrmap,
 
 Mgr::~Mgr()
 {
+}
+
+void Mgr::shutdown()
+{
+  if (initialized) {
+    AdminSocket *admin_socket = g_ceph_context->get_admin_socket();
+    admin_socket->unregister_commands(this);
+  }
+
+  finisher.wait_for_empty();
+  finisher.stop();
+
+  server.shutdown();
+}
+
+static std::string crush_hostname_for_osd(ClusterState& cluster_state, int osd_id)
+{
+  std::string hostname;
+  cluster_state.with_osdmap([&](const OSDMap& osdmap) {
+    if (osdmap.crush) {
+      auto loc = osdmap.crush->get_full_location(osd_id);
+      auto it = loc.find("host");
+      if (it != loc.end()) {
+        hostname = it->second;
+      }
+    }
+  });
+  return hostname;
 }
 
 void MetadataUpdate::finish(int r)
@@ -117,11 +148,21 @@ void MetadataUpdate::finish(int r)
 
       if (daemon_state.exists(key)) {
         DaemonStatePtr state = daemon_state.get(key);
+	// Resolve CRUSH host before taking state->lock to preserve lock ordering
+	// (Objecter::rwlock must not be acquired under state->lock)
+	std::string crush_host;
+	if (key.type == "osd") {
+	  try {
+	    crush_host = crush_hostname_for_osd(cluster_state, std::stoi(key.name));
+	  } catch (const std::exception& e) {
+	    dout(5) << "cannot derive CRUSH hostname for " << key
+		    << ": " << e.what() << dendl;
+	  }
+	}
 	std::map<string,string> m;
 	{
 	  std::lock_guard l(state->lock);
-	  state->hostname = daemon_meta.at("hostname").get_str();
-
+	  std::string reported_hostname = daemon_meta.at("hostname").get_str();
 	  if (key.type == "mds" || key.type == "mgr" || key.type == "mon") {
 	    daemon_meta.erase("name");
 	  } else if (key.type == "osd") {
@@ -131,12 +172,19 @@ void MetadataUpdate::finish(int r)
 	  for (const auto &[key, val] : daemon_meta) {
 	    m.emplace(key, val.get_str());
 	  }
+	  // prefer CRUSH physical host over container/pod hostname (tracker.ceph.com/issues/73080)
+	  // fall back to the reported hostname when CRUSH does not place the OSD
+	  // under a host bucket, and for mds/mgr/mon which don't use CRUSH
+	  m["hostname"] = !crush_host.empty() ? crush_host : reported_hostname;
 	}
+	// update_metadata calls _rm then _insert using state->hostname read from
+	// the map via set_metadata, so hostname must be set through m, not
+	// directly on state->hostname before the call (that would corrupt by_server)
 	daemon_state.update_metadata(state, m);
       } else {
         auto state = std::make_shared<DaemonState>(daemon_state.types);
         state->key = key;
-        state->hostname = daemon_meta.at("hostname").get_str();
+        std::string reported_hostname = daemon_meta.at("hostname").get_str();
 
         if (key.type == "mds" || key.type == "mgr" || key.type == "mon") {
           daemon_meta.erase("name");
@@ -149,6 +197,20 @@ void MetadataUpdate::finish(int r)
         for (const auto &[key, val] : daemon_meta) {
           m.emplace(key, val.get_str());
         }
+	// prefer CRUSH physical host over container/pod hostname (tracker.ceph.com/issues/73080)
+	// fall back to the reported hostname when CRUSH does not place the OSD
+	// under a host bucket, and for mds/mgr/mon which don't use CRUSH
+	std::string crush_host;
+	if (key.type == "osd") {
+	  try {
+	    crush_host = crush_hostname_for_osd(cluster_state,
+						std::stoi(key.name));
+	  } catch (const std::exception& e) {
+	    dout(5) << "cannot derive CRUSH hostname for " << key
+		    << ": " << e.what() << dendl;
+	  }
+	}
+	m["hostname"] = !crush_host.empty() ? crush_host : reported_hostname;
 	state->set_metadata(m);
 
         daemon_state.insert(state);
@@ -168,12 +230,21 @@ void Mgr::background_init(Context *completion)
   ceph_assert(!initializing);
   ceph_assert(!initialized);
   initializing = true;
+  initialization_start_time = ceph::coarse_mono_clock::now();
 
   finisher.start();
 
   finisher.queue(new LambdaContext([this, completion](int r){
     init();
-    completion->complete(0);
+    py_module_registry->check_all_modules_started(
+	new LambdaContext([this, completion](int){
+	  {
+	    std::lock_guard l(lock);
+	    initializing = false;
+	    initialized = true;
+	  }
+	completion->complete(0);
+      }));
   }));
 }
 
@@ -391,8 +462,6 @@ void Mgr::init()
 #endif
 
   dout(4) << "Complete." << dendl;
-  initializing = false;
-  initialized = true;
 }
 
 void Mgr::load_all_metadata()
@@ -468,12 +537,18 @@ void Mgr::load_all_metadata()
       dout(1) << "Skipping incomplete metadata entry" << dendl;
       continue;
     }
-    dout(4) << osd_metadata.at("hostname").get_str() << dendl;
 
     DaemonStatePtr dm = std::make_shared<DaemonState>(daemon_state.types);
-    dm->key = DaemonKey{"osd",
-                        stringify(osd_metadata.at("id").get_int())};
+    int osd_id = osd_metadata.at("id").get_int();
+    dm->key = DaemonKey{"osd", stringify(osd_id)};
     dm->hostname = osd_metadata.at("hostname").get_str();
+
+    // prefer CRUSH physical host over container/pod hostname (tracker.ceph.com/issues/73080)
+    std::string crush_host = crush_hostname_for_osd(cluster_state, osd_id);
+    if (!crush_host.empty()) {
+      dm->hostname = crush_host;
+    }
+    dout(4) << dm->hostname << dendl;
 
     osd_metadata.erase("id");
     osd_metadata.erase("hostname");
@@ -540,7 +615,7 @@ void Mgr::handle_osd_map()
         update_meta = true;
       }
       if (update_meta) {
-        auto c = new MetadataUpdate(daemon_state, k);
+        auto c = new MetadataUpdate(daemon_state, cluster_state, k);
         std::ostringstream cmd;
         cmd << "{\"prefix\": \"osd metadata\", \"id\": "
             << osd_id << "}";
@@ -587,7 +662,7 @@ void Mgr::handle_mon_map()
     if (daemon_state.is_updating(k)) {
       continue;
     }
-    auto c = new MetadataUpdate(daemon_state, k);
+    auto c = new MetadataUpdate(daemon_state, cluster_state, k);
     constexpr std::string_view cmd = R"({{"prefix": "mon metadata", "id": "{}"}})";
     monc->start_mon_command({fmt::format(cmd, name)}, {},
 			    &c->outbl, &c->outs, c);
@@ -612,10 +687,12 @@ Dispatcher::dispatch_result_t Mgr::ms_dispatch2(const ref_t<Message>& m)
     case CEPH_MSG_FS_MAP:
       handle_fs_map(ref_cast<MFSMap>(m));
       py_module_registry->notify_all("fs_map", "");
+      py_module_registry->notify_all("mds_metadata", "");
       return Dispatcher::ACKNOWLEDGED();
     case CEPH_MSG_OSD_MAP:
       handle_osd_map();
       py_module_registry->notify_all("osd_map", "");
+      py_module_registry->notify_all("osd_metadata", "");
 
       // Continuous subscribe, so that we can generate notifications
       // for our MgrPyModules
@@ -726,7 +803,7 @@ void Mgr::handle_fs_map(ref_t<MFSMap> m)
     }
 
     if (update) {
-      auto c = new MetadataUpdate(daemon_state, k);
+      auto c = new MetadataUpdate(daemon_state, cluster_state, k);
 
       // Older MDS daemons don't have addr in the metadata, so
       // fake it if the returned metadata doesn't have the field.
@@ -752,6 +829,7 @@ bool Mgr::got_mgr_map(const MgrMap& m)
   cluster_state.with_mgrmap([&](const MgrMap& m) {
       old_modules = m.modules;
     });
+  py_module_registry->notify_all("mgr_map", "");
   if (m.modules != old_modules) {
     derr << "mgrmap module list changed to (" << m.modules << "), respawn"
 	 << dendl;
@@ -764,17 +842,45 @@ bool Mgr::got_mgr_map(const MgrMap& m)
   return false;
 }
 
+bool Mgr::exceeded_initialization_expiration()
+{
+  // initialization_start_time=0 when initialization hasn't started yet,
+  // so know we can't have exceeded the time expiration.
+  if (ceph::coarse_mono_clock::is_zero(initialization_start_time)) {
+    return false;
+  }
+
+  // Save the amount of time elapsed
+  auto time_elapsed = ceph::coarse_mono_clock::now() - initialization_start_time;
+  dout(20) << "time elapsed since mgr initialization: " << time_elapsed << dendl;
+
+  // Reset start time if the expiration time has been exceeded.
+  // Signal initialization=true so the mgr forcibly sends an "active" beacon
+  auto expiration = g_conf().get_val<std::chrono::milliseconds>("mgr_module_load_expiration");
+  bool exceeded_expiration = time_elapsed > expiration;
+  if (exceeded_expiration) {
+    std::lock_guard l(lock);
+    initialization_start_time = ceph::coarse_mono_clock::zero();
+    initializing = false;
+    initialized = true;
+  }
+
+  return exceeded_expiration;
+}
+
 void Mgr::handle_mgr_digest(ref_t<MMgrDigest> m)
 {
   dout(10) << m->mon_status_json.length() << dendl;
   dout(10) << m->health_json.length() << dendl;
   cluster_state.load_digest(m.get());
-  //no users: py_module_registry->notify_all("mon_status", "");
+  py_module_registry->notify_all("mon_status", "");
   py_module_registry->notify_all("health", "");
 
   // Hack: use this as a tick/opportunity to prompt python-land that
   // the pgmap might have changed since last time we were here.
   py_module_registry->notify_all("pg_summary", "");
+  py_module_registry->notify_all("pg_stats", "");
+  py_module_registry->notify_all("pg_dump", "");
   dout(10) << "done." << dendl;
   m.reset();
 
@@ -802,12 +908,19 @@ int Mgr::call(
   try {
     if (admin_command == "mgr_status") {
       f->open_object_section("mgr_status");
-      cluster_state.with_mgrmap(
-	[f](const MgrMap& mm) {
-	  f->dump_unsigned("mgrmap_epoch", mm.get_epoch());
-	});
-      f->dump_bool("initialized", initialized);
+      {
+	cluster_state.with_mgrmap(
+	    [f](const MgrMap& mm) {
+	    f->dump_unsigned("mgrmap_epoch", mm.get_epoch());
+	    });
+        f->dump_bool("initialized", initialized);
+	f->open_array_section("pending_modules");
+        for (auto& mod : py_module_registry->get_pending_modules()) {
+          f->dump_string("module", mod);
+        }
+        f->close_section();
       f->close_section();
+      }
       return 0;
     } else {
       return -ENOSYS;

@@ -43,7 +43,6 @@ from ..exceptions import Error
 from ..host_facts import list_networks
 from ..net_utils import EndPoint
 
-
 logger = logging.getLogger()
 
 # sambacc provided commands we will need (when clustered)
@@ -51,6 +50,7 @@ _SCC = '/usr/bin/samba-container'
 _NODES_SUBCMD = [_SCC, 'ctdb-list-nodes']
 _MUTEX_SUBCMD = [_SCC, 'ctdb-rados-mutex']  # requires rados uri
 _ETC_SAMBA_TLS = '/etc/samba/tls'
+_WANT_SIGNAL_DIR = '/run/want_update_signal'
 
 
 class Features(enum.Enum):
@@ -58,6 +58,8 @@ class Features(enum.Enum):
     CLUSTERED = 'clustered'
     CEPHFS_PROXY = 'cephfs-proxy'
     REMOTE_CONTROL = 'remote-control'
+    REMOTE_CONTROL_LOCAL = 'remote-control-local'
+    KEYBRIDGE = 'keybridge'
 
     @classmethod
     def valid(cls, value: str) -> bool:
@@ -136,6 +138,11 @@ class Ports(enum.Enum):
         return names[self]
 
 
+class ListenTo(str, enum.Enum):
+    TCP = 'tcp'
+    UNIX = 'unix'
+
+
 @dataclasses.dataclass(frozen=True)
 class TLSFiles:
     cert: str = ''
@@ -181,6 +188,48 @@ class TLSFiles:
 class RemoteControlConfig:
     port: int
     tls_files: TLSFiles
+    listen_to: Optional[List[ListenTo]] = None
+    unix_sock_path: str = '/run/remote-control.s'
+
+    @property
+    def listen_to_tcp(self) -> bool:
+        return bool(
+            self.port
+            and (not self.listen_to or ListenTo.TCP in self.listen_to)
+        )
+
+    @property
+    def listen_to_unix(self) -> bool:
+        return bool(
+            self.unix_sock_path
+            and (self.listen_to and ListenTo.UNIX in self.listen_to)
+        )
+
+    @classmethod
+    def configure(
+        cls,
+        features: List[str],
+        service_ports: Dict,
+        tls_files: Dict[str, str],
+    ) -> Optional['RemoteControlConfig']:
+        listen_to = []
+        if Features.REMOTE_CONTROL.value in features:
+            listen_to.append(ListenTo.TCP)
+        if Features.REMOTE_CONTROL_LOCAL.value in features:
+            listen_to.append(ListenTo.UNIX)
+        if not listen_to:
+            return None
+        return cls(
+            port=Ports.REMOTE_CONTROL.customized(service_ports),
+            tls_files=TLSFiles.match(tls_files, 'remote_control'),
+            listen_to=listen_to,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class KeyBridgeConfig:
+    tls_files: TLSFiles
+    socket: str = 'unix:/run/keybridge.s'
 
 
 @dataclasses.dataclass(frozen=True)
@@ -195,6 +244,7 @@ class Config:
     debug_delay: int = 0
     join_sources: List[str] = dataclasses.field(default_factory=list)
     user_sources: List[str] = dataclasses.field(default_factory=list)
+    extra_config_uris: List[str] = dataclasses.field(default_factory=list)
     custom_dns: List[str] = dataclasses.field(default_factory=list)
     smb_port: int = 0
     ctdb_port: int = 0
@@ -213,9 +263,11 @@ class Config:
     bind_to: List[BindInterface] = dataclasses.field(default_factory=list)
     proxy_image: str = ''
     remote_control: Optional[RemoteControlConfig] = None
+    keybridge: Optional[KeyBridgeConfig] = None
 
     def config_uris(self) -> List[str]:
         uris = [self.source_config]
+        uris.extend(self.extra_config_uris or [])
         uris.extend(self.user_sources or [])
         if self.clustered:
             # When clustered, we inject certain clustering related config vars
@@ -275,6 +327,12 @@ class SambaContainerCommon(ContainerCommon):
         # variable. This can be dropped once sambacc no longer needs it,
         # possibly after the next sambacc release.
         environ['SAMBACC_CTDB'] = 'ctdb-is-experimental'
+        environ[
+            'SAMBACC_PASSWD_LOCATION'
+        ] = '/etc/passwd:/var/lib/samba/passwd:/lib/passwd'
+        environ[
+            'SAMBACC_GROUP_LOCATION'
+        ] = '/etc/group:/var/lib/samba/group:/lib/group'
         if self.cfg.ceph_config_entity:
             environ['SAMBACC_CEPH_ID'] = f'name={self.cfg.ceph_config_entity}'
         if self.cfg.rank >= 0:
@@ -316,8 +374,11 @@ class SMBDContainer(SambaContainerCommon):
         args = super().args()
         args.append('run')
         if self.cfg.clustered:
-            auth_kind = 'nsswitch' if self.cfg.domain_member else 'users'
-            args.append(f'--setup={auth_kind}')
+            if self.cfg.domain_member:
+                args.append('--setup=nsswitch')
+            else:
+                args.append('--setup=nsswitch_auto')
+                args.append('--setup=users')
             args.append('--setup=smb_ctdb')
             args.append('--wait-for=ctdb')
         args.append('smbd')
@@ -393,7 +454,17 @@ class ConfigWatchContainer(SambaContainerCommon):
         return 'configwatch'
 
     def args(self) -> List[str]:
-        return super().args() + ['update-config', '--watch']
+        args = super().args()
+        args.append('run')
+        if self.cfg.clustered:
+            if self.cfg.domain_member:
+                args.append('--setup=nsswitch')
+            else:
+                args.append('--setup=nsswitch_auto')
+            args.append('--wait-for=ctdb')
+        args.append(f'--config-watch-signal-pids-dir={_WANT_SIGNAL_DIR}')
+        args.append('configwatch')
+        return args
 
 
 class SMBMetricsContainer(ContainerCommon):
@@ -418,6 +489,16 @@ class RemoteControlContainer(SambaContainerCommon):
         assert self.cfg.remote_control, 'remote_control is not configured'
         args.append('serve')
         args.append('--grpc')
+        if self.cfg.remote_control.listen_to_tcp:
+            self._tcp_args(args)
+            if self.cfg.remote_control.listen_to_unix:
+                self._unix_extra_args(args)
+        elif self.cfg.remote_control.listen_to_unix:
+            self._unix_only_args(args)
+        return args
+
+    def _tcp_args(self, args: List[str]) -> None:
+        assert self.cfg.remote_control
         address = self.cfg.bind_to[0].address if self.cfg.bind_to else '*'
         port = self.cfg.remote_control.port
         args.append(f'--address={address}:{port}')
@@ -433,12 +514,47 @@ class RemoteControlContainer(SambaContainerCommon):
             args.append(f'--tls-key={key_path}')
             if ca_cert:
                 args.append(f'--tls-ca-cert={ca_cert}')
-        return args
+
+    def _unix_only_args(self, args: List[str]) -> None:
+        assert self.cfg.remote_control
+        sock_path = self.cfg.remote_control.unix_sock_path
+        args.append(f'--address=unix:{sock_path}')
+        args.append('--verification=rados-object')
+
+    def _unix_extra_args(self, args: List[str]) -> None:
+        assert self.cfg.remote_control
+        sock_path = self.cfg.remote_control.unix_sock_path
+        args.append(f'--extra-listener=unix:{sock_path};rados-object')
 
     def container_args(self) -> List[str]:
         return super().container_args() + [
             '--entrypoint=samba-remote-control'
         ]
+
+
+class KeyBridgeContainer(SambaContainerCommon):
+    def name(self) -> str:
+        return 'keybridge'
+
+    def args(self) -> List[str]:
+        args = super().args()
+        assert self.cfg.keybridge, 'keybridge is not configured'
+        args.append(f'--pidfile={_WANT_SIGNAL_DIR}/keybridge.pid')
+        args.append('keybridge')
+        if self.cfg.keybridge.tls_files:
+            cert_path = self.cfg.keybridge.tls_files.cert_interior_path
+            key_path = self.cfg.keybridge.tls_files.key_interior_path
+            ca_cert_path = self.cfg.keybridge.tls_files.ca_cert_interior_path
+            # all or nothing with kmip
+            assert cert_path and key_path and ca_cert_path
+            args.append(f'--kmip-tls-cert={cert_path}')
+            args.append(f'--kmip-tls-key={key_path}')
+            args.append(f'--kmip-tls-ca-cert={ca_cert_path}')
+        args.append(self.cfg.keybridge.socket)
+        return args
+
+    def container_args(self) -> List[str]:
+        return super().container_args() + ['--entrypoint=samba-satellite']
 
 
 class CephFSProxyContainer(ContainerCommon):
@@ -602,6 +718,7 @@ class SMB(ContainerDaemonForm):
         source_config = configs.get('config_uri', '')
         join_sources = configs.get('join_sources', [])
         user_sources = configs.get('user_sources', [])
+        extra_config_uris = configs.get('extra_config_uris', [])
         custom_dns = configs.get('custom_dns', [])
         instance_features = configs.get('features', [])
         files = data_utils.dict_get(configs, 'files', {})
@@ -614,6 +731,7 @@ class SMB(ContainerDaemonForm):
         cluster_lock_uri = configs.get('cluster_lock_uri', '')
         cluster_public_addrs = configs.get('cluster_public_addrs', [])
         bind_networks = configs.get('bind_networks', [])
+        tunables = configs.get('tunables', {})
 
         if not instance_id:
             raise Error('invalid instance (cluster) id')
@@ -647,13 +765,17 @@ class SMB(ContainerDaemonForm):
 
         self._organize_files(files)
 
-        if Features.REMOTE_CONTROL.value in instance_features:
-            remote_control_cfg = RemoteControlConfig(
-                port=Ports.REMOTE_CONTROL.customized(service_ports),
-                tls_files=TLSFiles.match(self._tls_files, 'remote_control'),
+        remote_control_cfg = RemoteControlConfig.configure(
+            instance_features,
+            service_ports,
+            self._tls_files,
+        )
+        if Features.KEYBRIDGE.value in instance_features:
+            keybridge_cfg = KeyBridgeConfig(
+                tls_files=TLSFiles.match(self._tls_files, 'keybridge')
             )
         else:
-            remote_control_cfg = None
+            keybridge_cfg = None
 
         rank, rank_gen = self._rank_info
         self._instance_cfg = Config(
@@ -663,6 +785,7 @@ class SMB(ContainerDaemonForm):
             source_config=source_config,
             join_sources=join_sources,
             user_sources=user_sources,
+            extra_config_uris=extra_config_uris,
             custom_dns=custom_dns,
             # major features
             domain_member=Features.DOMAIN.value in instance_features,
@@ -682,6 +805,8 @@ class SMB(ContainerDaemonForm):
             proxy_image=proxy_image,
             bind_to=self._network_mapper.bind_interfaces(bind_networks),
             remote_control=remote_control_cfg,
+            keybridge=keybridge_cfg,
+            ctdb_log_level=tunables.get('log_level.ctdb', ''),
         )
         logger.debug('SMB Instance Config: %s', self._instance_cfg)
         logger.debug('Configured files: %s', self._files)
@@ -743,6 +868,8 @@ class SMB(ContainerDaemonForm):
             )
         if self._cfg.remote_control:
             ctrs.append(RemoteControlContainer(self._cfg))
+        if self._cfg.keybridge:
+            ctrs.append(KeyBridgeContainer(self._cfg))
 
         if self._cfg.clustered:
             init_ctrs += [
@@ -806,7 +933,7 @@ class SMB(ContainerDaemonForm):
             self.identity, smb_ctr.name()
         )
         img = smb_ctr.container_image() or ctx.image or self.default_image
-        return SidecarContainer(
+        sc = SidecarContainer(
             ctx,
             entrypoint='',
             image=img,
@@ -818,6 +945,8 @@ class SMB(ContainerDaemonForm):
             init=False,
             remove=True,
         )
+        deployment_utils.enhance_container(ctx, sc)
+        return sc
 
     def container(self, ctx: CephadmContext) -> CephContainer:
         ctr = daemon_to_container(ctx, self, host_network=self._cfg.clustered)
@@ -858,6 +987,7 @@ class SMB(ContainerDaemonForm):
     def customize_container_args(
         self, ctx: CephadmContext, args: List[str]
     ) -> None:
+        args.append(ctx.container_engine.unlimited_pids_option)
         args.extend(self._layout().primary.container_args())
 
     def customize_container_mounts(
@@ -880,13 +1010,16 @@ class SMB(ContainerDaemonForm):
         if self._tls_files:
             tls_dir = str(data_dir / 'tls')
             mounts[tls_dir] = f'{_ETC_SAMBA_TLS}:z'
+        for filename in self._files or []:
+            if filename.endswith(('.ceph.conf', '.ceph.keyring')):
+                mounts[str(data_dir / filename)] = f'/etc/ceph/{filename}:z'
         if self._cfg.clustered:
             ctdb_persistent = str(data_dir / 'ctdb/persistent')
             ctdb_run = str(data_dir / 'ctdb/run')  # TODO: tmpfs too!
             ctdb_volatile = str(data_dir / 'ctdb/volatile')
             ctdb_etc = str(data_dir / 'ctdb/etc')
             mounts[ctdb_persistent] = '/var/lib/ctdb/persistent:z'
-            mounts[ctdb_run] = '/var/run/ctdb:z'
+            mounts[ctdb_run] = '/run/samba/ctdb:z'
             mounts[ctdb_volatile] = '/var/lib/ctdb/volatile:z'
             mounts[ctdb_etc] = '/etc/ctdb:z'
             # create a shared smb.conf file for our clustered instances.
@@ -941,7 +1074,7 @@ class SMB(ContainerDaemonForm):
         etc_samba_ctr = ddir / 'etc-samba-container'
         file_utils.makedirs(etc_samba_ctr, uid, gid, 0o770)
         file_utils.makedirs(ddir / 'lib-samba', uid, gid, 0o755)
-        file_utils.makedirs(ddir / 'run', uid, gid, 0o770)
+        file_utils.makedirs(ddir / 'run', uid, gid, 0o755)
         if self._files:
             file_utils.populate_files(data_dir, self._files, uid, gid)
         if self._tls_files:
@@ -953,6 +1086,8 @@ class SMB(ContainerDaemonForm):
             file_utils.makedirs(ddir / 'ctdb/run', uid, gid, 0o770)
             file_utils.makedirs(ddir / 'ctdb/volatile', uid, gid, 0o770)
             file_utils.makedirs(ddir / 'ctdb/etc', uid, gid, 0o770)
+            file_utils.makedirs(ddir / 'run/ctdb', uid, gid, 0o770)
+            file_utils.makedirs(ddir / 'lib-samba/lock/ctdb', uid, gid, 0o770)
             self._write_ctdb_stub_config(etc_samba_ctr / 'ctdb.json')
             self._write_smb_conf_stub(ddir / 'ctdb/smb.conf')
             if self._cfg.bind_to:

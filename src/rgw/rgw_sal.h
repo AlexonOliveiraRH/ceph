@@ -66,6 +66,10 @@ namespace rgw::restore {
   struct RestoreEntry;
 }
 
+namespace rgw::lua {
+  class Background;
+}
+
 class RGWGetDataCB {
 public:
   virtual int handle_data(bufferlist& bl, off_t bl_ofs, off_t bl_len) = 0;
@@ -286,6 +290,16 @@ class DataProcessorFactory {
   virtual RGWGetObj_Filter* get_filter() = 0;
   virtual bool need_copy_data() = 0;
   virtual void finalize_attrs(Attrs& attrs) { /* default implementation does nothing */ }
+
+  /*
+   * Override the accounted size for the bucket index.  Called after
+   * finalize_attrs().  Returns the logical object size when the
+   * factory knows better than the default heuristic, e.g. after
+   * decompressing data whose recompression was a no-op.
+   */
+  virtual uint64_t get_accounted_size(uint64_t default_size) {
+    return default_size;
+  }
 };
 
 /**
@@ -675,12 +689,14 @@ class Driver {
     virtual int store_oidc_provider(const DoutPrefixProvider* dpp,
                                     optional_yield y,
                                     const RGWOIDCProviderInfo& info,
-                                    bool exclusive) = 0;
+                                    bool exclusive,
+                                    RGWObjVersionTracker* objv_tracker) = 0;
     virtual int load_oidc_provider(const DoutPrefixProvider* dpp,
                                    optional_yield y,
                                    std::string_view tenant,
                                    std::string_view url,
-                                   RGWOIDCProviderInfo& info) = 0;
+                                   RGWOIDCProviderInfo& info,
+                                   RGWObjVersionTracker* objv_tracker) = 0;
     virtual int delete_oidc_provider(const DoutPrefixProvider* dpp,
                                      optional_yield y,
                                      std::string_view tenant,
@@ -1083,6 +1099,8 @@ class Bucket {
     virtual int remove_logging_object(const std::string& obj_name, const std::string& prefix, optional_yield y, const DoutPrefixProvider *dpp) = 0;
     /** Write a record to the pending bucket logging object */
     virtual int write_logging_object(const std::string& obj_name, const std::string& record, const std::string& prefix, optional_yield y, const DoutPrefixProvider *dpp, bool async_completion) = 0;
+    /** Mark this as a cache request */
+    virtual void set_cache_request() = 0;
 
     /* dang - This is temporary, until the API is completed */
     virtual rgw_bucket& get_key() = 0;
@@ -1287,7 +1305,7 @@ class Object {
     /** Create a randomized instance ID for this object */
     virtual void gen_rand_obj_instance_name() = 0;
     /** Get a multipart serializer for this object */
-    virtual std::unique_ptr<MPSerializer> get_serializer(const DoutPrefixProvider *dpp,
+    virtual std::unique_ptr<MPSerializer> get_serializer(const DoutPrefixProvider *dpp, optional_yield y,
 							 const std::string& lock_name) = 0;
     /** Move the data of an object to new placement storage */
     virtual int transition(Bucket* bucket,
@@ -1428,7 +1446,10 @@ class Object {
     virtual int omap_set_val_by_key(const DoutPrefixProvider *dpp, const std::string& key, bufferlist& val,
 				    bool must_exist, optional_yield y) = 0;
     /** Change the ownership of this object */
-    virtual int chown(User& new_user, const DoutPrefixProvider* dpp, optional_yield y) = 0;
+    virtual int chown(const DoutPrefixProvider* dpp,
+                      const rgw_owner& new_owner,
+                      const std::string& new_owner_name,
+                      optional_yield y) = 0;
 
     /** Check to see if the given object pointer is uninitialized */
     static bool empty(const Object* o) { return (!o || o->empty()); }
@@ -1451,6 +1472,8 @@ class Object {
     virtual bool have_instance(void) = 0;
     /** Clear the instance on this object */
     virtual void clear_instance() = 0;
+    /** Mark this as a cache request */
+    virtual void set_cache_request() = 0;
 
     /** Print the User to @a out */
     virtual void print(std::ostream& out) const = 0;
@@ -1537,6 +1560,9 @@ public:
   /** Get the Object that represents this upload */
   virtual std::unique_ptr<rgw::sal::Object> get_meta_obj() = 0;
 
+  /** True if this store persists per-part GCM salts; gates AEAD UploadPart salt emission. */
+  virtual bool supports_crypt_part_salts() const { return false; }
+
   /** Initialize this upload */
   virtual int init(const DoutPrefixProvider* dpp, optional_yield y, ACLOwner& owner, rgw_placement_rule& dest_placement, rgw::sal::Attrs& attrs) = 0;
   /** List all the parts of this upload, filling the parts cache */
@@ -1608,7 +1634,7 @@ public:
   virtual ~Serializer() = default;
 
   /** Try to take the lock for the given amount of time. */
-  virtual int try_lock(const DoutPrefixProvider *dpp, utime_t dur, optional_yield y) = 0;
+  virtual int try_lock(const DoutPrefixProvider *dpp, ceph::timespan dur, optional_yield y) = 0;
   /** Unlock the lock */
   virtual int unlock(const DoutPrefixProvider *dpp, optional_yield y)  = 0;
 
@@ -1825,6 +1851,8 @@ public:
   virtual const std::string& get_storage_class() = 0;
   /** Should we retain the head object when transitioning */
   virtual bool retain_head_object() = 0;
+  /** Should we retain versioned objects without creating a delete marker */
+  virtual bool retain_current_version() = 0;
   /** Is read_through allowed */
   virtual bool allow_read_through() = 0;
   /** Get read_through restore_days */
@@ -1922,6 +1950,8 @@ public:
 
   /** Get a script named with the given key from the backing store */
   virtual int get_script(const DoutPrefixProvider* dpp, optional_yield y, const std::string& key, std::string& script) = 0;
+  /** Get a copy of the lua bytecode if it exists, else the script named with the given key from the backing store */
+  virtual std::tuple<rgw::lua::LuaCodeType, int> get_script_or_bytecode(const DoutPrefixProvider* dpp, optional_yield y, const std::string& key) = 0;
   /** Put a script named with the given key to the backing store */
   virtual int put_script(const DoutPrefixProvider* dpp, optional_yield y, const std::string& key, const std::string& script) = 0;
   /** Delete a script named with the given key from the backing store */
@@ -1938,6 +1968,8 @@ public:
   virtual const std::string& luarocks_path() const = 0;
   /** Set the path to the loarocks install location **/
   virtual void set_luarocks_path(const std::string& path) = 0;
+
+  virtual void set_lua_background(rgw::lua::Background* background) = 0;
 };
 
 /** @} namespace rgw::sal in group RGWSAL */
@@ -2046,7 +2078,10 @@ public:
 
 #ifdef WITH_RADOSGW_RADOS
 std::optional<neorados::RADOS>
-make_neorados(CephContext* cct, boost::asio::io_context& io_context);
+make_neorados(
+    CephContext* cct,
+    boost::asio::io_context& io_context,
+    std::optional<std::string> objecter_admin_socket_name = std::nullopt);
 #endif
 
 /** @} */

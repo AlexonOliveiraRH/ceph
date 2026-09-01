@@ -15,7 +15,7 @@
 
 Each CephFS file system requires at least one MDS. The cluster operator will
 generally use their automated deployment tool to launch required MDS servers as
-needed.  Rook and ansible (via the ceph-ansible playbooks) are recommended
+needed.  Rook and Ansible (via the ceph-ansible playbooks) are recommended
 tools for doing this. For clarity, we also show the systemd commands here which
 may be run by the deployment technology if executed on bare-metal.
 
@@ -31,7 +31,7 @@ aggressive client loads uses about 2 to 3 CPU cores. This is due to the other
 miscellaneous upkeep threads working in tandem.
 
 Even so, it is recommended that an MDS server be well provisioned with an
-advanced CPU with sufficient cores. Development is on-going to make better use
+advanced CPU with sufficient cores. Development is ongoing to make better use
 of available CPU cores in the MDS; it is expected in future versions of Ceph
 that the MDS server will improve performance by taking advantage of more cores.
 
@@ -69,26 +69,56 @@ use available hardware within certain limits.  For the MDS, this generally
 means limiting its cache size.
 
 
+.. _manual-mds:
+
 Adding an MDS
 =============
 
-#. Create an mds directory ``/var/lib/ceph/mds/ceph-${id}``. The daemon only uses this directory to store its keyring.
 
-#. Create the authentication key, if you use CephX: ::
+In the below instructions, ``{id}`` is an arbitrary name, such as the hostname of the machine.
 
-	$ sudo ceph auth get-or-create mds.${id} mon 'profile mds' mgr 'profile mds' mds 'allow *' osd 'allow *' > /var/lib/ceph/mds/ceph-${id}/keyring
+#. Create the mds data directory.
 
-#. Start the service: ::
+   .. code:: bash
 
-	$ sudo systemctl start ceph-mds@${id}
+       mkdir -p /var/lib/ceph/mds/{cluster-name}-{id}
 
-#. The status of the cluster should show: ::
+#. Create and import the keyring.
 
-	mds: ${id}:1 {0=${id}=up:active} 2 up:standby
+   .. code:: bash
 
-#. Optionally, configure the file system the MDS should join (:ref:`mds-join-fs`): ::
+       ceph auth get-or-create mds.{id} mon "allow profile mds" mgr "allow profile mds" osd "allow rw tag cephfs *=*" mds "allow" > /var/lib/ceph/mds/{cluster-name}-{id}/keyring
 
-    $ ceph config set mds.${id} mds_join_fs ${fs}
+#. Start the daemon the manual way.
+
+   .. code:: bash
+
+       ceph-mds --cluster {cluster-name} -i {id} -m {mon-hostname}:{mon-port} [-f]
+
+#. Alternatively, start the daemon using a service manager.
+
+   .. code:: bash
+
+       sudo systemctl start ceph-mds@${id}
+
+#. If starting the daemon fails with this error:
+
+   ::
+
+       mds.-1.0 ERROR: failed to authenticate: (22) Invalid argument
+
+   Then make sure you do not have a keyring set in ceph.conf in the global
+   section; move it to the client section; or add a keyring setting specific to
+   this mds daemon. And verify that you see the same key in the mds data
+   directory and ``ceph auth get mds.{id}`` output.
+
+#. Optionally, configure the file system the MDS should join (:ref:`mds-join-fs`):
+
+   ::
+
+       $ ceph config set mds.${id} mds_join_fs ${fs}
+
+#. Now you are ready to :ref:`create-fs`.
 
 
 Removing an MDS
@@ -107,8 +137,8 @@ the following method.
 
 	$ sudo systemctl stop ceph-mds@${id}
 
-   The MDS will automatically notify the Ceph monitors that it is going down.
-   This enables the monitors to perform instantaneous failover to an available
+   The MDS will automatically notify the Ceph Monitors that it is going down.
+   This enables the Monitors to perform instantaneous failover to an available
    standby, if one exists. It is unnecessary to use administrative commands to
    effect this failover, e.g. through the use of ``ceph mds fail mds.${id}``.
 

@@ -1,10 +1,23 @@
 #!/bin/bash -x
 
+# https://tracker.ceph.com/issues/74922
+sudo systemctl stop udisks2 2>/dev/null || true
+
+source /etc/os-release
+# install nvme 2.13 (issue with latest nvme version 2.16 with centos9: https://tracker.ceph.com/issues/74615#note-5)
+if [[ "$VERSION_ID" == 9* ]]; then
+    sudo dnf install nvme-cli-2.13 libnvme-1.13 -y
+elif [[ "$VERSION_ID" == 10* ]]; then
+    # reinstall latest nvme-cli to ensure we get version 2.16+ 
+    sudo dnf remove nvme-cli -y
+    sudo dnf install nvme-cli -y
+fi
 sudo modprobe nvme-fabrics
 sudo modprobe nvme-tcp
-sudo dnf reinstall nvme-cli -y
-sudo lsmod | grep nvme
 nvme version
+sleep 20
+sudo lsmod | grep nvme
+
 
 source /etc/ceph/nvmeof.env
 SPDK_CONTROLLER="Ceph bdev Controller"
@@ -12,6 +25,7 @@ DISCOVERY_PORT="8009"
 
 discovery() {
     output=$(sudo nvme discover -t tcp -a $NVMEOF_DEFAULT_GATEWAY_IP_ADDRESS -s $DISCOVERY_PORT)
+    sleep 5
     expected_discovery_stdout="subtype: nvme subsystem"
     if ! echo "$output" | grep -q "$expected_discovery_stdout"; then
         return 1

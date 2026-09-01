@@ -33,6 +33,7 @@ export enum URLVerbs {
   /* Non-standard verbs */
   COPY = 'copy',
   CLONE = 'clone',
+  VIEW = 'view',
 
   /* Prometheus wording */
   RECREATE = 'recreate',
@@ -43,7 +44,8 @@ export enum URLVerbs {
 
   /* Multi-cluster */
   CONNECT = 'connect',
-  RECONNECT = 'reconnect'
+  RECONNECT = 'reconnect',
+  GATEWAY_GROUP = 'Gateway group'
 }
 
 export enum ActionLabels {
@@ -86,7 +88,12 @@ export enum ActionLabels {
 
   /* Multi-cluster */
   CONNECT = 'connect',
-  RECONNECT = 'reconnect'
+  RECONNECT = 'reconnect',
+  VIEW = 'View',
+
+  /* Hosts */
+  MAINTENANCE = 'Maintenance',
+  DRAIN = 'Drain'
 }
 
 @Injectable({
@@ -106,6 +113,8 @@ export class ActionLabelsI18n {
   MOVE: string;
   NEXT: string;
   BACK: string;
+  PREVIOUS: string;
+  CREATING: string;
   CHANGE: string;
   COPY: string;
   CLONE: string;
@@ -158,10 +167,12 @@ export class ActionLabelsI18n {
   DISCONNECT: string;
   RECONNECT: string;
   AUTHORIZE: string;
-  EXPAND_CLUSTER: string;
+  ADD_STORAGE: string;
   SETUP_MULTISITE_REPLICATION: string;
   NFS_EXPORT: string;
-
+  VIEW: string;
+  EDIT_GATEWAYS_GROUP: string;
+  SAVE_CHANGES: string;
   constructor() {
     /* Create a new item */
     this.CREATE = $localize`Create`;
@@ -196,6 +207,8 @@ export class ActionLabelsI18n {
     /* Wizard wording */
     this.NEXT = $localize`Next`;
     this.BACK = $localize`Back`;
+    this.PREVIOUS = $localize`Previous`;
+    this.CREATING = $localize`Creating`;
 
     /* Non-standard actions */
     this.CLONE = $localize`Clone`;
@@ -250,9 +263,12 @@ export class ActionLabelsI18n {
     this.CONNECT = $localize`Connect`;
     this.DISCONNECT = $localize`Disconnect`;
     this.RECONNECT = $localize`Reconnect`;
-    this.EXPAND_CLUSTER = $localize`Expand Cluster`;
+    this.ADD_STORAGE = $localize`Add Storage`;
 
-    this.NFS_EXPORT = $localize`Create NFS Export`;
+    this.NFS_EXPORT = $localize`Create NFS Share`;
+    this.VIEW = $localize`View`;
+    this.EDIT_GATEWAYS_GROUP = $localize`Edit gateways group`;
+    this.SAVE_CHANGES = $localize`Save changes`;
   }
 }
 
@@ -382,3 +398,9 @@ export const SSL_CIPHERS = [
 
 export const USER = 'user';
 export const VERSION_PREFIX = 'ceph version';
+
+export const CEPHFS_MIRRORING_PAGE_HEADER = {
+  title: $localize`Filesystem Mirroring`,
+  subtitle: $localize`Manage snapshot-based replication for CephFS across clusters.`,
+  description: $localize`Configure mirroring between filesystems and monitor replication status.`
+};

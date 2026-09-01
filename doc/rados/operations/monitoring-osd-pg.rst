@@ -30,7 +30,7 @@ either running and reachable (``up``), or it is not running and not
 reachable (``down``). 
 
 If an OSD is ``up``, it may be either ``in`` service (clients can read and
-write data) or it is ``out`` of service. If the OSD was ``in`` but then due to a failure or a manual action was set to the ``out`` state, Ceph will migrate placement groups to the other OSDs to maintin the configured redundancy.  
+write data) or it is ``out`` of service. If the OSD was ``in`` but then due to a failure or a manual action was set to the ``out`` state, Ceph will migrate placement groups to the other OSDs to maintain the configured redundancy.  
 
 If an OSD is ``out`` of service, CRUSH will not assign placement groups to it.
 If an OSD is ``down``, it will also be ``out``.
@@ -65,7 +65,7 @@ the cluster will **NOT** show ``HEALTH OK``:
    health statuses yet, because the PGs are in the process of being created and
    the OSDs are in the process of peering.
 #. You have just added or removed an OSD.
-#. You have just have modified your cluster map.
+#. You have just modified your cluster map.
 
 Checking to see if OSDs are ``up`` and running is an important aspect of monitoring them:
 whenever the cluster is up and running, every OSD that is ``in`` the cluster should also
@@ -551,7 +551,7 @@ performing the migration. For details, see the `Architecture`_ section.
 .. _placement group: ../placement-groups
 .. _mClock: ../../configuration/mclock-config-ref
 .. _mClock backfill: ../../configuration/mclock-config-ref#recovery-backfill-options
-.. _Architecture: ../../../architecture
+.. _Architecture: ../../../architecture/
 .. _OSD Not Running: ../../troubleshooting/troubleshooting-osd#osd-not-running
 .. _CRUSH map: ../crush-map
 .. _Configuring Monitor/OSD Interaction: ../../configuration/mon-osd-interaction/

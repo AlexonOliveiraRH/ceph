@@ -9,12 +9,16 @@
 #include "crimson/os/seastore/btree/fixed_kv_node.h"
 #include "crimson/os/seastore/lba_mapping.h"
 #include "crimson/os/seastore/logical_child_node.h"
+#include "crimson/os/seastore/lba/lba_btree_node.h"
+#include "crimson/os/seastore/backref/backref_tree_node.h"
 
 namespace {
   [[maybe_unused]] seastar::logger& logger() {
     return crimson::get_logger(ceph_subsys_seastore_tm);
   }
 }
+
+SET_SUBSYS(seastore_cache);
 
 namespace crimson::os::seastore {
 
@@ -62,9 +66,57 @@ std::ostream &operator<<(std::ostream &out, CachedExtent::extent_state_t state)
   }
 }
 
+std::ostream &operator<<(std::ostream &out, const extent_pin_state_t &s) {
+  switch (s) {
+  case extent_pin_state_t::Fresh:
+    return out << "Fresh";
+  case extent_pin_state_t::PendingPromote:
+    return out << "PendingPromote";
+  case extent_pin_state_t::Promoting:
+    return out << "Promoting";
+  case extent_pin_state_t::WarmIn:
+    return out << "WarmIn";
+  case extent_pin_state_t::Hot:
+    return out << "Hot";
+  case extent_pin_state_t::Max:
+    return out << "Max";
+  default:
+    __builtin_unreachable();
+    return out;
+  }
+}
+
 std::ostream &operator<<(std::ostream &out, const CachedExtent &ext)
 {
   return ext.print(out);
+}
+
+trans_spec_view_t::trans_spec_view_t(
+  Transaction &t) : t(&t) {}
+
+bool trans_spec_view_t::cmp_t::operator()(
+  const trans_spec_view_t &lhs,
+  const trans_spec_view_t &rhs) const
+{
+  transaction_id_t l = ((lhs.t == nullptr) ? 0 : lhs.t->get_trans_id());
+  transaction_id_t r = ((rhs.t == nullptr) ? 0 : rhs.t->get_trans_id());
+  return l < r;
+}
+
+bool trans_spec_view_t::cmp_t::operator()(
+  const transaction_id_t &lhs,
+  const trans_spec_view_t &rhs) const
+{
+  transaction_id_t r = ((rhs.t == nullptr) ? 0 : rhs.t->get_trans_id());
+  return lhs < r;
+}
+
+bool trans_spec_view_t::cmp_t::operator()(
+  const trans_spec_view_t &lhs,
+  const transaction_id_t &rhs) const
+{
+  transaction_id_t l = ((lhs.t == nullptr) ? 0 : lhs.t->get_trans_id());
+  return l < rhs;
 }
 
 CachedExtent::~CachedExtent()
@@ -100,6 +152,44 @@ CachedExtent* CachedExtent::maybe_get_transactional_view(Transaction &t) {
   }
 
   return this;
+}
+
+bool CachedExtent::is_pending_in_trans(transaction_id_t id) const {
+  auto trans_id = ((t == nullptr) ? 0 : t->get_trans_id());
+  return is_pending() && trans_id == id;
+}
+
+std::ostream &CachedExtent::print(std::ostream &out) const {
+  std::string prior_poffset_str = prior_poffset
+    ? fmt::format("{}", *prior_poffset)
+    : "nullopt";
+  out << "CachedExtent(addr=" << this
+      << ", type=" << get_type()
+      << ", trans=" << ((t == nullptr) ? 0 : t->get_trans_id())
+      << ", version=" << version
+      << ", dirty_from=" << dirty_from
+      << ", modify_time=" << sea_time_point_printer_t{modify_time}
+      << ", paddr=" << get_paddr()
+      << ", prior_paddr=" << prior_poffset_str
+      << std::hex << ", length=0x" << get_length()
+      << ", loaded=0x" << get_loaded_length() << std::dec
+      << ", state=" << state
+      << ", pin_state=" << pin_state
+      << ", last_committed_crc=" << last_committed_crc
+      << ", refcount=" << use_count()
+      << ", user_hint=" << user_hint
+      << ", write_policy=" << write_policy
+      << ", rewrite_gen=" << rewrite_gen_printer_t{rewrite_generation}
+      << ", pending_io=";
+  if (is_pending_io()) {
+    out << io_wait->from_state;
+  } else {
+    out << "N/A";
+  }
+  if (is_valid() && is_fully_loaded() && !is_stable_clean_pending()) {
+    print_detail(out);
+  }
+  return out << ")";
 }
 
 std::ostream &LogicalCachedExtent::print_detail(std::ostream &out) const
@@ -341,6 +431,243 @@ ceph::bufferptr BufferSpace::to_full_ptr(extent_len_t length)
   assert(ptr.length() == length);
   buffer_map.clear();
   return ptr;
+}
+
+void ExtentCommitter::sync_version() {
+  assert(extent.prior_instance);
+  auto &prior = *extent.prior_instance;
+  for (auto &mext : prior.mutation_pending_extents) {
+    auto &mextent = static_cast<CachedExtent&>(mext);
+    mextent.version = extent.version + 1;
+  }
+}
+
+void ExtentCommitter::sync_dirty_from() {
+  assert(extent.prior_instance);
+  auto &prior = *extent.prior_instance;
+  for (auto &mext : prior.mutation_pending_extents) {
+    auto &mextent = static_cast<CachedExtent&>(mext);
+    assert(mextent.dirty_from < extent.dirty_from ||
+      mextent.dirty_from == JOURNAL_SEQ_NULL);
+    mextent.dirty_from = extent.dirty_from;
+  }
+}
+
+void ExtentCommitter::sync_checksum() {
+  assert(extent.prior_instance);
+  auto &prior = *extent.prior_instance;
+  for (auto &mext : prior.mutation_pending_extents) {
+    auto &mextent = static_cast<CachedExtent&>(mext);
+    mextent.set_last_committed_crc(extent.last_committed_crc);
+  }
+}
+
+void ExtentCommitter::commit_data() {
+  assert(extent.prior_instance);
+  // extent and its prior are sharing the same bptr content
+  auto &prior = *extent.prior_instance;
+  prior.set_bptr(extent.get_bptr());
+  prior.on_data_commit();
+  _share_prior_data_to_mutations();
+  _share_prior_data_to_pending_versions();
+}
+
+void ExtentCommitter::commit_state() {
+  LOG_PREFIX(CachedExtent::commit_state_to_prior);
+  assert(extent.prior_instance);
+  SUBTRACET(seastore_cache, "{} prior={}",
+    t, extent, *extent.prior_instance);
+  auto &prior = *extent.prior_instance;
+  prior.t = extent.t;
+  prior.modify_time = extent.modify_time;
+  prior.last_committed_crc = extent.last_committed_crc;
+  prior.dirty_from = extent.dirty_from;
+  prior.length = extent.length;
+  // XXX: at present, zero loaded_length extents here
+  // must have been created by promoting/demoting them.
+  if (likely(extent.loaded_length != 0)) {
+    assert(prior.loaded_length == extent.loaded_length);
+    prior.buffer_space = std::move(extent.buffer_space);
+  }
+  // XXX: We can go ahead and change the prior's version because
+  // transactions don't hold a local view of the version field,
+  // unlike FixedKVLeafNode::modifications
+  prior.version = extent.version;
+  prior.user_hint = extent.user_hint;
+  prior.rewrite_generation = extent.rewrite_generation;
+  prior.state = extent.state;
+  extent.on_state_commit();
+}
+
+void ExtentCommitter::maybe_sync_copied_lba_key() {
+  ceph_assert(extent.is_logical());
+  auto &lextent = static_cast<LogicalChildNode&>(extent);
+  auto &prior = *extent.prior_instance;
+  for (auto &item : prior.read_transactions) {
+    switch (t.get_src()) {
+    case transaction_type_t::PROMOTE:
+      {
+        auto &shadow = *lextent.get_shadow();
+        item.t->maybe_sync_copied_lba_key(
+          lextent.get_laddr(),
+          lextent.get_paddr(),
+          shadow.get_paddr());
+        break;
+      }
+    case transaction_type_t::DEMOTE:
+      item.t->maybe_sync_copied_lba_key(
+        lextent.get_laddr(),
+        lextent.get_paddr(),
+        P_ADDR_NULL);
+      break;
+    default:
+      item.t->maybe_sync_copied_lba_key(
+        lextent.get_laddr(),
+        lextent.get_paddr(),
+        std::nullopt);
+      break;
+    }
+  }
+}
+
+void ExtentCommitter::commit_and_share_paddr() {
+  auto &prior = *extent.prior_instance;
+  auto old_paddr = prior.get_prior_paddr_and_reset();
+  if (prior.get_paddr() == extent.get_paddr()) {
+    return;
+  }
+  if (prior.read_transactions.empty()) {
+    prior.set_paddr(extent.get_paddr());
+    return;
+  }
+  for (auto &item : prior.read_transactions) {
+    auto [removed, retired] = item.t->pre_stable_extent_paddr_mod(item);
+    if (prior.get_paddr() != extent.get_paddr()) {
+      prior.set_paddr(extent.get_paddr());
+    }
+    item.t->post_stable_extent_paddr_mod(item, retired);
+    item.t->maybe_update_pending_paddr(
+      old_paddr, extent.get_paddr(), extent.get_length());
+  }
+}
+
+void ExtentCommitter::_share_prior_data_to_mutations() {
+  LOG_PREFIX(ExtentCommitter::_share_prior_data_to_mutations);
+  ceph_assert(is_lba_backref_node(extent.get_type()));
+  auto &prior = *extent.prior_instance;
+  for (auto &mext : prior.mutation_pending_extents) {
+    if (extent.get_type() == extent_types_t::LADDR_LEAF) {
+      // LBA leaf mappings contains other fields than just pladdr, which
+      // may also be modified. In this case, we can just overwrite the
+      // whole contents of the leaf node and reapply deltas like what
+      // we do for internal nodes.
+      auto &mextent = static_cast<lba::LBALeafNode&>(mext);
+      auto &me = static_cast<lba::LBALeafNode&>(extent);
+      TRACE("{} -> {}", me, mextent);
+      auto iter = me.begin();
+      auto merged = me.merge_content_to(t, mextent, iter);
+      mextent.adjust_delta([&](auto &buf) {
+        if (buf.op == lba::LBALeafNode::delta_t::op_t::UPDATE ||
+            // only remapping extents can create a delta with op
+            // INSERT and the corresponding mapping in "merged"
+            buf.op == lba::LBALeafNode::delta_t::op_t::INSERT) {
+          auto it = merged.find(buf.key);
+          if (it != merged.end()) {
+            TRACE("{} -> {}, {} -> {}",
+              me, mextent, (pladdr_t)buf.val.pladdr, it->second);
+            buf.val = lba::lba_map_val_le_t(it->second);
+          }
+        }
+      });
+      // "me" is the actual prev of mextent, so before mextent enters
+      // the "prepare" pipeline phase, its last_committed_crc should be
+      // that of "me"'s
+      mextent.set_last_committed_crc(me.get_last_committed_crc());
+    } else {
+      auto &mextent = static_cast<CachedExtent&>(mext);
+      TRACE("{} -> {}", extent, mextent);
+      extent.get_bptr().copy_out(
+        0, extent.get_length(), mextent.get_bptr().c_str());
+      mextent.on_data_commit();
+      mextent.reapply_delta();
+      mextent.set_last_committed_crc(extent.get_last_committed_crc());
+    }
+  }
+}
+
+void ExtentCommitter::_share_prior_data_to_pending_versions()
+{
+  ceph_assert(is_lba_backref_node(extent.get_type()));
+  auto &prior = *extent.prior_instance;
+  switch (extent.get_type()) {
+  case extent_types_t::LADDR_LEAF:
+    static_cast<lba::LBALeafNode&>(
+      prior).merge_content_to_pending_versions(t);
+    break;
+  case extent_types_t::LADDR_INTERNAL:
+    static_cast<lba::LBAInternalNode&>(prior
+      ).merge_content_to_pending_versions(t);
+    break;
+  case extent_types_t::BACKREF_INTERNAL:
+    static_cast<backref::BackrefInternalNode&>(prior
+      ).merge_content_to_pending_versions(t);
+    break;
+  default:
+    break;
+  }
+}
+
+void CachedExtent::new_committer(Transaction &t) {
+  ceph_assert(should_use_no_conflict_publish(t, this->get_type()));
+  ceph_assert(!committer);
+  committer = new ExtentCommitter(*this, t);
+  assert(prior_instance);
+  assert(!prior_instance->committer);
+  prior_instance->committer = committer;
+}
+
+void ExtentCommitter::commit_shadow_demote(Transaction &t) {
+  LOG_PREFIX(ExtentCommitter::commit_shadow_demote);
+  assert(t.get_src() == transaction_type_t::DEMOTE);
+  auto &prior = *extent.prior_instance->template cast<LogicalChildNode>();
+  auto shadow = prior.get_shadow();
+  assert(shadow);
+  for (auto &trans_view : prior.retired_transactions) {
+    assert(trans_view.t != nullptr);
+    auto view_tid = trans_view.t->get_trans_id();
+    if (view_tid == t.get_trans_id()) {
+      continue;
+    }
+    TRACET("removing shadow {} from retired_set of t.{}", t, *shadow, view_tid);
+    [[maybe_unused]] bool removed =
+      trans_view.t->remove_from_retired_set(*shadow);
+    assert(removed);
+    trans_view.t->remove_shadow_from_write_set(
+      shadow->get_paddr(), shadow->get_length());
+  }
+}
+
+void ExtentCommitter::commit_shadow_promote(Transaction &t) {
+  LOG_PREFIX(ExtentCommitter::commit_shadow_promote);
+  assert(t.get_src() == transaction_type_t::PROMOTE);
+  assert(extent.is_logical());
+  auto &lprior = static_cast<LogicalChildNode&>(*extent.prior_instance);
+  ceph_assert(lprior.get_pin_state() == extent_pin_state_t::Promoting);
+  auto &lext = static_cast<LogicalChildNode&>(extent);
+  auto shadow = lext.get_shadow();
+  assert(shadow);
+  assert(shadow->is_shadow_extent());
+  lprior.set_shadow(shadow);
+  for (auto &trans_view : lprior.retired_transactions) {
+    assert(trans_view.t != nullptr);
+    auto view_tid = trans_view.t->get_trans_id();
+    if (view_tid == t.get_trans_id()) {
+      continue;
+    }
+    TRACET("adding shadow {} from t.{}", t, *shadow, view_tid);
+    trans_view.t->add_absent_to_retired_set(shadow);
+  }
+  lprior.set_pin_state(extent_pin_state_t::Fresh);
 }
 
 }

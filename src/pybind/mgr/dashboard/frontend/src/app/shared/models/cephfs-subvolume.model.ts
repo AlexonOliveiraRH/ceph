@@ -23,6 +23,11 @@ export interface SubvolumeSnapshot {
 }
 
 export interface SubvolumeSnapshotInfo {
-  created_at: string;
-  has_pending_clones: string;
+  created_at?: string;
+  has_pending_clones?: string;
+  state?: string;
 }
+
+export const SNAPSHOT_VISIBILITY_CONFIG_NAME = 'client_respect_subvolume_snapshot_visibility';
+
+export const SNAPSHOT_VISIBILITY_CONFIG_SECTION = 'client';

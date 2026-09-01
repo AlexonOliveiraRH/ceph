@@ -273,6 +273,49 @@ export class CdValidators {
   }
 
   /**
+   * Validator for DH-HMAC-CHAP keys that must be Base64 encoded.
+   * Accepts plain Base64 or DHHC-1:XX:base64: format.
+   * Skips validation when value is empty (use with required validator if needed).
+   * @returns {ValidatorFn} Returns error map with `invalidBase64` if validation fails.
+   */
+  static base64(): ValidatorFn {
+    const plainBase64Regex = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+    const dhchapFormatRegex = /^DHHC-1:[0-9a-fA-F]{2}:[A-Za-z0-9+/]+:$/;
+    return (control: AbstractControl): { [key: string]: boolean } | null => {
+      if (isEmptyInputValue(control.value)) {
+        return null;
+      }
+      const value = control.value;
+      return plainBase64Regex.test(value) || dhchapFormatRegex.test(value)
+        ? null
+        : { invalidBase64: true };
+    };
+  }
+
+  /**
+   * Validator that checks whether the control value is a Base64 encoded JSON string.
+   * Whitespace characters are ignored. Skips validation when value is empty.
+   * @returns {ValidatorFn} Returns error map with `invalidBase64Json` if validation fails.
+   */
+  static base64Json(): ValidatorFn {
+    return (control: AbstractControl): ValidationErrors | null => {
+      const value = (control.value || '').replace(/\s/g, '');
+      if (isEmptyInputValue(value)) {
+        return null;
+      }
+      if (!/^[A-Za-z0-9+/]+=*$/.test(value)) {
+        return { invalidBase64Json: true };
+      }
+      try {
+        JSON.parse(atob(value));
+        return null;
+      } catch {
+        return { invalidBase64Json: true };
+      }
+    };
+  }
+
+  /**
    * Validate form control if condition is true with validators.
    *
    * @param {AbstractControl} formControl
@@ -292,18 +335,22 @@ export class CdValidators {
   ) {
     conditionalValidators = conditionalValidators.concat(permanentValidators);
 
-    formControl.setValidators((control: AbstractControl): {
-      [key: string]: any;
-    } => {
-      const value = condition.call(this);
-      if (value) {
-        return Validators.compose(conditionalValidators)(control);
+    formControl.setValidators(
+      (
+        control: AbstractControl
+      ): {
+        [key: string]: any;
+      } => {
+        const value = condition.call(this);
+        if (value) {
+          return Validators.compose(conditionalValidators)(control);
+        }
+        if (permanentValidators.length > 0) {
+          return Validators.compose(permanentValidators)(control);
+        }
+        return null;
       }
-      if (permanentValidators.length > 0) {
-        return Validators.compose(permanentValidators)(control);
-      }
-      return null;
-    });
+    );
 
     watchControls.forEach((control: AbstractControl) => {
       control.valueChanges.subscribe(() => {
@@ -328,8 +375,9 @@ export class CdValidators {
       if (!ctrl1 || !ctrl2) {
         return null;
       }
-      if (ctrl1.value !== ctrl2.value) {
-        ctrl2.setErrors({ match: true });
+      if (ctrl2.value && ctrl1.value !== ctrl2.value) {
+        const errors = _.merge({}, ctrl2.errors, { match: true });
+        ctrl2.setErrors(errors);
       } else {
         const hasError = ctrl2.hasError('match');
         if (hasError) {
@@ -462,6 +510,22 @@ export class CdValidators {
   }
 
   /**
+   * Validator function to ensure the entered value is a multiple of a typical block size (512 or 4096).
+   * It checks the numeric value directly against the modulo 512 calculation.
+   */
+  static blockSizeMultiple(): ValidatorFn {
+    return (control: AbstractControl): { [key: string]: boolean } | null => {
+      const value = control.value;
+      if (value !== null && value !== undefined && value !== '') {
+        if (Number(value) % 512 !== 0) {
+          return { blockSizeMultiple: true };
+        }
+      }
+      return null;
+    };
+  }
+
+  /**
    * Asynchronous validator that checks if the password meets the password
    * policy.
    * @param userServiceThis The object to be used as the 'this' object
@@ -529,7 +593,8 @@ export class CdValidators {
       let errorName: string;
       // - Bucket names cannot be formatted as IP address.
       constraints.push(() => {
-        const ipv4Rgx = /^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/i;
+        const ipv4Rgx =
+          /^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/i;
         const ipv6Rgx = /^(?:[a-f0-9]{1,4}:){7}[a-f0-9]{1,4}$/i;
         const name = control.value;
         let notIP = true;
@@ -670,7 +735,8 @@ export class CdValidators {
 
   static oauthAddressTest(): ValidatorFn {
     // Pattern matches: IPv4 addresses or hostnames (with or without dots, like 'localhost')
-    const OAUTH2_HTTPS_ADDRESS_PATTERN = /^((\d{1,3}\.){3}\d{1,3}|([a-zA-Z0-9-_]+\.)*[a-zA-Z0-9-_]+)$/;
+    const OAUTH2_HTTPS_ADDRESS_PATTERN =
+      /^((\d{1,3}\.){3}\d{1,3}|([a-zA-Z0-9-_]+\.)*[a-zA-Z0-9-_]+)$/;
     return (control: AbstractControl): Record<string, boolean> | null => {
       if (!control.value) {
         return null;

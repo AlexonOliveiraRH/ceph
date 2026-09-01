@@ -48,8 +48,7 @@ const std::map<int, std::string> MDSMap::flag_display = {
   {CEPH_MDSMAP_ALLOW_STANDBY_REPLAY, "allow_standby_replay"},
   {CEPH_MDSMAP_REFUSE_CLIENT_SESSION, "refuse_client_session"},
   {CEPH_MDSMAP_REFUSE_STANDBY_FOR_ANOTHER_FS, "refuse_standby_for_another_fs"},
-  {CEPH_MDSMAP_BALANCE_AUTOMATE, "balance_automate"},
-  {CEPH_MDSMAP_REFERENT_INODES, "allow_referent_inodes"}
+  {CEPH_MDSMAP_BALANCE_AUTOMATE, "balance_automate"}
 };
 
 MDSMap::MDSMap() noexcept = default;
@@ -257,6 +256,7 @@ void MDSMap::dump(Formatter *f) const
   f->dump_string("balancer", balancer);
   f->dump_string("bal_rank_mask", bal_rank_mask);
   f->dump_int("standby_count_wanted", std::max(0, standby_count_wanted));
+  f->dump_bool("standby_enable_host_anti_affinity", standby_enable_host_anti_affinity);
   f->dump_unsigned("qdb_leader", qdb_cluster_leader);
   f->open_array_section("qdb_cluster");
   for (auto m: qdb_cluster_members) {
@@ -275,7 +275,6 @@ void MDSMap::dump_flags_state(Formatter *f) const
     f->dump_bool(flag_display.at(CEPH_MDSMAP_REFUSE_CLIENT_SESSION), test_flag(CEPH_MDSMAP_REFUSE_CLIENT_SESSION));
     f->dump_bool(flag_display.at(CEPH_MDSMAP_REFUSE_STANDBY_FOR_ANOTHER_FS), test_flag(CEPH_MDSMAP_REFUSE_STANDBY_FOR_ANOTHER_FS));
     f->dump_bool(flag_display.at(CEPH_MDSMAP_BALANCE_AUTOMATE), test_flag(CEPH_MDSMAP_BALANCE_AUTOMATE));
-    f->dump_bool(flag_display.at(CEPH_MDSMAP_REFERENT_INODES), allow_referent_inodes());
     f->close_section();
 }
 
@@ -329,6 +328,7 @@ void MDSMap::print(ostream& out) const
   out << "balancer\t" << balancer << "\n";
   out << "bal_rank_mask\t" << bal_rank_mask << "\n";
   out << "standby_count_wanted\t" << std::max(0, standby_count_wanted) << "\n";
+  out << "standby_enable_host_anti_affinity\t" << (standby_enable_host_anti_affinity ? "true" : "false") << "\n";
   out << "qdb_cluster\tleader: " << qdb_cluster_leader << " members: " << qdb_cluster_members << std::endl;
 
   multimap< pair<mds_rank_t, unsigned>, mds_gid_t > foo;
@@ -426,8 +426,6 @@ void MDSMap::print_flags(std::ostream& out) const {
     out << " " << flag_display.at(CEPH_MDSMAP_REFUSE_STANDBY_FOR_ANOTHER_FS);
   if (test_flag(CEPH_MDSMAP_BALANCE_AUTOMATE))
     out << " " << flag_display.at(CEPH_MDSMAP_BALANCE_AUTOMATE);
-  if (allow_referent_inodes())
-    out << " " << flag_display.at(CEPH_MDSMAP_REFERENT_INODES);
 }
 
 void MDSMap::get_health(list<pair<health_status_t,string> >& summary,
@@ -815,7 +813,7 @@ void MDSMap::encode(bufferlist& bl, uint64_t features) const
   encode(data_pools, bl);
   encode(cas_pool, bl);
 
-  __u16 ev = 19;
+  __u16 ev = 20;
   encode(ev, bl);
   encode(compat, bl);
   encode(metadata_pool, bl);
@@ -846,6 +844,7 @@ void MDSMap::encode(bufferlist& bl, uint64_t features) const
   encode(max_xattr_size, bl);
   encode(qdb_cluster_leader, bl);
   encode(qdb_cluster_members, bl);
+  encode(standby_enable_host_anti_affinity, bl);
   ENCODE_FINISH(bl);
 }
 
@@ -1004,6 +1003,10 @@ void MDSMap::decode(bufferlist::const_iterator& p)
   if (ev >= 19) {
     decode(qdb_cluster_leader, p);
     decode(qdb_cluster_members, p);
+  }
+
+  if (ev >= 20) {
+    decode(standby_enable_host_anti_affinity, p);
   }
 
   /* All MDS since at least v14.0.0 understand INLINE */

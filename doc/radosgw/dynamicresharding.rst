@@ -4,8 +4,6 @@
 RGW Dynamic Bucket Index Resharding
 ===================================
 
-.. versionadded:: Luminous
-
 A bucket index object with too many entries can lead to performance
 problems. This can be addressed by resharding bucket indexes.  Until
 Luminous, changing the number of bucket shards (resharding) could only
@@ -31,7 +29,7 @@ shards more evenly.
 Detection of resharding opportunities runs as a background process
 that periodically scans all buckets. A bucket that requires resharding
 is added to a queue. A thread runs in the background and processes the
-queueued resharding tasks one at a time.
+queued resharding tasks one at a time.
 
 Starting with Tentacle, dynamic resharding has the ability to reduce
 the number of shards. Once the condition allowing reduction is noted,
@@ -183,7 +181,7 @@ Setting a Bucket's Minimum Number of Shards
 
 Since dynamic resharding can now reduce the number of shards,
 administrators may want to prevent the number of shards from becoming
-too low, for example if the expect the number of objects to increase
+too low, for example if they expect the number of objects to increase
 in the future. This command allows administrators to set a per-bucket
 minimum. This does not, however, prevent administrators from manually
 resharding to a lower number of shards.

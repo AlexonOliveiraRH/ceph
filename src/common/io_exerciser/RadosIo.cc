@@ -8,6 +8,7 @@
 #include "DataGenerator.h"
 #include "IoOp.h"
 #include "common/ceph_json.h"
+#include "common/io_exerciser/IoSequence.h"
 #include "common/json/OSDStructures.h"
 #include "librados/librados_asio.h"
 
@@ -15,6 +16,8 @@
 
 using RadosIo = ceph::io_exerciser::RadosIo;
 using ConsistencyChecker = ceph::consistency::ConsistencyChecker;
+
+using GenerationType = ceph::io_exerciser::data_generation::GenerationType;
 
 namespace {
 template <typename S>
@@ -46,18 +49,23 @@ RadosIo::RadosIo(librados::Rados& rados, boost::asio::io_context& asio,
                  const std::string& pool, const std::string& primary_oid, const std::string& secondary_oid,
                  uint64_t block_size, int seed, int threads, ceph::mutex& lock,
                  ceph::condition_variable& cond, bool is_replicated_pool,
-                 bool ec_optimizations)
-    : Model(primary_oid, secondary_oid, block_size),
+                 bool ec_optimizations, int balanced_read_percentage,
+                 GenerationType data_generation_type,
+                 std::shared_ptr<ceph::io_exerciser::IoSequence> seq, bool delete_objects)
+    : Model(primary_oid, secondary_oid, block_size, delete_objects),
       rados(rados),
       asio(asio),
-      om(std::make_unique<ObjectModel>(primary_oid, secondary_oid, block_size, seed)),
+      om(std::make_unique<ObjectModel>(primary_oid, secondary_oid, block_size, seed, delete_objects)),
       db(data_generation::DataGenerator::create_generator(
-          data_generation::GenerationType::HeaderedSeededRandom, *om)),
+          data_generation_type, *om)),
       pool(pool),
       threads(threads),
       lock(lock),
       cond(cond),
-      outstanding_io(0) {
+      outstanding_io(0),
+      seq(seq),
+      rng(seed),
+      balanced_read_percentage(balanced_read_percentage) {
   int rc;
   rc = rados.ioctx_create(pool.c_str(), io);
   ceph_assert(rc == 0);
@@ -161,6 +169,11 @@ void RadosIo::applyIoOp(IoOp& op) {
     }
 
     case OpType::Remove: {
+      if (!delete_objects) {
+        const std::string new_primary_oid = primary_oid_base + "_" + std::to_string(++num_objects);
+        set_primary_oid(new_primary_oid);
+        break;
+      }
       start_io();
       auto op_info = std::make_shared<AsyncOpInfo<0>>();
       librados::ObjectWriteOperation wop;
@@ -223,6 +236,13 @@ void RadosIo::applyIoOp(IoOp& op) {
     case OpType::FailedWrite3:
       applyReadWriteOp(op);
       break;
+    case OpType::TruncateWrite:
+      [[fallthrough]];
+    case OpType::TruncateWrite2:
+      [[fallthrough]];
+    case OpType::TruncateWrite3:
+      applyTruncateWriteOp(op);
+      break;
     case OpType::InjectReadError:
       [[fallthrough]];
     case OpType::InjectWriteError:
@@ -255,12 +275,31 @@ void RadosIo::applyReadWriteOp(IoOp& op) {
       ceph_assert(ec == boost::system::errc::success);
       for (int i = 0; i < N; i++) {
         ceph_assert(db->validate(op_info->bufferlist[i], op_info->offset[i],
-                                 op_info->length[i]));
+                                 op_info->length[i], pool,
+                                 seq ? seq->get_id() : Sequence::SEQUENCE_END,
+                                 seq ? seq->get_step() : -1));
       }
       finish_io();
     };
+
+    int flags = 0;
+    if (readOp.balanced_read.has_value()) {
+      if (*readOp.balanced_read) {
+        flags = librados::OPERATION_BALANCE_READS;
+      }
+      // Else: keep flags == 0
+    } else {
+      ceph_assert(balanced_read_percentage >= 0);
+      ceph_assert(balanced_read_percentage <= 100);
+      uint64_t range = 100;
+      uint64_t rand_value = rng();
+      int index = rand_value % range;
+      if (index <= balanced_read_percentage) {
+        flags = librados::OPERATION_BALANCE_READS;
+      }
+    }
     librados::async_operate(asio.get_executor(), io, primary_oid,
-                            std::move(rop), 0, nullptr, read_cb);
+                            std::move(rop), flags, nullptr, read_cb);
     num_io++;
   };
 
@@ -372,6 +411,59 @@ void RadosIo::applyReadWriteOp(IoOp& op) {
     default:
       ceph_abort_msg(
           fmt::format("Unsupported Read/Write operation ({})", op.getOpType()));
+      break;
+  }
+}
+
+void RadosIo::applyTruncateWriteOp(IoOp& op) {
+  auto applyTruncateWriteOp = [this]<OpType opType, int N>(
+                                  TruncateWriteOp<opType, N> truncWriteOp) {
+    auto op_info =
+        std::make_shared<AsyncOpInfo<N>>(truncWriteOp.offset, truncWriteOp.length);
+    librados::ObjectWriteOperation wop;
+    
+    // First, add the truncate operation
+    wop.truncate(truncWriteOp.size * block_size);
+    
+    // Then, add the write operations
+    for (int i = 0; i < N; i++) {
+      op_info->bufferlist[i] =
+          db->generate_data(truncWriteOp.offset[i], truncWriteOp.length[i]);
+      wop.write(truncWriteOp.offset[i] * block_size,
+                op_info->bufferlist[i]);
+    }
+    
+    auto write_cb = [this](boost::system::error_code ec, version_t ver) {
+      ceph_assert(ec == boost::system::errc::success);
+      finish_io();
+    };
+    librados::async_operate(asio.get_executor(), io, primary_oid,
+                            std::move(wop), 0, nullptr, write_cb);
+    num_io++;
+  };
+
+  switch (op.getOpType()) {
+    case OpType::TruncateWrite: {
+      start_io();
+      SingleTruncateWriteOp& truncWriteOp = static_cast<SingleTruncateWriteOp&>(op);
+      applyTruncateWriteOp(truncWriteOp);
+      break;
+    }
+    case OpType::TruncateWrite2: {
+      start_io();
+      DoubleTruncateWriteOp& truncWriteOp = static_cast<DoubleTruncateWriteOp&>(op);
+      applyTruncateWriteOp(truncWriteOp);
+      break;
+    }
+    case OpType::TruncateWrite3: {
+      start_io();
+      TripleTruncateWriteOp& truncWriteOp = static_cast<TripleTruncateWriteOp&>(op);
+      applyTruncateWriteOp(truncWriteOp);
+      break;
+    }
+    default:
+      ceph_abort_msg(
+          fmt::format("Unsupported TruncateWrite operation ({})", op.getOpType()));
       break;
   }
 }

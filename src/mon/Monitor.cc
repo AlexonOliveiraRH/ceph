@@ -37,9 +37,14 @@
 
 #include "osd/OSDMap.h"
 
+#include "health_check.h"
 #include "MonitorDBStore.h"
+#include "MonMap.h"
+#include "Paxos.h"
+#include "MonitorBackup.h"
 
 #include "messages/PaxosServiceMessage.h"
+#include "messages/MMonCommand.h"
 #include "messages/MMonMap.h"
 #include "messages/MMonGetMap.h"
 #include "messages/MMonGetVersion.h"
@@ -64,6 +69,8 @@
 #include "messages/MTimeCheck2.h"
 #include "messages/MPing.h"
 
+#include "msg/Messenger.h"
+
 #include "common/strtol.h"
 #include "common/ceph_argparse.h"
 #include "common/Timer.h"
@@ -77,6 +84,7 @@
 #include "include/color.h"
 #include "include/ceph_fs.h"
 #include "include/str_list.h"
+#include "include/util.h" // for collect_sys_info(), dump_services()
 
 #include "OSDMonitor.h"
 #include "MDSMonitor.h"
@@ -93,6 +101,7 @@
 #include "common/cmdparse.h"
 #include "include/ceph_assert.h"
 #include "include/compat.h"
+#include "mgr/DaemonHealthMetric.h"
 #include "perfglue/heap_profiler.h"
 
 #include "auth/none/AuthNoneClientHandler.h"
@@ -144,6 +153,42 @@ static ostream& _prefix(std::ostream *_dout, const Monitor *mon) {
 		<< "(" << mon->get_state_name() << ") e" << mon->monmap->get_epoch() << " ";
 }
 
+void Monitor::C_Command::_finish(int r) {
+  auto m = op->get_req<MMonCommand>();
+  if (r >= 0) {
+    std::ostringstream ss;
+    if (!op->get_req()->get_connection()) {
+      ss << "connection dropped for command ";
+    } else {
+      MonSession *s = op->get_session();
+
+      // if client drops we may not have a session to draw information from.
+      if (s) {
+	ss << "from='" << s->name << " " << s->addrs << "' "
+	   << "entity='" << s->entity_name << "' ";
+      } else {
+	ss << "session dropped for command ";
+      }
+    }
+    cmdmap_t cmdmap;
+    std::ostringstream ds;
+    std::string prefix;
+    cmdmap_from_json(m->cmd, &cmdmap, ds);
+    cmd_getval(cmdmap, "prefix", prefix);
+    if (prefix != "config set" && prefix != "config-key set")
+      ss << "cmd='" << m->cmd << "': finished";
+
+    mon.audit_clog->info() << ss.str();
+    mon.reply_command(op, rc, rs, rdata, version);
+  }
+  else if (r == -ECANCELED)
+    return;
+  else if (r == -EAGAIN)
+    mon.dispatch_op(op);
+  else
+    ceph_abort_msg("bad C_Command return value");
+}
+
 const string Monitor::MONITOR_NAME = "monitor";
 const string Monitor::MONITOR_STORE_PREFIX = "monitor_store";
 
@@ -165,6 +210,7 @@ MonCommand mon_commands[] = {
 Monitor::Monitor(CephContext* cct_, string nm, MonitorDBStore *s,
 		 Messenger *m, Messenger *mgr_m, MonMap *map) :
   Dispatcher(cct_),
+  KeyServer(cct, &keyring),
   AuthServer(cct_),
   name(nm),
   rank(-1), 
@@ -177,13 +223,8 @@ Monitor::Monitor(CephContext* cct_, string nm, MonitorDBStore *s,
   logger(NULL), cluster_logger(NULL), cluster_logger_registered(false),
   monmap(map),
   log_client(cct_, messenger, monmap, LogClient::FLAG_MON),
-  key_server(cct, &keyring),
-  auth_cluster_required(cct,
-			cct->_conf->auth_supported.empty() ?
-			cct->_conf->auth_cluster_required : cct->_conf->auth_supported),
-  auth_service_required(cct,
-			cct->_conf->auth_supported.empty() ?
-			cct->_conf->auth_service_required : cct->_conf->auth_supported),
+  auth_cluster_required(cct, cct->_conf.get_val<std::string>("auth_cluster_required")),
+  auth_service_required(cct, cct->_conf.get_val<std::string>("auth_service_required")),
   mgr_messenger(mgr_m),
   mgr_client(cct_, mgr_m, monmap),
   gss_ktfile_client(cct->_conf.get_val<std::string>("gss_ktab_client_file")),
@@ -251,7 +292,7 @@ Monitor::Monitor(CephContext* cct_, string nm, MonitorDBStore *s,
   paxos_service[PAXOS_MONMAP].reset(new MonmapMonitor(*this, *paxos, "monmap"));
   paxos_service[PAXOS_OSDMAP].reset(new OSDMonitor(cct, *this, *paxos, "osdmap"));
   paxos_service[PAXOS_LOG].reset(new LogMonitor(*this, *paxos, "logm"));
-  paxos_service[PAXOS_AUTH].reset(new AuthMonitor(*this, *paxos, "auth"));
+  paxos_service[PAXOS_AUTH].reset(new AuthMonitor(cct, *this, *paxos, "auth"));
   paxos_service[PAXOS_MGR].reset(new MgrMonitor(*this, *paxos, "mgr"));
   paxos_service[PAXOS_MGRSTAT].reset(new MgrStatMonitor(*this, *paxos, "mgrstat"));
   paxos_service[PAXOS_HEALTH].reset(new HealthMonitor(*this, *paxos, "health"));
@@ -505,7 +546,11 @@ will start to track new ops received afterwards.";
 	    << duration << " seconds" << dendl;
     out << "compacted " << g_conf().get_val<std::string>("mon_keyvaluedb")
 	<< " in " << duration << " seconds";
- } else {
+  } else if (command == "backup") {
+    r = perform_backup();
+  } else if (command == "backup_cleanup") {
+    r = cleanup_backup();
+  } else {
     ceph_abort_msg("bad AdminSocket command binding");
   }
   (read_only ? audit_clog->debug() : audit_clog->info())
@@ -522,6 +567,40 @@ abort:
     << "cmd=" << command << " "
     << "args=" << args << ": aborted";
   return r;
+}
+
+int Monitor::perform_backup()
+{
+  std::string backup_path = g_conf().get_val<string>("mon_backup_path");
+  dout(1) << "triggering backup" << dendl;
+  if (backup_path.empty()) {
+    derr << "backup failed: mon_backup_path is empty" << dendl;
+    return -ENOTDIR;
+  }
+  if (!backup_manager) {
+    derr << "backup failed: monitor still initializing" << dendl;
+    return -EAGAIN;
+  }
+  uint64_t jobid = backup_manager->backup();
+  dout(1) << "queued backup job id " << jobid << dendl;
+  return 0;
+}
+
+int Monitor::cleanup_backup()
+{
+  std::string backup_path = g_conf().get_val<string>("mon_backup_path");
+  dout(1) << "triggering backup_cleanup" << dendl;
+  if (backup_path.empty()) {
+    derr << "backup_cleanup failed: mon_backup_path is empty" << dendl;
+    return -ENOTDIR;
+  }
+  if (!backup_manager) {
+    derr << "backup_cleanup failed: monitor still initializing" << dendl;
+    return -EAGAIN;
+  }
+  uint64_t jobid = backup_manager->cleanup();
+  dout(1) << "queued backup cleanup job id " << jobid << dendl;
+  return 0;
 }
 
 void Monitor::handle_signal(int signum)
@@ -564,8 +643,10 @@ CompatSet Monitor::get_supported_features()
   compat.incompat.insert(CEPH_MON_FEATURE_INCOMPAT_REEF);
   compat.incompat.insert(CEPH_MON_FEATURE_INCOMPAT_SQUID);
   compat.incompat.insert(CEPH_MON_FEATURE_INCOMPAT_TENTACLE);
+  compat.incompat.insert(CEPH_MON_FEATURE_INCOMPAT_UMBRELLA);
 
   // Release-independent features
+  compat.incompat.insert(CEPH_MON_FEATURE_INCOMPAT_CEPHX_AUTH_AES256K);
   compat.incompat.insert(CEPH_MON_FEATURE_INCOMPAT_NVMEOF_BEACON_DIFF);
   return compat;
 }
@@ -780,6 +861,56 @@ int Monitor::preinit()
         "ewon", PerfCountersBuilder::PRIO_INTERESTING);
     pcb.add_u64_counter(l_mon_election_lose, "election_lose", "Elections lost",
         "elst", PerfCountersBuilder::PRIO_INTERESTING);
+    pcb.add_u64(l_mon_backup_running, "backup_running", "Mon backup process is running",
+        nullptr, PerfCountersBuilder::PRIO_USEFUL);
+    pcb.add_u64_counter(l_mon_backup_started, "backup_started", "Mon backups started",
+        nullptr, PerfCountersBuilder::PRIO_INTERESTING);
+    pcb.add_u64_counter(l_mon_backup_success, "backup_success", "Mon backups finished successfully",
+        nullptr, PerfCountersBuilder::PRIO_USEFUL);
+    pcb.add_u64_counter(l_mon_backup_failed, "backup_failed", "Mon backups failed",
+        nullptr, PerfCountersBuilder::PRIO_USEFUL);
+    pcb.add_time_avg(l_mon_backup_duration, "backup_duration", "Mon backup duration",
+        nullptr, PerfCountersBuilder::PRIO_USEFUL);
+    pcb.add_time(l_mon_backup_last_success, "backup_last_success", "Last successful mon backup",
+        nullptr, PerfCountersBuilder::PRIO_USEFUL);
+    pcb.add_u64(l_mon_backup_last_success_id, "backup_last_success_id", "Last successful mon backup id",
+        nullptr, PerfCountersBuilder::PRIO_INTERESTING);
+    pcb.add_time(l_mon_backup_last_failed, "backup_last_failed", "Last failed mon backup",
+        nullptr, PerfCountersBuilder::PRIO_USEFUL);
+    pcb.add_u64(l_mon_backup_last_size, "backup_last_size", "Last backup size",
+        nullptr, PerfCountersBuilder::PRIO_INTERESTING);
+    pcb.add_u64(l_mon_backup_last_files, "backup_last_files", "Last backup file numbers",
+        nullptr, PerfCountersBuilder::PRIO_INTERESTING);
+    pcb.add_u64_counter(l_mon_backup_cleanup_started, "backup_cleanup_started", "Mon backup cleanup started",
+        nullptr, PerfCountersBuilder::PRIO_INTERESTING);
+    pcb.add_u64(l_mon_backup_cleanup_running, "backup_cleanup_running", "Mon backup cleanup is running",
+        nullptr, PerfCountersBuilder::PRIO_INTERESTING);
+    pcb.add_u64_counter(l_mon_backup_cleanup_success, "backup_cleanup_success", "Mon backup cleanup finished successfully",
+        nullptr, PerfCountersBuilder::PRIO_USEFUL);
+    pcb.add_u64_counter(l_mon_backup_cleanup_failed, "backup_cleanup_failed", "Mon backup cleanup failed",
+        nullptr, PerfCountersBuilder::PRIO_USEFUL);
+    pcb.add_u64(l_mon_backup_cleanup_size, "backup_cleanup_size", "Size of backups removed",
+        nullptr, PerfCountersBuilder::PRIO_INTERESTING);
+    pcb.add_u64(l_mon_backup_cleanup_kept, "backup_cleanup_kept", "Number of backups kept after cleanup",
+        nullptr, PerfCountersBuilder::PRIO_INTERESTING);
+    pcb.add_time_avg(l_mon_backup_cleanup_duration, "backup_cleanup_duration", "Mon backup cleanup duration",
+        nullptr, PerfCountersBuilder::PRIO_INTERESTING);
+    pcb.add_u64(l_mon_backup_cleanup_freed, "backup_cleanup_freed", "Mon backup cleanup freed size in bytes",
+        nullptr, PerfCountersBuilder::PRIO_INTERESTING);
+    pcb.add_u64(l_mon_backup_cleanup_deleted, "backup_cleanup_deleted", "Mon backup cleanup deleted backups",
+        nullptr, PerfCountersBuilder::PRIO_INTERESTING);
+    pcb.add_u64(l_mon_data_disk_total_bytes, "data_disk_total_bytes",
+        "Total size of the filesystem hosting the monitor data directory",
+        "dtot", PerfCountersBuilder::PRIO_USEFUL, unit_t(UNIT_BYTES));
+    pcb.add_u64(l_mon_data_disk_avail_bytes, "data_disk_avail_bytes",
+        "Available space on the filesystem hosting the monitor data directory",
+        "davb", PerfCountersBuilder::PRIO_USEFUL, unit_t(UNIT_BYTES));
+    pcb.add_u64(l_mon_data_disk_avail_percent, "data_disk_avail_percent",
+        "Available space on the filesystem hosting the monitor data directory, as a percentage",
+        "dpct", PerfCountersBuilder::PRIO_USEFUL);
+    pcb.add_u64(l_mon_db_total_bytes, "db_total_bytes",
+        "Estimated on-disk size of the monitor key/value store",
+        "dbsz", PerfCountersBuilder::PRIO_USEFUL, unit_t(UNIT_BYTES));
     logger = pcb.create_perf_counters();
     cct->get_perfcounters_collection()->add(logger);
   }
@@ -892,7 +1023,7 @@ int Monitor::preinit()
         // Attempt to decode and extract keyring only if it is found.
         KeyRing keyring;
         auto p = bl.cbegin();
-        decode(keyring, p);
+        ::decode(keyring, p);
         extract_save_mon_key(keyring);
       }
     }
@@ -904,7 +1035,7 @@ int Monitor::preinit()
       EntityName mon_name;
       mon_name.set_type(CEPH_ENTITY_TYPE_MON);
       EntityAuth mon_key;
-      if (key_server.get_auth(mon_name, mon_key)) {
+      if (get_auth(mon_name, mon_key)) {
 	dout(1) << "copying mon. key from old db to external keyring" << dendl;
 	keyring.add(mon_name, mon_key);
 	bufferlist bl;
@@ -938,6 +1069,13 @@ int Monitor::preinit()
 				       command.helpstring);
     ceph_assert(r == 0);
   }
+  r = admin_socket->register_command("backup", admin_hook,
+				     "create a backup of the mon database");
+  ceph_assert(r == 0);
+  r = admin_socket->register_command(
+    "backup_cleanup", admin_hook,
+    "delete old mon database backups according to retention config");
+  ceph_assert(r == 0);
   l.lock();
 
   // add ourselves as a conf observer
@@ -956,6 +1094,23 @@ int Monitor::init()
 {
   dout(2) << "init" << dendl;
   std::lock_guard l(lock);
+
+  auto emergency_ciphers = cct->_conf.get_val<std::string>("mon_auth_emergency_allowed_ciphers");
+  if (!emergency_ciphers.empty()) {
+    std::vector<std::string> v;
+    std::vector<int> ciphers;
+    get_str_vec(emergency_ciphers, ", ", v);
+    for (auto& cipher : v) {
+      int c = CryptoManager::get_key_type(cipher);
+      if (c < 0) {
+        lderr(cct) << "init: invalid cipher: " << cipher << dendl;
+        continue;
+      }
+      ciphers.push_back(c);
+    }
+    std::lock_guard lock{cipher_mutex};
+    my_allowed_ciphers = std::move(ciphers);
+  }
 
   finisher.start();
 
@@ -986,6 +1141,9 @@ int Monitor::init()
 
   // add features of myself into feature_map
   session_map.feature_map.add_mon(con_self->get_features());
+
+  backup_manager = std::make_unique<MonitorBackupManager>(cct, this);
+
   return 0;
 }
 
@@ -1011,7 +1169,7 @@ void Monitor::refresh_from_paxos(bool *need_bootstrap)
   if (r >= 0) {
     try {
       auto p = bl.cbegin();
-      decode(fingerprint, p);
+      ::decode(fingerprint, p);
     }
     catch (ceph::buffer::error& e) {
       dout(10) << __func__ << " failed to decode cluster_fingerprint" << dendl;
@@ -1080,6 +1238,9 @@ void Monitor::shutdown()
     cct->get_admin_socket()->unregister_commands(admin_hook);
     delete admin_hook;
     admin_hook = NULL;
+  }
+  if (backup_manager) {
+    backup_manager->stop();
   }
 
   elector.shutdown();
@@ -1286,6 +1447,7 @@ void Monitor::bootstrap()
 
   // probe monitors
   dout(10) << "probing other monitors" << dendl;
+  ++probe_epoch;
   for (unsigned i = 0; i < monmap->size(); i++) {
     if ((int)i != rank)
       send_mon_message(
@@ -1764,7 +1926,7 @@ void Monitor::handle_sync_get_chunk(MonOpRequestRef op)
     sync_providers.erase(sp.cookie);
   }
 
-  encode(*tx, reply->chunk_bl);
+  ::encode(*tx, reply->chunk_bl);
 
   m->get_connection()->send_message(reply);
 }
@@ -2252,6 +2414,21 @@ epoch_t Monitor::get_epoch()
   return elector.get_epoch();
 }
 
+std::string Monitor::get_leader_name() {
+  return quorum.empty() ? std::string() : monmap->get_name(leader);
+}
+
+std::list<std::string> Monitor::get_quorum_names() {
+  std::list<std::string> q;
+  for (auto p = quorum.begin(); p != quorum.end(); ++p)
+    q.push_back(monmap->get_name(*p));
+  return q;
+}
+
+mon_feature_t Monitor::get_required_mon_features() const {
+  return monmap->get_required_features();
+}
+
 void Monitor::_finish_svc_election()
 {
   ceph_assert(state == STATE_LEADER || state == STATE_PEON);
@@ -2319,7 +2496,7 @@ void Monitor::win_election(epoch_t epoch, const set<int>& active, uint64_t featu
     // do that anyway for other reasons, though.
     MonitorDBStore::TransactionRef t = paxos->get_pending_transaction();
     bufferlist bl;
-    encode(m, bl);
+    ::encode(m, bl);
     t->put(MONITOR_STORE_PREFIX, "last_metadata", bl);
   }
   elector.process_pending_pings();
@@ -2575,6 +2752,13 @@ void Monitor::apply_monmap_to_compatset_features()
     ceph_assert(HAVE_FEATURE(quorum_con_features, SERVER_TENTACLE));
     new_features.incompat.insert(CEPH_MON_FEATURE_INCOMPAT_TENTACLE);
   }
+  if (monmap_features.contains_all(ceph::features::mon::FEATURE_UMBRELLA)) {
+    ceph_assert(ceph::features::mon::get_persistent().contains_all(
+           ceph::features::mon::FEATURE_UMBRELLA));
+    // this feature should only ever be set if the quorum supports it.
+    ceph_assert(HAVE_FEATURE(quorum_con_features, SERVER_UMBRELLA));
+    new_features.incompat.insert(CEPH_MON_FEATURE_INCOMPAT_UMBRELLA);
+  }
 
 
   // Release-independent features
@@ -2582,8 +2766,12 @@ void Monitor::apply_monmap_to_compatset_features()
     ceph_assert(ceph::features::mon::get_persistent().contains_all(
            ceph::features::mon::FEATURE_NVMEOF_BEACON_DIFF));
     // this feature should only ever be set if the quorum supports it.
-    ceph_assert(HAVE_FEATURE(quorum_con_features, NVMEOF_BEACON_DIFF));
     new_features.incompat.insert(CEPH_MON_FEATURE_INCOMPAT_NVMEOF_BEACON_DIFF);
+  }
+  if (monmap_features.contains_all(ceph::features::mon::FEATURE_CEPHX_AUTH_AES256K)) {
+    ceph_assert(ceph::features::mon::get_persistent().contains_all(ceph::features::mon::FEATURE_CEPHX_AUTH_AES256K));
+    // this feature should only ever be set if the quorum supports it.
+    new_features.incompat.insert(CEPH_MON_FEATURE_INCOMPAT_CEPHX_AUTH_AES256K);
   }
 
   dout(5) << __func__ << dendl;
@@ -2629,6 +2817,9 @@ void Monitor::calc_quorum_requirements()
   if (features.incompat.contains(CEPH_MON_FEATURE_INCOMPAT_TENTACLE)) {
     required_features |= CEPH_FEATUREMASK_SERVER_TENTACLE;
   }
+  if (features.incompat.contains(CEPH_MON_FEATURE_INCOMPAT_UMBRELLA)) {
+    required_features |= CEPH_FEATUREMASK_SERVER_UMBRELLA;
+  }
 
   // monmap
   if (monmap->get_required_features().contains_all(
@@ -2647,12 +2838,6 @@ void Monitor::calc_quorum_requirements()
 	ceph::features::mon::FEATURE_NAUTILUS)) {
     required_features |= CEPH_FEATUREMASK_SERVER_NAUTILUS |
       CEPH_FEATUREMASK_CEPHX_V2;
-  }
-
-  // Release-independent features
-  if (monmap->get_required_features().contains_all(
-	ceph::features::mon::FEATURE_NVMEOF_BEACON_DIFF)) {
-    required_features |= CEPH_FEATUREMASK_NVMEOF_BEACON_DIFF;
   }
 
   dout(10) << __func__ << " required_features " << required_features << dendl;
@@ -2989,6 +3174,10 @@ void Monitor::log_health(
   const auto min_log_period = g_conf().get_val<int64_t>(
       "mon_health_log_update_period");
   for (auto& p : updated.checks) {
+    if (healthmon()->is_muted(p.first)) {
+      continue;
+    }
+
     auto q = previous.checks.find(p.first);
     bool logged = false;
     if (q == previous.checks.end()) {
@@ -4200,14 +4389,14 @@ void Monitor::forward_request_leader(MonOpRequestRef op)
 struct AnonConnection : public Connection {
   entity_addr_t socket_addr;
 
-  int send_message(Message *m) override {
-    ceph_abort_msg("send_message on anonymous connection");
-  }
   void send_keepalive() override {
     ceph_abort_msg("send_keepalive on anonymous connection");
   }
   void mark_down() override {
     // silently ignore
+  }
+  void shutdown() override {
+    // silengtly ignore
   }
   void mark_disposable() override {
     // silengtly ignore
@@ -4215,6 +4404,11 @@ struct AnonConnection : public Connection {
   bool is_connected() override { return false; }
   entity_addr_t get_peer_socket_addr() const override {
     return socket_addr;
+  }
+
+protected:
+  int send_msg(MessageRef&& m) override {
+    ceph_abort_msg("send_message on anonymous connection");
   }
 
 private:
@@ -4719,6 +4913,7 @@ void Monitor::dispatch_op(MonOpRequestRef op)
     case MSG_REMOVE_SNAPS:
     case MSG_MON_GET_PURGED_SNAPS:
     case MSG_OSD_PG_READY_TO_MERGE:
+    case MSG_OSD_PG_STOP_MERGE:
       paxos_service[PAXOS_OSDMAP]->dispatch(op);
       return;
 
@@ -4904,7 +5099,7 @@ void Monitor::handle_ping(MonOpRequestRef op)
   f->close_section();
   stringstream ss;
   f->flush(ss);
-  encode(ss.str(), payload);
+  ::encode(ss.str(), payload);
   reply->set_payload(payload);
   dout(10) << __func__ << " reply payload len " << reply->get_payload().length() << dendl;
   m->get_connection()->send_message(reply);
@@ -5362,6 +5557,34 @@ void Monitor::handle_subscribe(MonOpRequestRef op)
        ++p) {
     if (p->first == "monmap" || p->first == "config") {
       // these require no caps
+    } else if (p->first.starts_with("mdsmap") || p->first.starts_with("fsmap")) {
+      if (!s->is_capable("mds", MON_CAP_R)) {
+        dout(5) << __func__ << " " << op->get_req()->get_source_inst()
+                << " not enough caps for " << p->first << " -- dropping"
+                << dendl;
+        continue;
+      }
+    } else if (p->first == "osdmap") {
+      if (!s->is_capable("osd", MON_CAP_R)) {
+        dout(5) << __func__ << " " << op->get_req()->get_source_inst()
+                << " not enough caps for " << p->first << " -- dropping"
+                << dendl;
+        continue;
+      }
+    } else if (p->first == "osd_pg_creates") {
+      if (!s->is_capable("osd", MON_CAP_W)) {
+        dout(5) << __func__ << " " << op->get_req()->get_source_inst()
+                << " not enough caps for " << p->first << " -- dropping"
+                << dendl;
+        continue;
+      }
+    } else if (p->first.starts_with("kv:")) {
+      if (!s->is_capable("config-key", MON_CAP_R)) {
+        dout(5) << __func__ << " " << op->get_req()->get_source_inst()
+                << " not enough caps for " << p->first << " -- dropping"
+                << dendl;
+        continue;
+      }
     } else if (!s->is_capable("mon", MON_CAP_R)) {
       dout(5) << __func__ << " " << op->get_req()->get_source_inst()
 	      << " not enough caps for " << *(op->get_req()) << " -- dropping"
@@ -5393,25 +5616,19 @@ void Monitor::handle_subscribe(MonOpRequestRef op)
 				 m->get_connection()->has_feature(CEPH_FEATURE_INCSUBOSDMAP));
     }
 
-    if (p->first.compare(0, 6, "mdsmap") == 0 || p->first.compare(0, 5, "fsmap") == 0) {
+    if (p->first.starts_with("mdsmap") || p->first.starts_with("fsmap")) {
       dout(10) << __func__ << ": MDS sub '" << p->first << "'" << dendl;
-      if ((int)s->is_capable("mds", MON_CAP_R)) {
-        Subscription *sub = s->sub_map[p->first];
-        ceph_assert(sub != nullptr);
-        mdsmon()->check_sub(sub);
-      }
+      Subscription *sub = s->sub_map[p->first];
+      ceph_assert(sub != nullptr);
+      mdsmon()->check_sub(sub);
     } else if (p->first == "osdmap") {
-      if ((int)s->is_capable("osd", MON_CAP_R)) {
-	if (s->osd_epoch > p->second.start) {
-	  // client needs earlier osdmaps on purpose, so reset the sent epoch
-	  s->osd_epoch = 0;
-	}
-        osdmon()->check_osdmap_sub(s->sub_map["osdmap"]);
+      if (s->osd_epoch > p->second.start) {
+        // client needs earlier osdmaps on purpose, so reset the sent epoch
+        s->osd_epoch = 0;
       }
+      osdmon()->check_osdmap_sub(s->sub_map["osdmap"]);
     } else if (p->first == "osd_pg_creates") {
-      if ((int)s->is_capable("osd", MON_CAP_W)) {
-	osdmon()->check_pg_creates_sub(s->sub_map["osd_pg_creates"]);
-      }
+      osdmon()->check_pg_creates_sub(s->sub_map["osd_pg_creates"]);
     } else if (p->first == "monmap") {
       monmon()->check_sub(s->sub_map[p->first]);
     } else if (logmon()->sub_name_to_id(p->first) >= 0) {
@@ -5422,7 +5639,7 @@ void Monitor::handle_subscribe(MonOpRequestRef op)
       mgrstatmon()->check_sub(s->sub_map[p->first]);
     } else if (p->first == "config") {
       configmon()->check_sub(s);
-    } else if (p->first.find("kv:") == 0) {
+    } else if (p->first.starts_with("kv:")) {
       kvmon()->check_sub(s->sub_map[p->first]);
     }
     else if (p->first == "NVMeofGw") {
@@ -5545,7 +5762,7 @@ int Monitor::load_metadata()
   if (r)
     return r;
   auto it = bl.cbegin();
-  decode(mon_metadata, it);
+  ::decode(mon_metadata, it);
 
   pending_metadata = mon_metadata;
   return 0;
@@ -5973,6 +6190,11 @@ void Monitor::tick()
 
       for (const auto &i : health.checks) {
         const std::string &code = i.first;
+
+        if (healthmon()->is_muted(code)) {
+          continue;
+        }
+
         const std::string &summary = i.second.summary;
         const health_status_t severity = i.second.severity;
 
@@ -6055,6 +6277,7 @@ void Monitor::tick()
     prepare_new_fingerprint(t);
     paxos->trigger_propose();
   }
+  backup_manager->tick();
 
   mgr_client.update_daemon_health(get_health_metrics());
   new_tick();
@@ -6093,6 +6316,13 @@ vector<DaemonHealthMetric> Monitor::get_health_metrics()
   return metrics;
 }
 
+bool Monitor::is_mon_down() const {
+  int max = monmap->size();
+  int actual = get_quorum().size();
+  auto now = ceph::real_clock::now();
+  return actual < max && now > monmap->created.to_real_time();
+}
+
 void Monitor::prepare_new_fingerprint(MonitorDBStore::TransactionRef t)
 {
   uuid_d nf;
@@ -6100,7 +6330,7 @@ void Monitor::prepare_new_fingerprint(MonitorDBStore::TransactionRef t)
   dout(10) << __func__ << " proposing cluster_fingerprint " << nf << dendl;
 
   bufferlist bl;
-  encode(nf, bl);
+  ::encode(nf, bl);
   t->put(MONITOR_NAME, "cluster_fingerprint", bl);
 }
 
@@ -6353,6 +6583,10 @@ int Monitor::handle_auth_bad_method(
 {
   derr << __func__ << " hmm, they didn't like " << old_auth_method
        << " result " << cpp_strerror(result) << dendl;
+  if (con->get_peer_type() == CEPH_ENTITY_TYPE_MON) {
+    /* this is hacky but the least invasive way to cycle secrets: */
+    cycle_mon_secret = probe_epoch;
+  }
   return -EACCES;
 }
 
@@ -6390,13 +6624,22 @@ bool Monitor::get_authorizer(int service_id, AuthAuthorizer **authorizer)
   if (service_id == CEPH_ENTITY_TYPE_MON) {
     // mon to mon authentication uses the private monitor shared key and not the
     // rotating key
-    CryptoKey secret;
-    if (!keyring.get_secret(name, secret) &&
-	!key_server.get_secret(name, secret)) {
+    CryptoKey key_server_secret;
+    CryptoKey keyring_secret;
+
+    bool ksb = get_secret(name, key_server_secret);
+    if (ksb) {
+      dout(30) << __func__ << ": keyserver found secret=" << key_server_secret << dendl;
+    }
+    bool krb = keyring.get_secret(name, keyring_secret);
+    if (krb) {
+      dout(30) << __func__ << ": keyring found secret=" << keyring_secret << dendl;
+    }
+    if (!ksb && !krb) {
       dout(0) << " couldn't get secret for mon service from keyring or keyserver"
 	      << dendl;
       stringstream ss, ds;
-      int err = key_server.list_secrets(ds);
+      int err = list_secrets(ds);
       if (err < 0)
 	ss << "no installed auth entries!";
       else
@@ -6405,8 +6648,21 @@ bool Monitor::get_authorizer(int service_id, AuthAuthorizer **authorizer)
       return false;
     }
 
-    ret = key_server.build_session_auth_info(
-      service_id, auth_ticket_info.ticket, secret, (uint64_t)-1, info);
+    CryptoKey secret;
+    dout(30) << __func__ << ": cycle_mon_secret=" << cycle_mon_secret << dendl;
+    if ((((cycle_mon_secret & 1) == 0) && ksb) || !krb) {
+      /* Use KeyServer if present (it should be because Monitor::key_server's
+       * extra_secrets **is** the Monitor::keyring.
+       */
+      dout(15) << __func__ << ": using key_server secret" << dendl;
+      secret = key_server_secret;
+    } else {
+      dout(15) << __func__ << ": using keyring secret" << dendl;
+      secret = keyring_secret;
+    }
+
+    ret = build_session_auth_info(
+      service_id, auth_ticket_info.ticket, secret, (uint64_t)-1, secret.get_type(), info);
     if (ret < 0) {
       dout(0) << __func__ << " failed to build mon session_auth_info "
 	      << cpp_strerror(ret) << dendl;
@@ -6414,8 +6670,8 @@ bool Monitor::get_authorizer(int service_id, AuthAuthorizer **authorizer)
     }
   } else if (service_id == CEPH_ENTITY_TYPE_MGR) {
     // mgr
-    ret = key_server.build_session_auth_info(
-      service_id, auth_ticket_info.ticket, info);
+    ret = build_session_auth_info(
+      service_id, auth_ticket_info.ticket, std::nullopt, info);
     if (ret < 0) {
       derr << __func__ << " failed to build mgr service session_auth_info "
 	   << cpp_strerror(ret) << dendl;
@@ -6431,11 +6687,11 @@ bool Monitor::get_authorizer(int service_id, AuthAuthorizer **authorizer)
     return false;
   }
   bufferlist ticket_data;
-  encode(blob, ticket_data);
+  ::encode(blob, ticket_data);
 
   auto iter = ticket_data.cbegin();
   CephXTicketHandler handler(g_ceph_context, service_id);
-  decode(handler.ticket, iter);
+  ::decode(handler.ticket, iter);
 
   handler.session_key = info.session_key;
 
@@ -6485,9 +6741,10 @@ int Monitor::handle_auth_request(
       return -EOPNOTSUPP;
     }
     bool was_challenge = (bool)auth_meta->authorizer_challenge;
+    dout(20) << __func__ << ": verify authorizer was_challenge=" << was_challenge << dendl;
     bool isvalid = ah->verify_authorizer(
       cct,
-      keyring,
+      use_mon_keyring ? static_cast<KeyStore&>(keyring) : static_cast<KeyStore&>(*this),
       payload,
       auth_meta->get_connection_secret_length(),
       reply,
@@ -6533,7 +6790,7 @@ int Monitor::handle_auth_request(
 
     // handler?
     unique_ptr<AuthServiceHandler> auth_handler{get_auth_service_handler(
-      auth_method, g_ceph_context, &key_server)};
+      auth_method, g_ceph_context, this)};
     if (!auth_handler) {
       dout(1) << __func__ << " auth_method " << auth_method << " not supported"
 	      << dendl;
@@ -6544,19 +6801,24 @@ int Monitor::handle_auth_request(
     EntityName entity_name;
 
     try {
-      decode(mode, p);
+      ::decode(mode, p);
       if (mode < AUTH_MODE_MON ||
 	  mode > AUTH_MODE_MON_MAX) {
 	dout(1) << __func__ << " invalid mode " << (int)mode << dendl;
 	return -EACCES;
       }
       ceph_assert(mode >= AUTH_MODE_MON && mode <= AUTH_MODE_MON_MAX);
-      decode(entity_name, p);
-      decode(con->peer_global_id, p);
+      ::decode(entity_name, p);
+      ::decode(con->peer_global_id, p);
     } catch (ceph::buffer::error& e) {
       dout(1) << __func__ << " failed to decode, " << e.what() << dendl;
       return -EACCES;
     }
+    dout(15) << __func__ << ": decoded"
+            << " mode=" << mode
+            << " entity_name=" << entity_name
+            << " con->peer_global_id=" << con->peer_global_id
+            << dendl;
 
     // supported method?
     if (entity_name.get_type() == CEPH_ENTITY_TYPE_MON ||
@@ -6596,6 +6858,8 @@ int Monitor::handle_auth_request(
     s = new MonSession(con);
     s->auth_handler = auth_handler.release();
     con->set_priv(RefCountedPtr{s, false});
+
+    dout(20) << __func__ << ": starting session: " << *s << dendl;
 
     r = s->auth_handler->start_session(
       entity_name,
@@ -6693,7 +6957,7 @@ bool Monitor::ms_handle_fast_authentication(Connection *con)
 	   << " addr " << s->con->get_peer_addr()
 	   << " " << *s << dendl;
 
-  AuthCapsInfo &caps_info = con->get_peer_caps_info();
+  auto& caps_info = con->get_peer_caps_info();
   if (caps_info.allow_all) {
     s->caps.set_allow_all();
     s->authenticated = true;
@@ -6702,7 +6966,7 @@ bool Monitor::ms_handle_fast_authentication(Connection *con)
     bufferlist::const_iterator p = caps_info.caps.cbegin();
     string str;
     try {
-      decode(str, p);
+      ::decode(str, p);
     } catch (const ceph::buffer::error &err) {
       derr << __func__ << " corrupt cap data for " << con->get_peer_entity_name()
 	   << " in auth db" << dendl;
@@ -6734,6 +6998,9 @@ void Monitor::set_mon_crush_location(const string& loc)
 
 void Monitor::notify_new_monmap(bool can_change_external_state, bool remove_rank_elector)
 {
+  dout(20) << __func__
+           << ": can_change_external_state=" << can_change_external_state
+           << " remove_rank_elector=" << remove_rank_elector << dendl;
   if (need_set_crush_loc) {
     auto my_info_i = monmap->mon_info.find(name);
     if (my_info_i != monmap->mon_info.end() &&
@@ -6776,6 +7043,22 @@ void Monitor::notify_new_monmap(bool can_change_external_state, bool remove_rank
     }
   }
   set_elector_disallowed_leaders(can_change_external_state);
+
+  {
+    std::lock_guard lock{cipher_mutex};
+    my_service_cipher = monmap->auth_service_cipher;
+    dout(20) << __func__ << ": my_service_cipher now " << my_service_cipher << dendl;
+    auto emergency_ciphers = cct->_conf.get_val<std::string>("mon_auth_emergency_allowed_ciphers");
+    if (emergency_ciphers.empty()) {
+      my_allowed_ciphers = monmap->auth_allowed_ciphers;
+      dout(20) << __func__ << ": auth_allowed_ciphers now " << my_allowed_ciphers << dendl;
+    } else {
+      dout(20) << __func__
+               << ": mon_auth_emergency_allowed_ciphers (" << my_allowed_ciphers
+               << ") overrides MonMap::auth_allowed_ciphers (" << monmap->auth_allowed_ciphers << ")"
+               << dendl;
+    }
+  }
 }
 
 void Monitor::set_elector_disallowed_leaders(bool allow_election)
@@ -7102,4 +7385,41 @@ void Monitor::disconnect_disallowed_stretch_sessions()
     ++i;
     session_stretch_allowed(*j, blank);
   }
+}
+
+int Monitor::get_service_cipher() const
+{
+  dout(30) << __func__ << dendl;
+  int cipher;
+  {
+    std::lock_guard lock{cipher_mutex};
+    cipher = my_service_cipher;
+  }
+  dout(30) << __func__ << ": = " << cipher << dendl;
+  return cipher;
+}
+
+bool Monitor::is_cipher_allowed(int cipher) const
+{
+  dout(30) << __func__ << ": " << CryptoManager::get_key_type_name(cipher) << dendl;
+  bool found;
+  {
+    std::lock_guard lock{cipher_mutex};
+    auto it = std::find(my_allowed_ciphers.begin(), my_allowed_ciphers.end(), cipher);
+    found = (it != my_allowed_ciphers.end());
+  }
+  dout(30) << __func__ << ": = " << found << dendl;
+  return found;
+}
+
+std::vector<int> Monitor::get_ciphers_allowed() const
+{
+  dout(30) << __func__ << dendl;
+  std::vector<int> ciphers;
+  {
+    std::lock_guard lock{cipher_mutex};
+    ciphers = my_allowed_ciphers;
+  }
+  dout(30) << __func__ << ": = " << ciphers << dendl;
+  return ciphers;
 }

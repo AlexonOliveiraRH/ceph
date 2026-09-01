@@ -32,7 +32,7 @@ class LCDBSerializer : public StoreLCSerializer {
 public:
   LCDBSerializer(DBStore* store, const std::string& oid, const std::string& lock_name, const std::string& cookie) {}
 
-  virtual int try_lock(const DoutPrefixProvider *dpp, utime_t dur, optional_yield y) override { return 0; }
+  virtual int try_lock(const DoutPrefixProvider *dpp, ceph::timespan dur, optional_yield y) override { return 0; }
   virtual int unlock(const DoutPrefixProvider* dpp, optional_yield y) override {
     return 0;
   }
@@ -217,6 +217,7 @@ protected:
     virtual bool allow_read_through() { return tier.allow_read_through; }
     virtual uint64_t get_read_through_restore_days() { return tier.read_through_restore_days; }
     virtual bool retain_head_object() { return tier.retain_head_object; }
+    virtual bool retain_current_version() { return tier.retain_current_version; }
     RGWZoneGroupPlacementTier& get_rt() { return tier; }
   };
 
@@ -330,6 +331,9 @@ protected:
 
     /** Get a script named with the given key from the backing store */
     virtual int get_script(const DoutPrefixProvider* dpp, optional_yield y, const std::string& key, std::string& script) override;
+    /** Get a ref to the Lua bytecode if it exists, else the script named with the given key from the backing store */
+    virtual std::tuple<rgw::lua::LuaCodeType, int> get_script_or_bytecode(const DoutPrefixProvider* dpp, optional_yield y,
+                                                                          const std::string& key) override;
     /** Put a script named with the given key to the backing store */
     virtual int put_script(const DoutPrefixProvider* dpp, optional_yield y, const std::string& key, const std::string& script) override;
     /** Delete a script named with the given key from the backing store */
@@ -342,6 +346,7 @@ protected:
     virtual int list_packages(const DoutPrefixProvider* dpp, optional_yield y, rgw::lua::packages_t& packages) override;
     /** Reload lua packages */
     virtual int reload_packages(const DoutPrefixProvider* dpp, optional_yield y) override;
+
   };
 
   /*
@@ -585,6 +590,7 @@ protected:
         return std::unique_ptr<Object>(new DBObject(*this));
       }
       virtual std::unique_ptr<MPSerializer> get_serializer(const DoutPrefixProvider *dpp,
+							   optional_yield y,
 							   const std::string& lock_name) override;
       virtual int transition(Bucket* bucket,
           const rgw_placement_rule& placement_rule,
@@ -614,7 +620,10 @@ protected:
           Attrs* vals) override;
       virtual int omap_set_val_by_key(const DoutPrefixProvider *dpp, const std::string& key, bufferlist& val,
           bool must_exist, optional_yield y) override;
-      virtual int chown(User& new_user, const DoutPrefixProvider* dpp, optional_yield y) override;
+      virtual int chown(const DoutPrefixProvider* dpp,
+                        const rgw_owner& new_owner,
+                        const std::string& new_owner_name,
+                        optional_yield y) override;
     private:
       int read_attrs(const DoutPrefixProvider* dpp, DB::Object::Read &read_op, optional_yield y, rgw_obj* target_obj = nullptr);
   };
@@ -624,8 +633,8 @@ protected:
   public:
     MPDBSerializer(const DoutPrefixProvider *dpp, DBStore* store, DBObject* obj, const std::string& lock_name) {}
 
-    virtual int try_lock(const DoutPrefixProvider *dpp, utime_t dur, optional_yield y) override {return 0; }
-    virtual int unlock(const DoutPrefixProvider* dpp, optional_yield y) override { return 0;}
+    virtual int try_lock(const DoutPrefixProvider *dpp, ceph::timespan dur, optional_yield y) override;
+    virtual int unlock(const DoutPrefixProvider* dpp, optional_yield y) override;
   };
 
   class DBAtomicWriter : public StoreWriter {
@@ -990,12 +999,14 @@ public:
       int store_oidc_provider(const DoutPrefixProvider *dpp,
                               optional_yield y,
                               const RGWOIDCProviderInfo& info,
-                              bool exclusive) override;
+                              bool exclusive,
+                              RGWObjVersionTracker* objv_tracker) override;
       int load_oidc_provider(const DoutPrefixProvider *dpp,
                              optional_yield y,
                              std::string_view tenant,
                              std::string_view url,
-                             RGWOIDCProviderInfo& info) override;
+                             RGWOIDCProviderInfo& info,
+                             RGWObjVersionTracker* objv_tracker) override;
       int delete_oidc_provider(const DoutPrefixProvider *dpp,
                                optional_yield y,
                                std::string_view tenant,

@@ -49,7 +49,7 @@ Alternatively, you may use the ``CEPH_ARGS`` environment variable to avoid
 re-entry of the user name and secret.
 
 For details on configuring the Ceph Storage Cluster to use authentication, see
-:ref:`rados-cephx-config-ref`. For details on the architecture of Cephx, see
+:ref:`rados-cephx-config-ref`. For details on the architecture of CephX, see
 :ref:`arch_high_availability_authentication`.
 
 Background
@@ -60,7 +60,7 @@ Storage, Filesystem, native API), Ceph stores all data as RADOS objects within
 :ref:`rados_pools`.  Ceph users must have access to a given pool in order to read and
 write data, and Ceph users must have execute permissions in order to use Ceph's
 administrative commands. The following concepts will help you understand
-Ceph['s] user management.
+Ceph's user management.
 
 .. _rados-ops-user:
 
@@ -72,10 +72,10 @@ Creating users allows you to control who (or what) can access your Ceph Storage
 Cluster, its pools, and the data within those pools.
 
 Ceph has the concept of a ``type`` of user. For purposes of user management,
-the type will always be ``client``. Ceph identifies users in a "period-
-delimited form" that consists of the user type and the user ID: for example,
+the type will always be ``client``. Ceph identifies users in a "period-delimited
+form" that consists of the user type and the user ID: for example,
 ``TYPE.ID``, ``client.admin``, or ``client.user1``. The reason for user typing
-is that the Cephx protocol is used not only by clients but also non-clients,
+is that the CephX protocol is used not only by clients but also non-clients,
 such as Ceph Monitors, OSDs, and Metadata Servers. Distinguishing the user type
 helps to distinguish between client users and other users. This distinction
 streamlines access control, user monitoring, and traceability.
@@ -222,8 +222,8 @@ The following entries describe access capabilities.
 
 ``class-read``
 
-:Descriptions: Gives the user the capability to call class read methods.
-               Subset of ``x``.
+:Description: Gives the user the capability to call class read methods.
+              Subset of ``x``.
 
 
 ``class-write``
@@ -252,6 +252,15 @@ The following entries describe valid capability profiles:
 
 :Description: Gives a user permissions to connect as an MDS to other MDSs or
               monitors.
+
+
+``profile rgw`` (Manager, Monitor, and OSD)
+
+:Description: Gives a user permissions to connect as a Ceph Object Gateway.
+              Conferred on RGWs in order to enable them to create and tune
+              their pools, read maps and pool stats, and read ``config-key``
+              keys under the ``rgw/`` prefix. OSD access is limited to pools
+              tagged with the ``rgw`` application.
 
 
 ``profile bootstrap-osd`` (Monitor only)

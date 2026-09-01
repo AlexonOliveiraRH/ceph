@@ -9,6 +9,7 @@ set(crimson_seastore_srcs
   transaction_manager.cc
   cache.cc
   extent_pinboard.cc
+  logical_bucket.cc
   root_block.cc
   lba_manager.cc
   async_cleaner.cc
@@ -20,6 +21,8 @@ set(crimson_seastore_srcs
   omap_manager.cc
   omap_manager/btree/btree_omap_manager.cc
   omap_manager/btree/omap_btree_node_impl.cc
+  omap_manager/log/log_node.cc
+  omap_manager/log/log_manager.cc
   onode.cc
   onode_manager/staged-fltree/node.cc
   onode_manager/staged-fltree/node_extent_manager.cc
@@ -43,6 +46,7 @@ set(crimson_seastore_srcs
   random_block_manager/block_rb_manager.cc
   random_block_manager/rbm_device.cc
   random_block_manager/nvme_block_device.cc
+  random_block_manager/hdd_device.cc
   random_block_manager/avlallocator.cc
   journal/segmented_journal.cc
   journal/segment_allocator.cc

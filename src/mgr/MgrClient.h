@@ -63,6 +63,8 @@ protected:
   Messenger *msgr;
   MonMap *monmap;
 
+  bool dead = false;
+
   std::unique_ptr<MgrSessionState> session;
 
   ceph::mutex lock = ceph::make_mutex("MgrClient::lock");
@@ -109,6 +111,7 @@ protected:
 
 public:
   MgrClient(CephContext *cct_, Messenger *msgr_, MonMap *monmap);
+  ~MgrClient();
 
   void set_messenger(Messenger *msgr_) { msgr = msgr_; }
 

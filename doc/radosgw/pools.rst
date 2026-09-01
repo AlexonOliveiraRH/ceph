@@ -1,3 +1,5 @@
+.. _radosgw-pools:
+
 =====
 Pools
 =====
@@ -22,8 +24,6 @@ pool creation.
 
 Pool Namespaces
 ===============
-
-.. versionadded:: Luminous
 
 Pool names particular to a zone follow the naming convention
 ``{zone-name}.pool-name``. For example, a zone named ``us-east`` will

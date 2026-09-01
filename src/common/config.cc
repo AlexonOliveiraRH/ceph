@@ -137,7 +137,7 @@ md_config_t::md_config_t(ConfigValues& values,
 {
   // Load the compile-time list of Option into
   // a map so that we can resolve keys quickly.
-  for (const auto &i : get_ceph_options()) {
+  for (const auto &i : ceph_options) {
     if (schema.count(i.name)) {
       // We may be instantiated pre-logging so send 
       std::cerr << "Duplicate config key in schema: '" << i.name << "'"
@@ -708,6 +708,8 @@ int md_config_t::parse_argv(ConfigValues& values,
       if (r >= 0) {
 	string k(bl.c_str(), bl.length());
 	set_val_or_die(values, tracker, "key", k.c_str());
+      } else {
+        std::cerr << "cannot read keyfile: " << cpp_strerror(r) << std::endl;
       }
     }
     else if (ceph_argparse_witharg(args, i, &val, "--keyring", "-k", (char*)NULL)) {

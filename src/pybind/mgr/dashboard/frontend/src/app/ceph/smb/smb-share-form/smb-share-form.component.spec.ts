@@ -5,12 +5,13 @@ import { SharedModule } from '~/app/shared/shared.module';
 import { HttpClientTestingModule } from '@angular/common/http/testing';
 import { RouterTestingModule } from '@angular/router/testing';
 import { ReactiveFormsModule, Validators } from '@angular/forms';
-import { ToastrModule } from 'ngx-toastr';
+
 import {
   CheckboxModule,
   ComboBoxModule,
   GridModule,
   InputModule,
+  NumberModule,
   SelectModule
 } from 'carbon-components-angular';
 import { SmbService } from '~/app/shared/api/smb.service';
@@ -28,9 +29,9 @@ describe('SmbShareFormComponent', () => {
         HttpClientTestingModule,
         RouterTestingModule,
         ReactiveFormsModule,
-        ToastrModule.forRoot(),
         GridModule,
         InputModule,
+        NumberModule,
         SelectModule,
         ComboBoxModule,
         CheckboxModule
@@ -41,6 +42,7 @@ describe('SmbShareFormComponent', () => {
 
     fixture = TestBed.createComponent(SmbShareFormComponent);
     component = fixture.componentInstance;
+    component.ngOnInit();
     fixture.detectChanges();
   });
 
@@ -49,7 +51,6 @@ describe('SmbShareFormComponent', () => {
   });
 
   it('should create the form', () => {
-    component.ngOnInit();
     expect(component.smbShareForm).toBeDefined();
     expect(component.smbShareForm.get('share_id')).toBeTruthy();
     expect(component.smbShareForm.get('volume')).toBeTruthy();
@@ -89,9 +90,52 @@ describe('SmbShareFormComponent', () => {
       prefixedPath: '/volumes/fs1/group1/subvol1',
       inputPath: '/',
       browseable: true,
-      readonly: false
+      readonly: false,
+      read_iops_limit: 0,
+      write_iops_limit: 0,
+      read_bw_limit: 0,
+      read_bw_limit_unit: 'MiB',
+      write_bw_limit: 0,
+      write_bw_limit_unit: 'MiB',
+      read_burst_mult: 15,
+      write_burst_mult: 15
     });
     component.submitAction();
     expect(component).toBeTruthy();
+  });
+
+  describe('QoS', () => {
+    it('should have QoS form controls with default values', () => {
+      expect(component.smbShareForm.get('read_iops_limit')).toBeTruthy();
+      expect(component.smbShareForm.get('write_iops_limit')).toBeTruthy();
+      expect(component.smbShareForm.get('read_bw_limit')).toBeTruthy();
+      expect(component.smbShareForm.get('read_bw_limit_unit')).toBeTruthy();
+      expect(component.smbShareForm.get('write_bw_limit')).toBeTruthy();
+      expect(component.smbShareForm.get('write_bw_limit_unit')).toBeTruthy();
+      expect(component.smbShareForm.get('read_burst_mult')).toBeTruthy();
+      expect(component.smbShareForm.get('write_burst_mult')).toBeTruthy();
+      expect(component.smbShareForm.get('read_iops_limit').value).toBe(0);
+      expect(component.smbShareForm.get('write_burst_mult').value).toBe(15);
+    });
+
+    it('should include QoS fields in buildRequest when set', () => {
+      component.clusterId = 'cluster1';
+      component.smbShareForm.patchValue({
+        share_id: 'share1',
+        name: 'My Share',
+        volume: 'fs1',
+        inputPath: '/',
+        read_iops_limit: 1000,
+        write_iops_limit: 500,
+        read_bw_limit: 100,
+        read_bw_limit_unit: 'MiB',
+        write_burst_mult: 60
+      });
+      const request = component.buildRequest();
+      expect(request.share_resource.cephfs.qos.read_iops_limit).toBe(1000);
+      expect(request.share_resource.cephfs.qos.write_iops_limit).toBe(500);
+      expect(request.share_resource.cephfs.qos.read_bw_limit).toBe(100 * 1024 * 1024);
+      expect(request.share_resource.cephfs.qos.write_burst_mult).toBe(60);
+    });
   });
 });

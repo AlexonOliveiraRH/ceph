@@ -25,7 +25,8 @@ are installed automatically by the bootstrap process below.
 
 See `Docker Live Restore <https://docs.docker.com/engine/daemon/live-restore/>`_
 for an optional feature that allows restarting Docker Engine without restarting
-all running containers.
+all running containers. See :ref:`cephadm-docker-live-restore` for details on
+how cephadm integrates with Docker Engine to facilitate the Live Restore feature.
 
 See the section :ref:`Compatibility With Podman
 Versions<cephadm-compatibility-with-podman>` for a table of Ceph versions that
@@ -149,6 +150,7 @@ packages that provide the ``cephadm`` command, run the following commands:
 #. Add the repository:
 
    .. prompt:: bash #
+      :substitutions:
 
       ./cephadm add-repo --release |stable-release|
 
@@ -170,6 +172,7 @@ packages that provide the ``cephadm`` command, run the following commands:
 
      /usr/sbin/cephadm
 
+.. _cephadm_bootstrap_a_new_cluster:
 
 Bootstrap a New Cluster
 =======================
@@ -450,8 +453,8 @@ of two kinds of custom container registry can be used in this scenario: (1) a
 Podman-based or Docker-based insecure registry, or (2) a secure registry.
 
 The practice of installing software on systems that are not connected directly
-to the internet is called "airgapping" and registries that are not connected
-directly to the internet are referred to as "airgapped".
+to the Internet is called "airgapping" and registries that are not connected
+directly to the Internet are referred to as "airgapped".
 
 Make sure that your container image is inside the registry. Make sure that you
 have access to all hosts that you plan to add to the cluster.
@@ -487,7 +490,7 @@ have access to all hosts that you plan to add to the cluster.
       mgr/cephadm/container_image_prometheus = <hostname>:5000/prometheus
       mgr/cephadm/container_image_node_exporter = <hostname>:5000/node_exporter
       mgr/cephadm/container_image_grafana = <hostname>:5000/grafana
-      mgr/cephadm/container_image_alertmanager = <hostname>:5000/alertmanger
+      mgr/cephadm/container_image_alertmanager = <hostname>:5000/alertmanager
       EOF
 
 #. Run bootstrap using the temporary configuration file and pass the name of your

@@ -2,15 +2,15 @@
  Troubleshooting OSDs
 ======================
 
-Before troubleshooting the cluster's OSDs, check the monitors
+Before troubleshooting the cluster's OSDs, check the Monitors
 and the network. 
 
-First, determine whether the monitors have a quorum. Run the ``ceph health``
-command or the ``ceph -s`` command and if Ceph shows ``HEALTH_OK`` then there
-is a monitor quorum. 
+First, determine whether the Monitors have a quorum. Run the ``ceph health``
+command or the ``ceph -s`` command, and if Ceph shows ``HEALTH_OK``, then there
+is a Monitor quorum. 
 
-If the monitors don't have a quorum or if there are errors with the monitor
-status, address the monitor issues before proceeding by consulting the material
+If the Monitors don't have a quorum or if there are errors with the Monitor
+status, address the Monitor issues before proceeding by consulting the material
 in :ref:`rados-troubleshooting-mon`.
 
 Next, check your networks to make sure that they are running properly. Networks
@@ -225,7 +225,7 @@ If the cluster has started but an OSD isn't starting, check the following:
 
      kernel.pid_max = 4194303
 
-- **Check ``nf_conntrack``:** This connection-tracking and connection-limiting
+- **Check nf_conntrack:** This connection-tracking and connection-limiting
   system causes problems for many production Ceph clusters. The problems often
   emerge slowly and subtly. As cluster topology and client workload grow,
   mysterious and intermittent connection failures and performance glitches
@@ -252,15 +252,15 @@ If the cluster has started but an OSD isn't starting, check the following:
   release notes for each Ceph version in order to make sure that you have
   addressed any issues related to your kernel.
 
-- **Segment Fault:** If there is a segment fault, increase log levels and
-  restart the problematic daemon(s). If segment faults recur, search the Ceph
-  bug tracker `https://tracker.ceph/com/projects/ceph
+- **Segmentation Fault:** If there is a segmentation fault, increase log levels and
+  restart the problematic daemon(s). If segmentation faults recur, search the Ceph
+  bug tracker `https://tracker.ceph.com/projects/ceph
   <https://tracker.ceph.com/projects/ceph/>`_ and the ``dev`` and
   ``ceph-users`` mailing list archives `https://ceph.io/resources
   <https://ceph.io/resources>`_ to see if others have experienced and reported
   these issues. If this truly is a new and unique failure, post to the ``dev``
   email list and provide the following information: the specific Ceph release
-  being run, ``ceph.conf`` (with secrets XXX'd out), your monitor status
+  being run, ``ceph.conf`` (with secrets XXX'd out), your Monitor status
   output, and excerpts from your log file(s).
 
 
@@ -269,7 +269,7 @@ An OSD Failed
 
 When an OSD fails, this means that a ``ceph-osd`` process is unresponsive or
 has died and that the corresponding OSD has been marked ``down``. Surviving
-``ceph-osd`` daemons will report to the monitors that the OSD appears to be
+``ceph-osd`` daemons will report to the Monitors that the OSD appears to be
 down, and a new status will be visible in the output of the ``ceph health``
 command, as in the following example:
 
@@ -316,7 +316,7 @@ error or a hardware issue with the host.
 
 If the OSD problem is the result of a software error (for example, a failed
 assertion or another unexpected error), search for reports of the issue in the
-`bug tracker <https://tracker.ceph/com/projects/ceph>`_ , the `dev mailing list
+`bug tracker <https://tracker.ceph.com/projects/ceph>`_, the `dev mailing list
 archives <https://lists.ceph.io/hyperkitty/list/dev@ceph.io/>`_, and the
 `ceph-users mailing list archives
 <https://lists.ceph.io/hyperkitty/list/ceph-users@ceph.io/>`_.  If there is no
@@ -330,7 +330,7 @@ No Free Drive Space
 -------------------
 
 If an OSD is full, Ceph prevents data loss by ensuring that no new data is
-written to the OSD. In an properly running cluster, health checks are raised
+written to the OSD. In a properly running cluster, health checks are raised
 when the cluster's OSDs and pools approach certain "fullness" ratios. The
 ``mon_osd_full_ratio`` threshold defaults to ``0.95`` (or 95% of capacity):
 this is the point above which clients are prevented from writing data. The
@@ -465,10 +465,10 @@ To check network statistics, run the following command:
 Drive Configuration
 -------------------
 
-An SAS or SATA storage drive should house only one OSD, but a NVMe drive can
+An SAS or SATA storage drive should house only one OSD, but an NVMe drive can
 easily house two or more. However, it is possible for read and write throughput
 to bottleneck if other processes share the drive. Such processes include:
-journals / metadata, operating systems, Ceph monitors, ``syslog`` logs, other
+journals / metadata, operating systems, Ceph Monitors, ``syslog`` logs, other
 OSDs, and non-Ceph processes.
 
 Because Ceph acknowledges writes *after* journaling, fast SSDs are an
@@ -495,18 +495,18 @@ cause significantly degraded performance. Tools that are useful in checking for
 drive errors include ``dmesg``, ``syslog`` logs, and ``smartctl`` (found in the
 ``smartmontools`` package).
 
-.. note:: ``smartmontools`` 7.0 and late provides NVMe stat passthrough and
+.. note:: ``smartmontools`` 7.0 and later provides NVMe stat passthrough and
    JSON output.
 
 
 Co-resident Monitors/OSDs
 -------------------------
 
-Although monitors are relatively lightweight processes, performance issues can
-result when monitors are run on the same host machine as an OSD. Monitors issue
+Although Monitors are relatively lightweight processes, performance issues can
+result when Monitors are run on the same host machine as an OSD. Monitors issue
 many ``fsync()`` calls and this can interfere with other workloads. The danger
-of performance issues is especially acute when the monitors are co-resident on
-the same storage drive as an OSD. In addition, if the monitors are running an
+of performance issues is especially acute when the Monitors are co-resident on
+the same storage drive as an OSD. In addition, if the Monitors are running an
 older kernel (pre-3.0) or a kernel with no ``syncfs(2)`` syscall, then multiple
 OSDs running on the same host might make so many commits as to undermine each
 other's performance.  This problem sometimes results in what is called "the
@@ -626,58 +626,256 @@ Possible solutions:
 - Override OSD shard configuration (on HDD based cluster with mClock scheduler)
     - See :ref:`mclock-tblshoot-hdd-shard-config` for resolution
 
+.. _rados-slow-requests-debugging:
+
+.. |rarr| unicode:: U+2192 .. RIGHT ARROW
+
 Debugging Slow Requests
 -----------------------
 
-If you run ``ceph daemon osd.<id> dump_historic_ops`` or ``ceph daemon osd.<id>
-dump_ops_in_flight``, you will see a set of operations and a list of events
-each operation went through. These are briefly described below.
+When troubleshooting slow operations, run one of three admin socket
+commands to inspect in-flight or recently completed operations. Each
+reveals different information to pinpoint bottlenecks.
 
-Events from the Messenger layer:
+.. note::
 
-- ``header_read``: The time that the messenger first started reading the message off the wire.
-- ``throttled``: The time that the messenger tried to acquire memory throttle space to read
-  the message into memory.
-- ``all_read``: The time that the messenger finished reading the message off the wire.
-- ``dispatched``: The time that the messenger gave the message to the OSD.
-- ``initiated``: This is identical to ``header_read``. The existence of both is a
-  historical oddity.
+   Operation tracking requires :confval:`osd_enable_op_tracker` set to
+   ``true`` (the default). If disabled, all three commands return an
+   error: "op_tracker tracking is not enabled now, so no ops are
+   tracked currently, even those get stuck. Please enable
+   osd_enable_op_tracker, and the tracker will start to track new
+   ops received afterwards." To enable the tracker at runtime, run:
 
-Events from the OSD as it processes ops:
+   .. prompt:: bash
 
-- ``queued_for_pg``: The op has been put into the queue for processing by its PG.
-- ``reached_pg``: The PG has started performing the op.
-- ``waiting for \*``: The op is waiting for some other work to complete before
-  it can proceed (for example, a new OSDMap; the scrubbing of its object
-  target; the completion of a PG's peering; all as specified in the message).
-- ``started``: The op has been accepted as something the OSD should do and 
-  is now being performed.
-- ``waiting for subops from``: The op has been sent to replica OSDs.
+      ceph config set osd osd_enable_op_tracker true
 
-Events from ``Filestore``:
 
-- ``commit_queued_for_journal_write``: The op has been given to the FileStore.
-- ``write_thread_in_journal_buffer``: The op is in the journal's buffer and is waiting
-  to be persisted (as the next disk write).
-- ``journaled_completion_queued``: The op was journaled to disk and its callback
-  has been queued for invocation.
+The Three Commands
+~~~~~~~~~~~~~~~~~~~
 
-Events from the OSD after data has been given to underlying storage:
+**dump_ops_in_flight**: see operations being processed right now
 
-- ``op_commit``: The op has been committed (that is, written to journal) by the
-  primary OSD.
-- ``op_applied``: The op has been `written with write()
-  <https://www.freebsd.org/cgi/man.cgi?write(2)>`_ to the backing FS (that is,
-  applied in memory but not flushed out to disk) on the primary.
-- ``sub_op_applied``: ``op_applied``, but for a replica's "subop".
-- ``sub_op_committed``: ``op_commit``, but for a replica's subop (only for EC pools).
-- ``sub_op_commit_rec/sub_op_apply_rec from <X>``: The primary marks this when it
-  hears about the above, but for a particular replica (i.e. ``<X>``).
-- ``commit_sent``: We sent a reply back to the client (or primary OSD, for sub ops).
+Run a command of the following form:
 
-Although some of these events may appear redundant, they cross important
-boundaries in the internal code (such as passing data across locks into new
-threads).
+.. prompt:: bash
+
+   ceph daemon osd.<id> dump_ops_in_flight [filterstr]
+
+Issue this ASOK command when an OSD is reporting errors, slow requests,
+or when its latency is high. The top-level ``ops_in_flight`` object
+contains an ``ops`` array and ``num_ops`` count. Each op shows ``age``
+(seconds since initiated) and the current ``flag_point``. If passed,
+the ``filterstr`` argument filters results by client IP address.
+
+**dump_historic_ops_by_duration**: see recently completed operations sorted
+by execution time
+
+Run a command of the following form:
+
+.. prompt:: bash
+
+   ceph daemon osd.<id> dump_historic_ops_by_duration [filterstr]
+
+Use this to identify slow patterns or worst offenders. Returns an array
+of completed operations sorted longest-duration-first. The top-level
+response includes:
+
+- ``size``: maximum ops retained (= :confval:`osd_op_history_size`,
+  default 20)
+- ``duration``: retention window in seconds (=
+  :confval:`osd_op_history_duration`, default 600)
+- ``ops``: array of operation objects
+
+The OSD retains ops from the last 600 seconds or up to 20 operations,
+whichever limit is hit first. If passed, the ``filterstr`` argument
+filters results by client IP address.
+
+**dump_historic_slow_ops**: see operations exceeding the slow threshold
+
+Run a command of the following form:
+
+.. prompt:: bash
+
+   ceph daemon osd.<id> dump_historic_slow_ops [filterstr]
+
+Use this when you want to filter for operations whose ``duration``
+meets or exceeds :confval:`osd_op_history_slow_op_threshold` (default
+10.0 seconds). The OSD retains up to
+:confval:`osd_op_history_slow_op_size` (default 20) such operations.
+If passed, the ``filterstr`` argument filters results by client IP address.
+
+.. note::
+
+   Do not confuse :confval:`osd_op_history_slow_op_threshold` with
+   :confval:`osd_op_complaint_time`. The former filters completed
+   operations by actual duration; the latter triggers log warnings
+   for in-flight operations still running past the threshold.
+
+
+Output field reference
+~~~~~~~~~~~~~~~~~~~~~~
+
+Each operation object contains these fields:
+
+- ``description``: compact string encoding op type, client, PG, object,
+  and flags (see `Decoding the description field`_ below)
+- ``initiated_at``: ISO 8601 UTC timestamp when op was received
+- ``age``: seconds since ``initiated_at`` (in-flight ops only)
+- ``duration``: seconds from initiation to completion (completed ops
+  only)
+- ``type_data.flag_point``: current or last state reached by the op
+- ``type_data.client_info.client``: entity name, format ``client.NUM``
+- ``type_data.client_info.client_addr``: network address, format
+  ``IP:port/nonce`` (or ``[IPv6]:port/nonce`` for IPv6 addresses) where
+  nonce identifies the client process instance
+- ``type_data.client_info.tid``: transaction ID, client-assigned
+  sequential integer unique per session
+- ``type_data.events``: array of state transitions in chronological
+  order
+
+
+Decoding the description field
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The ``description`` field is a compact summary. Here is a real example:
+
+.. code-block:: text
+
+   osd_op(client.2035306.0:1369555462 7.97 7:e9516884:::.dir.f5083a78-5c53-45e6-a2b7-1e68b9ea0ef2.23165.2.4:head [call rgw.guard_bucket_resharding in=26b,call rgw.bucket_prepare_op in=20b] snapc 0=[] ondisk+write+known_if_redirected e271143)
+
+Components of the description field:
+
+- ``osd_op``: message type (MOSDOp)
+- ``client.2035306``: client entity type and monitor-assigned number
+- ``.0``: client incarnation counter (increments on reconnect)
+- ``:1369555462``: transaction ID (tid)
+- ``7.97``: pool ID (decimal) dot PG seed (hexadecimal)
+- ``7:e9516884``: pool ID colon bitwise hash of object key
+- ``:::``: separators for namespace, key, object (all empty here)
+- ``.dir.f5083a78-...:head``: object name and snapshot (``:head`` =
+  live version, no snapshot)
+- ``[call rgw.METHOD in=Nb]``: OSD class method calls. ``call`` = type,
+  class name, method name, ``in=Nb`` = input data size
+- ``snapc 0=[]``: snap context (0 = no snapshots, empty list)
+- ``ondisk+write+...``: request flags joined by ``+``
+- ``e271143``: OSDMap epoch at time of request
+
+
+Event reference
+~~~~~~~~~~~~~~~
+
+The ``type_data.events`` array records state transitions in order.
+Walk it to find the longest-duration event and diagnose bottleneck
+(see `Identifying the bottleneck`_ below).
+
+**Phase 1: Messenger (message arrival)**
+
+- ``header_read``: first bytes of message read from network
+- ``throttled``: messenger acquiring memory throttle. Duration often
+  shows approximately 4,294,967,295 seconds (unsigned arithmetic wrap). Ignore the
+  duration value for this event.
+- ``all_read``: all message bytes received from network
+- ``dispatched``: message handed to OSD for processing
+
+**Phase 2: OSD core (queuing)**
+
+- ``initiated``: op registered in tracking system (``STATE_LIVE``)
+- ``queued_for_pg``: op enqueued to PG work queue
+- ``reached_pg``: op dequeued, PG lock acquired, entering ``do_request()``.
+  May repeat if op is requeued.
+
+**Phase 3: Blocking conditions (may appear, may repeat)**
+
+- ``waiting for rw locks``: blocked on per-object read/write locks. Long
+  duration = object contention.
+- ``waiting for missing object``: object not yet recovered
+- ``waiting for degraded object``: object in degraded state
+- ``waiting for readable``: PG not yet readable; peering incomplete
+- ``waiting for scrub``: scrub operation locking this object
+- ``waiting for peered``: PG not yet in peered state
+- ``waiting for active``: PG not yet active
+- ``waiting for ondisk``: waiting for prior op to commit to journal
+
+**Phase 4: Execution**
+
+- ``started``: all locks acquired, ``execute_ctx()`` beginning. Long
+  duration = slow backend I/O.
+
+**Phase 5: Replication (replicated pools only)**
+
+- ``waiting for subops from [X,Y]``: sub-ops sent to replica OSDs X and
+  Y. Waiting for commit ACKs. Long duration = slow replicas.
+- ``sub_op_commit_rec``: commit acknowledgment received from one replica.
+  Appears once per replica.
+- ``op_commit``: all replicas committed. Op is durable but client not yet
+  notified.
+
+**Phase 6: Completion**
+
+- ``commit_sent``: reply sent to client with durability guarantee
+  (``CEPH_OSD_FLAG_ONDISK``). Client now knows op is durable.
+- ``done``: op released from tracking. Resources freed.
+
+.. note::
+
+   The ``throttled`` event duration is unreliable. When ``throttle_stamp``
+   is uninitialized (zero) and the previous event has a real timestamp,
+   unsigned subtraction wraps: ``0 - 1718984486 ~= 2^32 - 1``.
+   This does **not** mean the op was throttled for 136 years. Ignore the
+   ``throttled`` event duration. Focus on other events when diagnosing.
+
+
+Identifying the bottleneck
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+To find where time is spent in an operation:
+
+#. Run one of the three commands above.
+#. In the ``type_data.events`` array for each op of interest, find the
+   event with the largest ``duration`` value.
+#. That event indicates where time was spent. Interpret by event name:
+
+   - Large duration on ``waiting for rw locks`` |rarr| per-object lock
+     contention. Another op holds the lock on the same object. Reduce
+     concurrent writes to the same object.
+   - Large duration on ``waiting for subops from [X,Y]`` |rarr| replica X or Y
+     is slow. Check replica OSD health, disk I/O, network.
+   - Large duration on ``started`` (before ``op_commit``) |rarr| slow backend
+     I/O on the primary. Check disk iostat.
+   - Large duration on ``queued_for_pg`` |rarr| PG queue backlog; high
+     concurrent load.
+   - Repeated ``reached_pg`` |rarr| ``waiting for rw locks`` cycles |rarr| lock
+     contention retry loop. Reduce concurrent writes to same object.
+
+
+Related configuration
+~~~~~~~~~~~~~~~~~~~~~
+
+Control op tracking and history retention with these six options. Set
+them in ``ceph.conf`` or via ``ceph config set osd <option> <value>``.
+
+- :confval:`osd_enable_op_tracker`: Enable operation tracking (type:
+  bool, default: true). Must be true for all three commands to work.
+- :confval:`osd_op_history_size`: Max completed ops retained (type: uint,
+  default: 20). Controls ``dump_historic_ops_by_duration``.
+- :confval:`osd_op_history_duration`: Retention window in seconds (type:
+  uint, default: 600). Controls ``dump_historic_ops_by_duration``.
+- :confval:`osd_op_history_slow_op_size`: Max slow ops retained (type:
+  uint, default: 20). Controls ``dump_historic_slow_ops``.
+- :confval:`osd_op_history_slow_op_threshold`: Slow op threshold in
+  seconds (type: float, default: 10.0). Controls
+  ``dump_historic_slow_ops``.
+- :confval:`osd_op_complaint_time`: In-flight complaint threshold in
+  seconds (type: float, default: 30.0). Used for logging and
+  ``dump_blocked_ops``.
+
+To change a setting at runtime, run:
+
+.. prompt:: bash
+
+   ceph config set osd osd_op_history_size 50
+
 
 .. _mclock-tblshoot-hdd-shard-config:
 
@@ -733,7 +931,7 @@ The upstream Ceph community has traditionally recommended separate *public*
 provides the following benefits:
 
 #. Segregation of (1) heartbeat traffic and replication/recovery traffic
-   (private) from (2) traffic from clients and between OSDs and monitors
+   (private) from (2) traffic from clients and between OSDs and Monitors
    (public). This helps keep one stream of traffic from DoS-ing the other,
    which could in turn result in a cascading failure.
 
@@ -754,16 +952,16 @@ and reduced OSD flapping.
 When a private network (or even a single host link) fails or degrades while the
 public network continues operating normally, OSDs may not handle this situation
 well. In such situations, OSDs use the public network to report each other
-``down`` to the monitors, while marking themselves ``up``. The monitors then
+``down`` to the Monitors, while marking themselves ``up``. The Monitors then
 send out-- again on the public network--an updated cluster map with the
-affected OSDs marked `down`. These OSDs reply to the monitors "I'm not dead
-yet!", and the cycle repeats. We call this scenario 'flapping`, and it can be
+affected OSDs marked `down`. These OSDs reply to the Monitors "I'm not dead
+yet!", and the cycle repeats. We call this scenario 'flapping', and it can be
 difficult to isolate and remediate. Without a private network, this irksome
 dynamic is avoided: OSDs are generally either ``up`` or ``down`` without
 flapping.
 
 If something does cause OSDs to 'flap' (repeatedly being marked ``down`` and
-then ``up`` again), you can force the monitors to halt the flapping by
+then ``up`` again), you can force the Monitors to halt the flapping by
 temporarily freezing their states:
 
 .. prompt:: bash
@@ -816,7 +1014,7 @@ being marked ``out`` (regardless of the current value of
 
 .. _subscribe to the ceph-devel email list: mailto:majordomo@vger.kernel.org?body=subscribe+ceph-devel
 .. _unsubscribe from the ceph-devel email list: mailto:majordomo@vger.kernel.org?body=unsubscribe+ceph-devel
-.. _subscribe to the ceph-users email list: mailto:ceph-users-join@lists.ceph.com
-.. _unsubscribe from the ceph-users email list: mailto:ceph-users-leave@lists.ceph.com
+.. _subscribe to the ceph-users email list: mailto:ceph-users-join@ceph.io
+.. _unsubscribe from the ceph-users email list: mailto:ceph-users-leave@ceph.io
 .. _OS recommendations: ../../../start/os-recommendations
 .. _ceph-devel: ceph-devel@vger.kernel.org

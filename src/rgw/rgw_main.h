@@ -94,8 +94,25 @@ class AppMain {
   SiteConfig site;
   const DoutPrefixProvider* dpp;
   RGWProcessEnv env;
-  void need_context_pool();
-  std::optional<ceph::async::io_context_pool> context_pool;
+  class AdminSocketHook* heap_profiler_hook{nullptr};
+  void unregister_heap_profiler_hook(); // idempotent; used by shutdown() and ~AppMain()
+
+  class IOContextPoolHolder {
+  private:
+    std::optional<ceph::async::io_context_pool> pool_;
+    const DoutPrefixProvider* dpp_;
+
+  public:
+    explicit IOContextPoolHolder(const DoutPrefixProvider* dpp) : dpp_(dpp) {};
+    IOContextPoolHolder(const IOContextPoolHolder&) = delete;
+    IOContextPoolHolder& operator=(const IOContextPoolHolder&) = delete;
+
+    ceph::async::io_context_pool& get();
+    ceph::async::io_context_pool& operator*() { return get(); }
+    ceph::async::io_context_pool* operator->() { return std::addressof(get()); }
+  };
+
+  IOContextPoolHolder context_pool;
 public:
   AppMain(const DoutPrefixProvider* dpp);
   ~AppMain();
@@ -125,6 +142,7 @@ public:
   int init_frontends2(RGWLib* rgwlib = nullptr);
   void init_tracepoints();
   void init_lua();
+  void init_kms_cache();
 #ifdef WITH_RADOSGW_RADOS
   void init_dedup();
 #endif
@@ -143,6 +161,7 @@ static inline RGWRESTMgr *set_logging(RGWRESTMgr* mgr)
   return mgr;
 }
 
+#ifdef WITH_RADOSGW_RADOS
 static inline RGWRESTMgr *rest_filter(rgw::sal::Driver* driver, int dialect, RGWRESTMgr* orig)
 {
   RGWSyncModuleInstanceRef sync_module = driver->get_sync_module();
@@ -152,4 +171,13 @@ static inline RGWRESTMgr *rest_filter(rgw::sal::Driver* driver, int dialect, RGW
     return orig;
   }
 }
+#else
+// sync modules (and their REST filters) are a RADOS-only feature; the
+// complete RGWSyncModuleInstance type lives in the rados driver, so avoid
+// referring to it in no-RADOS builds
+static inline RGWRESTMgr *rest_filter(rgw::sal::Driver*, int, RGWRESTMgr* orig)
+{
+  return orig;
+}
+#endif
 

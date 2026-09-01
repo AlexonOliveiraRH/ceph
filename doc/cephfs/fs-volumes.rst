@@ -31,7 +31,7 @@ Requirements
 
 * Nautilus (14.2.x) or later Ceph release
 
-* Cephx client user (see :doc:`/rados/operations/user-management`) with
+* CephX client user (see :doc:`/rados/operations/user-management`) with
   at least the following capabilities::
 
     mon 'allow r'
@@ -44,19 +44,66 @@ Create a volume by running a command of the following form:
 
 .. prompt:: bash #
 
-   ceph fs volume create <vol_name> [placement] [--data-pool <data-pool-name>] [--meta-pool <metadata-pool-name>]
+   ceph fs volume create <vol_name>
 
 This creates a CephFS file system and its data and metadata pools. Alternately,
-if the data pool and/or metadata pool needed for creating a CephFS volume
-already exist, these pool names can be passed to this command so that the
-volume is created using these existing pools. This command can also deploy MDS
-daemons for the filesystem using a Ceph Manager orchestrator module (for
-example Rook). See :doc:`/mgr/orchestrator`.
+if the data pool and/or metadata pool for the new CephFS volume
+already exist, these pool names can be passed to the ``ceph fs`` command so that the
+volume is created using these existing pools.
 
+MDS services for the new CephFS filesystem (volume) may be deployed using the
+orchestrator. See :doc:`/mgr/orchestrator`.
+
+When using the cephadm orchestrator, an example service spec might look
+like the following, which assumes that the new volume is named ``zac`` and
+the orchestrator label ``zacmds`` has been asigned to at least two appropriate
+cluster nodes:
+
+.. prompt:: bash # auto
+
+   # cat <<EOF >/tmp/mds.zac.spec
+   service_type: mds
+   service_id: zac
+   service_name: mds.zac
+   placement:
+     count: 2
+     label: zacmds
+   EOF
+   # ceph orch apply -i /tmp/mds.zac.spec --dry-run
+   # echo validate the placement then run
+   # ceph orch apply -i /tmp/mds.zac.spec
+
+See also :ref:`orchestrator-cli-cephfs` for more information information
+regarding placement.
+
+When the cluster is running Ceph Tentacle (20.2.0) or later, one may condense these
+commands, placing and deploying MDS daemons for the filesystem using a Ceph Manager
+orchestrator module (cephadm or Rook). See :doc:`/mgr/orchestrator`.
 ``<vol_name>`` is the volume name (an arbitrary string). ``[placement]`` is an
 optional string that specifies the :ref:`orchestrator-cli-placement-spec` for
-the MDS. See also :ref:`orchestrator-cli-cephfs` for more examples on
+the MDS. See also :ref:`orchestrator-cli-cephfs` for more examples of
 placement.
+
+.. prompt:: bash #
+
+   ceph fs volume create <vol_name> [placement] [--data-pool <data-pool-name>] [--meta-pool <metadata-pool-name>]
+
+With either command form, the metadata pool must currently be replicated,
+and we recommend placing it, via an appropriate CRUSH rule, on SSD OSDs.
+The metadata pool may easily share SSD OSDs with other pools, as it
+stores relatively little data. That said, for this purpose, more but smaller
+OSDs are better than fewer but larger. Say you have four 7.6 TiB NVMe SSDs total: you
+will gain performance by splitting each into 3 or 4 OSDs.
+
+The first data pool may be erasure-coded, but we also recommend that it be
+replicated and placed on SSDs, which will often be the same OSDs as above. Then
+one or more additional data pools may be attached and client data directed
+to them via :doc:`/cephfs/file-layouts`.  The advantage of this strategy is
+that backtrace information is always stored in the first data pool, and
+provisioning that on faster media will greatly speed repair and other operations.
+As with the metadata pool, this will not consume much capacity and does not
+require dedicated OSDs. These additional data pools often are deployed with erasure
+coding and/or on cost-effective media such as HDDs or coarse-IU QLC SSDs.
 
 .. note:: Specifying placement via a YAML file is not supported through the
           volume interface.
@@ -72,8 +119,9 @@ tries to remove MDS daemons using the enabled Ceph Manager orchestrator module.
 
 .. note:: After volume deletion, we recommend restarting `ceph-mgr` if a new
    file system is created on the same cluster and the subvolume interface is
-   being used. See https://tracker.ceph.com/issues/49605#note-5 for more
-   details.
+   being used. The restart clears state that Manager modules may still hold
+   for the deleted volume, which can otherwise interfere with subvolume
+   operations on the new file system.
 
 .. note:: If the snap-schedule Ceph Manager module is being used for a volume
    and the volume is deleted, then the snap-schedule Ceph Manager module will
@@ -126,7 +174,7 @@ The output format is JSON and contains fields as follows:
         * ``used``: The amount of storage consumed in bytes
         * ``name``: Name of the pool
 
-* ``mon_addrs``: List of Ceph monitor addresses
+* ``mon_addrs``: List of Ceph Monitor addresses
 * ``used_size``: Current used size of the CephFS volume in bytes
 * ``pending_subvolume_deletions``: Number of subvolumes pending deletion
 
@@ -180,7 +228,7 @@ a quota on it (see :doc:`/cephfs/quota`). By default, the subvolume group
 is created with octal file mode ``755``, UID ``0``, GID ``0`` and the data pool
 layout of its parent directory.
 
-You can also specify an Unicode normalization form using the ``--normalization``
+You can also specify a Unicode normalization form using the ``--normalization``
 option. This will be used to internally mangle file names so that Unicode
 characters that can be represented by different Unicode code point sequences
 are all mapped to the same representation, which means that they will all
@@ -196,7 +244,7 @@ The valid values for the Unicode normalization form are:
 
 To learn more about Unicode normalization forms see https://unicode.org/reports/tr15
 
-It's also possible to configure a subvolume group for case insensitive access
+It's also possible to configure a subvolume group for case-insensitive access
 when the ``--casesensitive=0`` option is used. When this option is added, file
 names that only differ in the case of its characters will be mapped to the same
 file. The case of the file name used when the file was created is preserved.
@@ -249,7 +297,7 @@ The output format is JSON and contains fields as follows:
 * ``uid``: UID of the subvolume group path
 * ``gid``: GID of the subvolume group path
 * ``mode``: mode of the subvolume group path
-* ``mon_addrs``: list of monitor addresses
+* ``mon_addrs``: list of Monitor addresses
 * ``bytes_pcent``: quota used in percentage if quota is set, else displays "undefined"
 * ``bytes_quota``: quota size in bytes if quota is set, else displays "infinite"
 * ``bytes_used``: current used size of the subvolume group in bytes
@@ -356,7 +404,7 @@ Valid Earmarks
    be aware that user permissions and ACLs associated with the previous scope might still apply. Ensure that
    any necessary permissions are updated as needed to maintain proper access control.
 
-When creating a subvolume you can also specify an Unicode normalization form by
+When creating a subvolume you can also specify a Unicode normalization form by
 using the ``--normalization`` option. This will be used to internally mangle
 file names so that Unicode characters that can be represented by different
 Unicode code point sequences are all mapped to the representation, which means
@@ -372,7 +420,7 @@ The valid values for the Unicode normalization form are:
 
 To learn more about Unicode normalization forms see https://unicode.org/reports/tr15
 
-It's also possible to configure a subvolume for case insensitive access when
+It's also possible to configure a subvolume for case-insensitive access when
 the ``--casesensitive=0`` option is used. When this option is added, file
 names that only differ in the case of its characters will be mapped to the same
 file. The case of the file name used when the file was created is preserved.
@@ -428,6 +476,15 @@ Use a command of the following form to resize a subvolume:
 This command resizes the subvolume quota, using the size specified by
 ``new_size``.  The ``--no_shrink`` flag prevents the subvolume from shrinking
 below the current "used size" of the subvolume.
+
+Resizing can also be done using human-friendly units::
+
+  ceph fs subvolume resize foo subvol1 100KiB
+  ceph fs subvolume resize foo subvol1 200.45KiB
+  ceph fs subvolume resize foo subvol1 300KB
+
+.. note:: Values will be strictly cast to IEC units even when SI units
+   are input, i.e. 1{K|KB|Ki|KiB} all translate to 1024 bytes.
 
 The subvolume can be resized to an unlimited (but sparse) logical size by
 passing ``inf`` or ``infinite`` as ``<new_size>``.
@@ -503,7 +560,7 @@ The output format is JSON and contains the following fields.
 * ``uid``: UID of the subvolume path
 * ``gid``: GID of the subvolume path
 * ``mode``: mode of the subvolume path
-* ``mon_addrs``: list of monitor addresses
+* ``mon_addrs``: list of Monitor addresses
 * ``bytes_pcent``: quota used in percentage if quota is set; else displays
   ``undefined``
 * ``bytes_quota``: quota size in bytes if quota is set; else displays
@@ -718,7 +775,7 @@ a subvolume:
 Listing the Snapshots of a Subvolume
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Use a command of the following from to list the snapshots of a subvolume:
+Use a command of the following form to list the snapshots of a subvolume:
 
 .. prompt:: bash #
 
@@ -820,7 +877,7 @@ the snapshot using the metadata key:
 Listing Custom Metadata That Has Been Set on a Snapshot
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Use a command of the following from to list custom metadata (key-value pairs)
+Use a command of the following form to list custom metadata (key-value pairs)
 set on the snapshot:
 
 .. prompt:: bash #
@@ -945,7 +1002,7 @@ Here is an example of an ``in-progress`` clone:
 A progress report is also printed in the output when clone is ``in-progress``.
 Here the progress is reported only for the specific clone. For collective
 progress made by all ongoing clones, a progress bar is printed at the bottom
-in ouput of ``ceph status`` command::
+in output of ``ceph status`` command::
 
   progress:
     3 ongoing clones - average progress is 47.569% (10s)
@@ -1053,7 +1110,7 @@ state:
         }
     }
 
-.. note:: Delete the canceled cloned by supplying the ``--force`` option to the
+.. note:: Delete the canceled clone by supplying the ``--force`` option to the
    ``fs subvolume rm`` command.
 
 Configurables
@@ -1116,9 +1173,8 @@ following command.
 Controlling Subvolume Snapshot Visibility
 -----------------------------------------
 
-.. note:: This functionality is currently supported only for FUSE/libcephfs clients.
-          Kernel client support is planned: progress can be tracked at
-          https://tracker.ceph.com/issues/72589.
+.. note:: This functionality is currently supported only for FUSE/libcephfs
+          clients. The kernel client does not yet support it.
 
 Snapshots of a subvolume can be hidden from compatible clients by
 performing two actions:
@@ -1164,12 +1220,12 @@ across all the clients, issue the command without specifying an ``id``:
 
    ceph config set client client_respect_subvolume_snapshot_visibility <true|false>
 
-.. note:: The MGR daemon operates as a privileged CephFS client and therefore
+.. note:: The Manager daemon operates as a privileged CephFS client and therefore
           bypasses snapshot visibility restrictions. This behavior is required
           to ensure the reliable execution of operations such as snap-schedule
           and snapshot cloning. As a result, modifying the
           ``client_respect_subvolume_snapshot_visibility`` configuration option
-          has no effect on the CephFS instance running within the MGR daemon.
+          has no effect on the CephFS instance running within the Manager daemon.
 
 How to Disable Snapshot Visibility on a Subvolume?
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1244,7 +1300,7 @@ pinned to one of the available ranks on the file system.
 Normalization and Case Sensitivity
 ----------------------------------
 
-The subvolumegroup and subvolume interefaces have a porcelain layer API to
+The subvolumegroup and subvolume interfaces have a porcelain layer API to
 manipulate the ``ceph.dir.charmap`` configurations (see also :ref:`charmap`).
 
 
@@ -1261,7 +1317,7 @@ Or for a subvolume:
 
 .. prompt:: bash #
 
-    ceph fs subvolume charmap set <vol_name> <subvol> <--group_name=name> <setting> <value>
+    ceph fs subvolume charmap set <vol_name> <subvol> --group_name=<name> <setting> <value>
 
 For example:
 
@@ -1289,7 +1345,7 @@ Or for a subvolume:
 
 .. prompt:: bash #
 
-    ceph fs subvolume charmap get <vol_name> <subvol> <--group_name=name> <setting>
+    ceph fs subvolume charmap get <vol_name> <subvol> --group_name=<name> <setting>
 
 For example:
 
@@ -1311,7 +1367,7 @@ Or for a subvolume:
 
 .. prompt:: bash #
 
-    ceph fs subvolume charmap get <vol_name> <subvol> <--group_name=name>
+    ceph fs subvolume charmap get <vol_name> <subvol> --group_name=<name>
 
 For example:
 
@@ -1333,13 +1389,13 @@ To remove the ``charmap`` configuration, for a subvolumegroup:
 
 .. prompt:: bash #
 
-    ceph fs subvolumegroup charmap rm <vol_name> <group_name
+    ceph fs subvolumegroup charmap rm <vol_name> <group_name>
 
 Or for a subvolume:
 
 .. prompt:: bash #
 
-    ceph fs subvolume charmap rm <vol_name> <subvol> <--group_name=name>
+    ceph fs subvolume charmap rm <vol_name> <subvol> --group_name=<name>
 
 For example:
 
@@ -1369,7 +1425,7 @@ file system flushes to synchronize checkpoints across its distributed components
 no guarantee that all acknowledged writes will be part of a given snapshot.
 
 The subvolume quiesce feature has been developed to provide enterprise-level consistency guarantees
-for multi-client applications that work with one or more subvolumes. The feature makes it possible to pause IO
+for multi-client applications that work with one or more subvolumes. The feature makes it possible to pause I/O
 to a set of subvolumes of a given volume (file system). Enforcing such a pause across all clients makes
 it possible to guarantee that any persistent checkpoints reached by the application before the pause
 will be recoverable from the snapshots made during the pause.
@@ -1380,7 +1436,7 @@ This pause is called a `quiesce`, which is also used as the command name:
 .. prompt:: bash $ auto
 
   $ ceph fs quiesce <vol_name> --set-id myset1 <[group_name/]sub_name...> --await
-  # perform actions while the IO pause is active, like taking snapshots
+  # perform actions while the I/O pause is active, like taking snapshots
   $ ceph fs quiesce <vol_name> --set-id myset1 --release --await
   # if successful, all members of the set were confirmed as still paused and released
 
@@ -1402,12 +1458,12 @@ A quiesce set can be manipulated in the following ways:
 * **cancel** the set, asynchronously aborting the pause on all its current members
 * **release** the set, requesting the end of the pause from all members and expecting an ack from all clients
 * **query** the current state of a set by id or all active sets or all known sets
-* **cancel all** active sets in case an immediate resume of IO is required.
+* **cancel all** active sets in case an immediate resume of I/O is required.
 
 The operations listed above are non-blocking: they attempt the intended modification
-and return with an up to date version of the target set, whether the operation was successful or not.
+and return with an up-to-date version of the target set, whether the operation was successful or not.
 The set may change states as a result of the modification, and the version that's returned in the response
-is guaranteed to be in a state consistent with this and potentialy other successful operations from
+is guaranteed to be in a state consistent with this and potentially other successful operations from
 the same control loop batch.
 
 Some set states are `awaitable`. We will discuss those below, but for now it's important to mention that
@@ -1591,7 +1647,7 @@ along with other arguments to let the system know our intention.
 
 There are two types of await: `quiesce await` and `release await`. The former is the default,
 and the latter can only be achieved with ``--release`` present in the argument list.
-To avoid confision, it is not permitted to issue a `quiesce await` when the set is not `QUIESCING`.
+To avoid confusion, it is not permitted to issue a `quiesce await` when the set is not `QUIESCING`.
 Trying to ``--release`` a set that is not `QUIESCED` is an ``EPERM`` error as well, regardless
 of whether await is requested alongside. However, it's not an error to `release await`
 an already released set, or to `quiesce await` a `QUIESCED` one - those are successful no-ops.
@@ -1617,7 +1673,7 @@ may mask a successful result with its own error. A good example is trying to can
   }
   Error EPERM: 
 
-Although ``--cancel`` will succeed syncrhonously for a set in an active state, awaiting a canceled
+Although ``--cancel`` will succeed synchronously for a set in an active state, awaiting a canceled
 set is not permitted, hence this call will result in an ``EPERM``. This is deliberately different from
 returning a ``EINVAL`` error, denoting an error on the user's side, to simplify the system's behavior
 when ``--await`` is requested. As a result, it's also a simpler model for the user to work with.
@@ -1667,7 +1723,7 @@ Quiesce-Await and Expiration
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Quiesce await has a side effect: it resets the internal expiration timer. This allows for a watchdog
-approach to a long running multistep process under the IO pause by repeatedly ``--await``\ ing an already
+approach to a long running multistep process under the I/O pause by repeatedly ``--await``\ ing an already
 `QUIESCED` set. Consider the following example script:
 
 .. prompt:: bash # auto
@@ -1688,14 +1744,14 @@ The goal of the script is to take consistent snapshots of 3 subvolumes.
 We begin by setting the bash ``-e`` option `(1)` to exit this script if any or the following commands
 returns with a non-zero status.
 
-We go on requesting an IO pause for the three subvolumes `(2)`. We set our timeouts allowing
+We go on requesting an I/O pause for the three subvolumes `(2)`. We set our timeouts allowing
 the system to spend up to 30 seconds reaching the quiesced state across all members
-and stay quiesced for up to 10 seconds before the quiesce expires and the IO
+and stay quiesced for up to 10 seconds before the quiesce expires and the I/O
 is resumed. We also specify ``--await`` to only proceed once the quiesce is reached.
 
 We then proceed with a set of command pairs that take the next snapshot and call ``--await`` on our set
 to extend the expiration timeout for 10 more seconds `(3,4)`. This approach gives us up to 10 seconds
-for every snapshot, but also allows taking as many snapshots as we need without losing the IO pause,
+for every snapshot, but also allows taking as many snapshots as we need without losing the I/O pause,
 and with it - consistency. If we wanted, we could update the `expiration` every time we called for await.
 
 If any of the snapshots gets stuck and takes longer than 10 seconds to complete, then the next call
@@ -1720,7 +1776,7 @@ a concurrent change of the set by another client. Consider this example:
   # ceph fs quiesce fs1 --set-id="snapshots" --release --await  # (5)
 
 The sequence looks good, and the release `(5)` completes successfully. However, it could be that
-before snap for sub3 `(4)` is taken, another session excludes sub3 from the set, resuming its IOs
+before snap for sub3 `(4)` is taken, another session excludes sub3 from the set, resuming its I/Os
 
 .. prompt:: bash # auto
 
@@ -1773,12 +1829,12 @@ Disabling Volumes Plugin
 ------------------------
 By default the volumes plugin is enabled and set to ``always on``. However, in
 certain cases it might be appropriate to disable it. For example, when a CephFS
-is in a degraded state, the volumes plugin commands may accumulate in MGR
+is in a degraded state, the volumes plugin commands may accumulate in the Manager
 instead of getting served. Which eventually causes policy throttles to kick in
-and the MGR becomes unresponsive.
+and the Manager becomes unresponsive.
 
 In this event, the volumes plugin can be disabled even though it is an
-``always on`` module in MGR. To do so, run ``ceph mgr module disable volumes
+``always on`` module in the Manager. To do so, run ``ceph mgr module disable volumes
 --yes-i-really-mean-it``. Do note that this command will disable operations
 and remove commands of the volumes plugin since it will disable all CephFS
 services on the Ceph cluster accessed through this plugin.

@@ -55,6 +55,7 @@ constexpr uint64_t DEFAULT_BLOCK_SIZE = 4096;
 class CircularBoundedJournal : public Journal, RecordScanner {
 public:
   CircularBoundedJournal(
+      store_index_t store_index,
       JournalTrimmer &trimmer, RBMDevice* device, const std::string &path);
   ~CircularBoundedJournal() {}
 
@@ -146,14 +147,8 @@ public:
     return cjs.get_records_start();
   }
 
-  using cbj_delta_handler_t = std::function<
-  replay_ertr::future<bool>(
-    const record_locator_t&,
-    const delta_info_t&,
-    sea_time_point modify_time)>;
-
   Journal::replay_ret scan_valid_record_delta(
-    cbj_delta_handler_t &&delta_handler,
+    scan_delta_handler_t &&delta_handler,
     journal_seq_t tail);
 
   void try_read_rolled_header(scan_valid_records_cursor &cursor) {
@@ -169,7 +164,7 @@ public:
   };
 
   Journal::replay_ret replay_segment(
-    cbj_delta_handler_t &handler, scan_valid_records_cursor& cursor);
+    scan_delta_handler_t &handler, scan_valid_records_cursor& cursor);
 
   read_ret read(paddr_t start, size_t len) final;
 
@@ -203,6 +198,7 @@ public:
   }
 
 private:
+  store_index_t store_index;
   JournalTrimmer &trimmer;
   std::string path;
   WritePipeline *write_pipeline = nullptr;

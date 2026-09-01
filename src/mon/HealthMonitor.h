@@ -20,12 +20,14 @@
 #include <string>
 
 #include "mon/PaxosService.h"
+#include "mon/PaxosMap.h"
+#include "mon/health_check.h"
 
 class HealthMonitor : public PaxosService
 {
   version_t version = 0;
-  std::map<int,health_check_map_t> quorum_checks;  // for each quorum member
-  health_check_map_t leader_checks;           // leader only
+  PaxosMap<Monitor, HealthMonitor, std::map<int,health_check_map_t> > quorum_checks;  // for each quorum member
+  PaxosMap<Monitor, HealthMonitor, health_check_map_t> leader_checks;           // leader only
   std::map<std::string,health_mute_t> mutes;
   // location level netsplit pairs to elasped time
   std::map<std::pair<std::string, std::string>, ceph::coarse_mono_clock::time_point> pending_location_netsplits;
@@ -75,6 +77,7 @@ private:
 
   bool prepare_command(MonOpRequestRef op);
   bool prepare_health_checks(MonOpRequestRef op);
+  void check_for_colocated_monitors(health_check_map_t *checks);
   void check_for_older_version(health_check_map_t *checks);
   void check_for_mon_down(health_check_map_t *checks, std::set<std::string> &mons_down);
   void check_for_clock_skew(health_check_map_t *checks);
@@ -85,6 +88,11 @@ private:
   bool check_leader_health();
   bool check_member_health();
   bool check_mutes();
+
+public:
+  bool is_muted(const std::string& code) const {
+    return mutes.count(code) > 0;
+  }
 };
 
 #endif // CEPH_HEALTH_MONITOR_H

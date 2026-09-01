@@ -333,14 +333,9 @@ void Option::print(ostream *out) const
     *out << "  See also: " << see_also << "\n";
   }
 
-  if (long_desc.size()) {
+  if (*long_desc != '\0') {
     *out << "\n" << long_desc << "\n";
   }
 }
 
-const std::vector<Option>& get_ceph_options() {
-  // Use a static pointer that's never destroyed to avoid use-after-free
-  // when background threads access options during program exit
-  static const std::vector<Option>* options = new std::vector<Option>(build_options());
-  return *options;
-}
+const std::vector<Option> ceph_options = build_options();

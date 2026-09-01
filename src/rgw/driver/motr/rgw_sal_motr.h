@@ -422,6 +422,7 @@ public:
   virtual bool is_tier_type_s3() { return (tier.is_tier_type_s3()); }
   virtual const std::string& get_storage_class() { return tier.storage_class; }
   virtual bool retain_head_object() { return tier.retain_head_object; }
+  virtual bool retain_current_version() { return tier.retain_current_version; }
   virtual bool allow_read_through() { return tier.allow_read_through; }
   virtual uint64_t get_read_through_restore_days() { return tier.read_through_restore_days; }
   RGWZoneGroupPlacementTier& get_rt() { return tier; }
@@ -548,6 +549,9 @@ class MotrLuaManager : public StoreLuaManager {
 
   /** Get a script named with the given key from the backing store */
   virtual int get_script(const DoutPrefixProvider* dpp, optional_yield y, const std::string& key, std::string& script) override;
+  /** Get the Lua bytecode if it exists, else script named with the given key from the backing store */
+  virtual std::tuple<rgw::lua::LuaCodeType, int> get_script_or_bytecode(const DoutPrefixProvider* dpp, optional_yield y,
+                                                                        const std::string& key) override;
   /** Put a script named with the given key to the backing store */
   virtual int put_script(const DoutPrefixProvider* dpp, optional_yield y, const std::string& key, const std::string& script) override;
   /** Delete a script named with the given key from the backing store */
@@ -1080,12 +1084,14 @@ class MotrStore : public StoreDriver {
     int store_oidc_provider(const DoutPrefixProvider* dpp,
                             optional_yield y,
                             const RGWOIDCProviderInfo& info,
-                            bool exclusive) override;
+                            bool exclusive,
+                            RGWObjVersionTracker* objv_tracker) override;
     int load_oidc_provider(const DoutPrefixProvider* dpp,
                            optional_yield y,
                            std::string_view tenant,
                            std::string_view url,
-                           RGWOIDCProviderInfo& info) override;
+                           RGWOIDCProviderInfo& info,
+                           RGWObjVersionTracker* objv_tracker) override;
     int delete_oidc_provider(const DoutPrefixProvider* dpp,
                              optional_yield y,
                              std::string_view tenant,

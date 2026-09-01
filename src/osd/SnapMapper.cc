@@ -15,7 +15,6 @@
 
 #include "SnapMapper.h"
 
-#include <fmt/printf.h>
 #include <fmt/ranges.h>
 
 #include "common/ceph_context.h"
@@ -42,11 +41,9 @@ using ceph::timespan_str;
 using result_t = Scrub::SnapMapReaderI::result_t;
 using code_t = Scrub::SnapMapReaderI::result_t::code_t;
 
-
-const string SnapMapper::MAPPING_PREFIX = "SNA_";
-const string SnapMapper::OBJECT_PREFIX = "OBJ_";
-
-const char *SnapMapper::PURGED_SNAP_PREFIX = "PSN_";
+static const std::string MAPPING_PREFIX = "SNA_";
+static const std::string OBJECT_PREFIX = "OBJ_";
+static const char *PURGED_SNAP_PREFIX = "PSN_";
 
 /*
 
@@ -115,8 +112,10 @@ int OSDriver::get_keys(
   LOG_PREFIX("OSDriver::get_keys");
   DEBUG("");
   using crimson::os::FuturizedStore;
-  return interruptor::green_get(os->omap_get_values(
-    ch, hoid, keys
+  return interruptor::green_get(
+    crimson::os::with_store<&crimson::os::FuturizedStore::Shard::omap_get_values>(
+    os,
+    ch, hoid, keys, 0
   ).safe_then([out] (FuturizedStore::Shard::omap_values_t&& vals) {
     // just the difference in comparator (`std::less<>` in omap_values_t`)
     reinterpret_cast<FuturizedStore::Shard::omap_values_t&>(*out) = std::move(vals);
@@ -157,7 +156,8 @@ int OSDriver::get_next(
     }
   };
   return interruptor::green_get(
-    os->omap_iterate(ch, hoid, start_from, callback
+    crimson::os::with_store<&crimson::os::FuturizedStore::Shard::omap_iterate>(
+      os, ch, hoid, start_from, callback, 0, nullptr
     ).safe_then([FNAME, key] (auto ret) {
       if (ret == ObjectStore::omap_iter_ret_t::NEXT) {
         DEBUG("key {} no more values", key);
@@ -180,8 +180,10 @@ int OSDriver::get_next_or_current(
   DEBUG("key {}", key);
   using crimson::os::FuturizedStore;
   // let's try to get current first
-  return interruptor::green_get(os->omap_get_values(
-    ch, hoid, FuturizedStore::Shard::omap_keys_t{key}
+  return interruptor::green_get(crimson::os::with_store<
+    &crimson::os::FuturizedStore::Shard::omap_get_values>(
+    os,
+    ch, hoid, FuturizedStore::Shard::omap_keys_t{key}, 0
   ).safe_then([FNAME, &key, next_or_current] (FuturizedStore::Shard::omap_values_t&& vals) {
     DEBUG("returning {}", key);
     ceph_assert(vals.size() == 1);
@@ -276,7 +278,7 @@ string SnapMapper::get_prefix(int64_t pool, snapid_t snap)
   // note: the snap_id is to be formatted as a 64-bit hex number,
   // and not according to the text representation of snapid_t
   ceph_assert(snap != CEPH_NOSNAP && snap != CEPH_SNAPDIR);
-  return fmt::sprintf("%s%lld_%.16X_",
+  return fmt::format("{}{}_{:016X}_",
 		      MAPPING_PREFIX,
 		      pool,
 		      static_cast<uint64_t>(snap));
@@ -517,7 +519,7 @@ void SnapMapper::clear_snaps(
   const hobject_t &oid,
   MapCacher::Transaction<std::string, ceph::buffer::list> *t)
 {
-  dout(20) << __func__ << " " << oid << dendl;
+  dout(10) << __func__ << " " << oid << dendl;
   ceph_assert(check(oid));
   set<string> to_remove;
   to_remove.insert(to_object_key(oid));
@@ -584,6 +586,15 @@ int SnapMapper::update_snaps(
   // Tolerate missing keys but not disk errors
   if (r < 0 && r != -ENOENT)
     return r;
+  if (r == -ENOENT) {
+    // Recently recovered replicas may observe missing snap-mapper state.
+    // Avoid creating an inconsistent state (OBJ_ without matching SNA_ entries) that
+    // would be detected by scrub later on - instead rebuild the mapping from scratch.
+    dout(10) << fmt::format("{}: {} no existing snap mapping, creating for {}",
+	       __func__, oid, new_snaps) << dendl;
+    add_oid(oid, new_snaps, t);
+    return 0;
+  }
   if (old_snaps_check)
     ceph_assert(out.snaps == *old_snaps_check);
 
@@ -765,7 +776,7 @@ int SnapMapper::remove_oid(
   const hobject_t &oid,
   MapCacher::Transaction<std::string, ceph::buffer::list> *t)
 {
-  dout(20) << *this << __func__ << " " << oid << dendl;
+  dout(10) << *this << __func__ << " " << oid << dendl;
   ceph_assert(check(oid));
   return _remove_oid(oid, t);
 }
@@ -843,7 +854,7 @@ void SnapMapper::update_snap_map(
         i.soid,
         _snaps,
         _t);
-    } else if (i.is_modify()) {
+    } else if (i.is_modify() || i.is_replace()) {
       int r = update_snaps(
         i.soid,
         _snaps,
@@ -861,7 +872,7 @@ void SnapMapper::update_snap_map(
 string SnapMapper::make_purged_snap_key(int64_t pool, snapid_t last)
 {
   ceph_assert(last != CEPH_NOSNAP && last != CEPH_SNAPDIR);
-  return fmt::sprintf("%s_%lld_%016llx",
+  return fmt::format("{}_{}_{:016x}",
 		      PURGED_SNAP_PREFIX,
 		      pool,
 		      static_cast<uint64_t>(last));

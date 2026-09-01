@@ -90,6 +90,8 @@ enum {
 using cctptr = boost::intrusive_ptr<CephContext>;
 using rsptr = std::shared_ptr<librados::Rados>;
 
+static void cephsqlite_atexit();
+
 struct cephsqlite_appdata {
   ~cephsqlite_appdata() {
     {
@@ -212,12 +214,18 @@ private:
       lderr(cct) << "cannot connect: " << cpp_strerror(rc) << dendl;
       return rc;
     }
+    /* This **must** occur after OpenSSL registers any atexit handlers (**sigh**). */
+    std::call_once(atexit_registered, []() {
+      std::atexit(cephsqlite_atexit);
+    });
     auto s = _cluster->get_addrs();
     ldout(cct, 5) << "completed connection to RADOS with address " << s << dendl;
     cluster = std::move(_cluster);
+
     return 0;
   }
 
+  std::once_flag atexit_registered;
   ceph::mutex cluster_mutex = ceph::make_mutex("libcephsqlite");;
   cctptr cct;
   rsptr cluster;
@@ -430,6 +438,12 @@ static int Sync(sqlite3_file *file, int flags)
 }
 
 
+static bool should_inject_stat_error(CephContext* cct)
+{
+  auto p = cct->_conf.get_val<double>("cephsqlite_inject_stat_error_probability");
+  return p && rand() % 10000 < p * 10000.0;
+}
+
 static int FileSize(sqlite3_file *file, sqlite_int64 *osize)
 {
   auto f = (cephsqlite_file*)file;
@@ -437,12 +451,14 @@ static int FileSize(sqlite3_file *file, sqlite_int64 *osize)
   df(5) << dendl;
 
   uint64_t size = 0;
-  if (int rc = f->io.rs->stat(&size); rc < 0) {
+  int rc = should_inject_stat_error(f->io.cct.get()) ? -EIO : f->io.rs->stat(&size);
+  if (rc < 0) {
     df(5) << "stat failed: " << cpp_strerror(rc) << dendl;
     if (rc == -EBLOCKLISTED) {
       getdata(f->vfs).maybe_reconnect(f->io.cluster);
+      return SQLITE_IOERR_LOCK;
     }
-    return SQLITE_NOTFOUND;
+    return SQLITE_IOERR_FSTAT;
   }
 
   *osize = (sqlite_int64)size;
@@ -719,9 +735,15 @@ static int Access(sqlite3_vfs* vfs, const char* path, int flags, int* result)
   }
 
   uint64_t size = 0;
-  if (int rc = io.rs->stat(&size); rc < 0) {
+  int access_rc = SQLITE_OK;
+  if (int rc = should_inject_stat_error(cct.get()) ? -EIO : io.rs->stat(&size); rc < 0) {
     dv(5) << "= " << rc << " (" << cpp_strerror(rc) << ")" << dendl;
-    *result = 0;
+    if (rc == -EBLOCKLISTED) {
+      getdata(vfs).maybe_reconnect(cluster);
+      access_rc = SQLITE_IOERR_LOCK;
+    } else {
+      access_rc = SQLITE_IOERR_FSTAT;
+    }
   } else {
     dv(5) << "= 0" << dendl;
     *result = 1;
@@ -729,7 +751,7 @@ static int Access(sqlite3_vfs* vfs, const char* path, int flags, int* result)
 
   auto end = ceph::coarse_mono_clock::now();
   getdata(vfs).logger->tinc(P_OP_ACCESS, end-start);
-  return SQLITE_OK;
+  return access_rc;
 }
 
 /* This method is only called once for each database. It provides a chance to
@@ -923,10 +945,6 @@ LIBCEPHSQLITE_API int sqlite3_cephsqlite_init(sqlite3* db, char** err, const sql
       free(vfs);
       return rc;
     }
-  }
-
-  if (int rc = std::atexit(cephsqlite_atexit); rc) {
-    return SQLITE_INTERNAL;
   }
 
   if (int rc = sqlite3_auto_extension((void(*)(void))autoreg); rc) {

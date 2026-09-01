@@ -52,6 +52,8 @@ as needed`_. You can also `create other CephFS volumes`_.
 Finally, to mount CephFS on your client nodes, see `Mount CephFS:
 Prerequisites`_ page. Additionally, a command-line shell utility is available
 for interactive access or scripting via the :ref:`cephfs-shell <cephfs-shell>`.
+To provision CephFS volumes for Kubernetes and other container platforms,
+see :ref:`csi-cephfs`.
 
 .. _Orchestrator: ../mgr/orchestrator
 .. _deploy MDS manually as needed: add-remove-mds
@@ -90,8 +92,10 @@ Administration
     Health messages <health-messages>
     Upgrading old file systems <upgrading>
     CephFS Top Utility <cephfs-top>
+    cephfs-tool <cephfs-tool>
     Scheduled Snapshots <snap-schedule>
     CephFS Snapshot Mirroring <cephfs-mirroring>
+    CephFS Snapshot Mirroring Checkpoints <cephfs-mirroring-checkpoints>
     Purge Queue <purge-queue>
 
 .. raw:: html
@@ -143,7 +147,7 @@ CephFS Concepts
     File layouts <file-layouts>
     Distributed Metadata Cache <mdcache>
     Dynamic Metadata Management in CephFS <dynamic-metadata-management>
-    CephFS IO Path <cephfs-io-path>
+    CephFS I/O Path <cephfs-io-path>
     Case Sensitivity and Normalization <charmap>
     LazyIO <lazyio>
     Directory fragmentation <dirfrags>
@@ -168,12 +172,13 @@ Troubleshooting and Disaster Recovery
 
     Client eviction <eviction>
     Scrubbing the File System <scrub>
+    Damaged ranks <damaged-rank>
     Handling full file systems <full>
     Metadata repair <disaster-recovery-experts>
     Troubleshooting <troubleshooting>
     Disaster recovery <disaster-recovery>
     cephfs-journal-tool <cephfs-journal-tool>
-    Recovering file system after monitor store loss <recover-fs-after-mon-store-loss>
+    Recovering file system after Monitor store loss <recover-fs-after-mon-store-loss>
 
 
 .. raw:: html

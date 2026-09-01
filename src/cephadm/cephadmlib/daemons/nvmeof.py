@@ -2,6 +2,7 @@ import logging
 import os
 
 from typing import Dict, List, Optional, Tuple, Union
+from pathlib import Path
 
 from ..container_daemon_form import ContainerDaemonForm, daemon_to_container
 from ..container_types import CephContainer
@@ -81,6 +82,8 @@ class CephNvmeof(ContainerDaemonForm):
         mounts[log_dir] = '/var/log/ceph:z'
         if mtls_dir:
             mounts[mtls_dir] = '/src/mtls:z'
+        if Path('/etc/kmip').is_dir():
+            mounts['/etc/kmip'] = '/src/certs/kmip:z'
         return mounts
 
     def _get_huge_pages_mounts(self, files: Dict[str, str]) -> Dict[str, str]:
@@ -107,12 +110,15 @@ class CephNvmeof(ContainerDaemonForm):
             'client_cert',
             'client_key',
             'root_ca_cert',
-            'encryption_key',
         ]:
             if fn in files:
                 mounts[
                     os.path.join(data_dir, fn)
-                ] = f'/{fn.replace("_", ".")}'
+                ] = f'/certs/mtls/{fn.replace("_", ".")}'
+        if 'encryption_key' in files:
+            mounts[
+                os.path.join(data_dir, 'encryption_key')
+            ] = '/encryption.key'
         return mounts
 
     def customize_container_mounts(

@@ -9,7 +9,7 @@ you can profile Ceph's CPU usage. See `Installing Oprofile`_ for details.
 Initializing oprofile
 =====================
 
-``oprofile`` must be initalized the first time it is used. Locate the
+``oprofile`` must be initialized the first time it is used. Locate the
 ``vmlinux`` image that corresponds to the kernel you are running:
 
 .. prompt:: bash $
@@ -74,7 +74,7 @@ Run the following command to reset ``oprofile``:
    results from prior tests do not get mixed in with the results of the current
    test. 
 
-.. _oprofile: http://oprofile.sourceforge.net/about/
+.. _oprofile: https://oprofile.sourceforge.net/about/
 .. _Installing Oprofile: ../../../dev/cpu-profiler
 
 
