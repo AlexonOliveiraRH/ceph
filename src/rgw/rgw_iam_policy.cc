@@ -19,6 +19,7 @@
 
 #include "rgw_auth.h"
 #include "rgw_iam_policy.h"
+#include "rgw_oidc_provider.h"
 
 
 inline constexpr int dout_subsys = ceph_subsys_rgw;
@@ -234,6 +235,22 @@ static const actpair actpairs[] =
  { "organizations:ListRoots", organizationsListRoots},
  { "organizations:ListPolicies", organizationsListPolicies},
  { "organizations:ListTargetsForPolicy", organizationsListTargetsForPolicy},
+ { "s3vectors:CreateIndex", s3vectorsCreateIndex},
+ { "s3vectors:CreateVectorBucket", s3vectorsCreateVectorBucket},
+ { "s3vectors:DeleteIndex", s3vectorsDeleteIndex},
+ { "s3vectors:DeleteVectorBucket", s3vectorsDeleteVectorBucket},
+ { "s3vectors:DeleteVectorBucketPolicy", s3vectorsDeleteVectorBucketPolicy},
+ { "s3vectors:DeleteVectors", s3vectorsDeleteVectors},
+ { "s3vectors:GetIndex", s3vectorsGetIndex},
+ { "s3vectors:GetVectorBucket", s3vectorsGetVectorBucket},
+ { "s3vectors:GetVectorBucketPolicy", s3vectorsGetVectorBucketPolicy},
+ { "s3vectors:GetVectors", s3vectorsGetVectors},
+ { "s3vectors:ListIndexes", s3vectorsListIndexes},
+ { "s3vectors:ListVectorBuckets", s3vectorsListVectorBuckets},
+ { "s3vectors:ListVectors", s3vectorsListVectors},
+ { "s3vectors:PutVectorBucketPolicy", s3vectorsPutVectorBucketPolicy},
+ { "s3vectors:PutVectors", s3vectorsPutVectors},
+ { "s3vectors:QueryVectors", s3vectorsQueryVectors},
 };
 
 namespace {
@@ -381,16 +398,23 @@ parse_principal_(const struct Keyword* w, std::string&& s,
 	}
 
         if (match[1] == "oidc-provider") {
-                return Principal::oidc_provider(std::move(match[2]));
+                return Principal::oidc_provider(std::move(a->account), std::move(match[2]));
         }
 	if (match[1] == "assumed-role") {
 	  return Principal::assumed_role(std::move(a->account), match[2]);
 	}
       }
+    } else if (w->id == TokenID::Federated &&
+               (s.find('/') != string::npos || s.find('.') != string::npos)) {
+      // bare URL like "example.com" or "localhost:8080/auth/realms/myrealm"
+      // used for global OIDC providers in trust policies. Restricted to
+      // Principal.Federated so bare account/tenant names under Principal.AWS
+      // (which may contain a '.') keep matching as accounts.
+      return Principal::oidc_provider(std::string{global_oidc_id}, std::string{s});
     } else if (std::none_of(s.begin(), s.end(),
-		       [](const char& c) {
-			 return (c == ':') || (c == '/');
-		       })) {
+           [](const char& c) {
+       return (c == ':') || (c == '/');
+           })) {
       // Since tenants are simply prefixes, there's no really good
       // way to see if one exists or not. So we return the thing and
       // let them try to match against it.
@@ -809,6 +833,12 @@ bool ParseState::do_string(CephContext* cct, const char* s, size_t l) {
         }
         if ((t->notaction & organizationsAllValue) == organizationsAllValue) {
           t->notaction[organizationsAll] = 1;
+        }
+        if ((t->action & s3vectorsAllValue) == s3vectorsAllValue) {
+          t->action[s3vectorsAll] = 1;
+        }
+        if ((t->notaction & s3vectorsAllValue) == s3vectorsAllValue) {
+          t->notaction[s3vectorsAll] = 1;
         }
       }
     }
@@ -1897,6 +1927,54 @@ std::string_view action_bit_string(action_t action) {
   case organizationsListTargetsForPolicy:
     return "organizations:ListTargetsForPolicy";
 
+  case s3vectorsCreateIndex:
+    return "s3vectors:CreateIndex";
+
+  case s3vectorsCreateVectorBucket:
+    return "s3vectors:CreateVectorBucket";
+
+  case s3vectorsDeleteIndex:
+    return "s3vectors:DeleteIndex";
+
+  case s3vectorsDeleteVectorBucket:
+    return "s3vectors:DeleteVectorBucket";
+
+  case s3vectorsDeleteVectorBucketPolicy:
+    return "s3vectors:DeleteVectorBucketPolicy";
+
+  case s3vectorsDeleteVectors:
+    return "s3vectors:DeleteVectors";
+
+  case s3vectorsGetIndex:
+    return "s3vectors:GetIndex";
+
+  case s3vectorsGetVectorBucket:
+    return "s3vectors:GetVectorBucket";
+
+  case s3vectorsGetVectorBucketPolicy:
+    return "s3vectors:GetVectorBucketPolicy";
+
+  case s3vectorsGetVectors:
+    return "s3vectors:GetVectors";
+
+  case s3vectorsListIndexes:
+    return "s3vectors:ListIndexes";
+
+  case s3vectorsListVectorBuckets:
+    return "s3vectors:ListVectorBuckets";
+
+  case s3vectorsListVectors:
+    return "s3vectors:ListVectors";
+
+  case s3vectorsPutVectorBucketPolicy:
+    return "s3vectors:PutVectorBucketPolicy";
+
+  case s3vectorsPutVectors:
+    return "s3vectors:PutVectors";
+
+  case s3vectorsQueryVectors:
+    return "s3vectors:QueryVectors";
+
   case s3All:
     return "s3:*";
 
@@ -1914,6 +1992,9 @@ std::string_view action_bit_string(action_t action) {
 
   case organizationsAll:
     return "organizations:*";
+
+  case s3vectorsAll:
+    return "s3vectors:*";
 
   case allCount:
     return "{invalidSentinel}";

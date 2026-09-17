@@ -3730,6 +3730,7 @@ private:
   std::string no_per_pg_omap_alert;
   std::string disk_size_mismatch_alert;
   std::string spurious_read_errors_alert;
+  std::string no_db_sharding_alert;
   std::queue <std::pair<ceph::mono_clock::time_point, bool>> slow_op_event_queue;
   size_t slow_op_event_count = 0;
   size_t slow_scrub_op_event_count = 0;
@@ -3755,6 +3756,7 @@ private:
 
   void _check_legacy_statfs_alert();
   void _check_no_per_pg_or_pool_omap_alert();
+  void _check_no_db_sharding_alert();
   void _set_disk_size_mismatch_alert(const std::string& s) {
     std::lock_guard l(qlock);
     disk_size_mismatch_alert = s;
@@ -3791,6 +3793,8 @@ private:
 
     old_extent_map_t old_extents;   ///< must deref these blobs
     interval_set<uint64_t> extents_to_gc; ///< extents for garbage collection
+
+    bool full_write = false;        /// < whether full object is overwritten
 
     struct write_item {
       uint64_t logical_offset;      ///< write logical offset
@@ -3883,6 +3887,20 @@ private:
     uint64_t offset, uint64_t length,
     ceph::buffer::list::iterator& blp,
     WriteContext *wctx);
+
+  /// Determines if small write can reuse existing blob
+  /// and hence omit blob relocation.
+  /// Returns the amount of remaining bytes which need relocation,
+  /// effectively the possibe return values are for now:
+  /// * 0 - blob has been reused and writing has been staged
+  /// * min_alloc_size - no writing staged, blob to be relocated.
+  uint32_t _do_write_small_with_maybe_blob_reuse(
+    TransContext* txc,
+    CollectionRef& c,
+    OnodeRef& o,
+    uint64_t offset, uint64_t length,
+    bufferlist& bl,
+    WriteContext* wctx);
   void _do_write_big_apply_deferred(
     TransContext* txc,
     CollectionRef& c,
