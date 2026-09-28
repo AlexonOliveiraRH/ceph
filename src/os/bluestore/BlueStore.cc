@@ -2095,7 +2095,6 @@ BlueStore::OnodeRef BlueStore::OnodeSpace::lookup(const ghobject_t& oid)
     auto p = onode_map.find(oid);
     if (p == onode_map.end()) {
       ldout(cache->cct, 30) << __func__ << " " << oid << " miss" << dendl;
-      cache->logger->inc(l_bluestore_onode_misses);
     } else {
       ldout(cache->cct, 30) << __func__ << " " << oid << " hit " << p->second
                             << " " << p->second->nref
@@ -2104,8 +2103,6 @@ BlueStore::OnodeRef BlueStore::OnodeSpace::lookup(const ghobject_t& oid)
       // This will pin onode and implicitly touch the cache when Onode
       // eventually will become unpinned
       o = p->second;
-
-      cache->logger->inc(l_bluestore_onode_hits);
     }
   }
 
@@ -4361,6 +4358,9 @@ void BlueStore::ExtentMap::maybe_load_shard(
     ceph_assert((size_t)start < shards.size());
     auto p = &shards[start];
     if (!p->loaded) {
+
+      auto shard_load_start = ceph::mono_clock::now();
+
       BLUE_SCOPE(maybe_load_shard);
       dout(30) << __func__ << " opening shard 0x" << std::hex
 	       << p->shard_info->offset << std::dec << dendl;
@@ -4386,6 +4386,10 @@ void BlueStore::ExtentMap::maybe_load_shard(
 	       << " (" << v.length() << " bytes)" << dendl;
       ceph_assert(p->dirty == false);
       ceph_assert(v.length() == p->shard_info->bytes);
+
+      onode->c->store->logger->tinc(l_bluestore_onode_shard_miss_lat,
+                                     ceph::mono_clock::now() - shard_load_start);
+
       onode->c->store->logger->inc(l_bluestore_onode_shard_misses);
     } else {
       onode->c->store->logger->inc(l_bluestore_onode_shard_hits);
@@ -5406,8 +5410,12 @@ BlueStore::OnodeRef BlueStore::Collection::get_onode(
   }
 
   OnodeRef o = onode_space.lookup(oid);
-  if (o)
+  if (o) {
+    store->logger->inc(l_bluestore_onode_hits);
     return o;
+  }
+  store->logger->inc(l_bluestore_onode_misses);
+  auto start = mono_clock::now(); //miss
   BLUE_SCOPE(get_onode);
   string key;
   get_object_key(store->cct, oid, &key);
@@ -5424,8 +5432,10 @@ BlueStore::OnodeRef BlueStore::Collection::get_onode(
   }
   if (v.length() == 0) {
     ceph_assert(r == -ENOENT);
-    if (!create)
+    if (!create) {
+      store->logger->tinc(l_bluestore_onode_miss_lat, mono_clock::now() - start);
       return OnodeRef();
+    }
   } else {
     ceph_assert(r >= 0);
   }
@@ -5433,6 +5443,7 @@ BlueStore::OnodeRef BlueStore::Collection::get_onode(
   // new object, load onode if available
   on = Onode::create_decode(this, oid, key, v, true, store->segment_size != 0);
   o.reset(on);
+  store->logger->tinc(l_bluestore_onode_miss_lat, mono_clock::now() - start);
   return onode_space.add_onode(oid, o);
 }
 
@@ -5911,6 +5922,11 @@ std::vector<std::string> BlueStore::get_tracked_keys() const noexcept
     "bluestore_warn_on_no_per_pool_omap"s,
     "bluestore_warn_on_no_per_pg_omap"s,
     "bluestore_warn_on_no_db_sharding"s,
+    "bluestore_warn_on_legacy_min_alloc_size"s,
+    "bluestore_min_alloc_size"s,
+    "bluestore_min_alloc_size_hdd"s,
+    "bluestore_min_alloc_size_ssd"s,
+    "bluestore_use_optimal_io_size_for_min_alloc_size"s,
     "bluestore_max_defer_interval"s,
     "bluestore_onode_segment_size"s,
     "bluestore_allocator_lookup_policy"s,
@@ -5932,6 +5948,13 @@ void BlueStore::handle_conf_change(const ConfigProxy& conf,
   }
   if (changed.count("bluestore_warn_on_no_db_sharding")) {
     _check_no_db_sharding_alert();
+  }
+  if (changed.count("bluestore_warn_on_legacy_min_alloc_size") ||
+      changed.count("bluestore_min_alloc_size") ||
+      changed.count("bluestore_min_alloc_size_hdd") ||
+      changed.count("bluestore_min_alloc_size_ssd") ||
+      changed.count("bluestore_use_optimal_io_size_for_min_alloc_size")) {
+    _check_legacy_min_alloc_size_alert();
   }
 
   if (changed.count("bluestore_csum_type")) {
@@ -6536,6 +6559,18 @@ void BlueStore::_init_logger()
   b.add_u64_counter(l_bluestore_write_small_skipped_bytes,
       "write_small_skipped_bytes",
       "Small writes into existing or sparse small blobs skipped due to zero detection (bytes)");
+
+  b.add_time_avg(l_bluestore_buffer_miss_lat, "buffer_miss_lat", "Avg data cache miss disk latency"); //bluestore data buffer
+
+  
+
+  b.add_time_avg(l_bluestore_onode_miss_lat, "onode_miss_lat",
+      "Average onode miss latency",
+      "ro_l");
+
+  b.add_time_avg(l_bluestore_onode_shard_miss_lat,
+               "onode_shard_miss_lat",
+               "Average onode shard miss latency"); 
   //****************************************
 
   // compressions stats
@@ -6601,10 +6636,10 @@ void BlueStore::_init_logger()
 	    PerfCountersBuilder::PRIO_DEBUGONLY,
 	    unit_t(UNIT_BYTES));
   b.add_u64_counter(l_bluestore_buffer_miss_bytes, "buffer_miss_bytes",
-	    "Sum for bytes of read missed in the cache",
-	    NULL,
-	    PerfCountersBuilder::PRIO_DEBUGONLY,
-	    unit_t(UNIT_BYTES));
+     "Sum for bytes of read missed in the cache",
+     NULL,
+     PerfCountersBuilder::PRIO_DEBUGONLY,
+     unit_t(UNIT_BYTES));
   //****************************************
 
   // internal stats
@@ -8831,21 +8866,7 @@ int BlueStore::mkfs()
   // choose min_alloc_size
   dout(5) << __func__ << " optimal_io_size 0x" << std::hex << optimal_io_size
 	  << " block_size: 0x" << block_size << std::dec << dendl;
-  if ((cct->_conf->bluestore_use_optimal_io_size_for_min_alloc_size) && (optimal_io_size != 0)) {
-    dout(5) << __func__ << " optimal_io_size 0x" << std::hex << optimal_io_size
-		<< " for min_alloc_size 0x" << min_alloc_size << std::dec << dendl;
-    min_alloc_size = optimal_io_size;
-  }
-  else if (cct->_conf->bluestore_min_alloc_size) {
-    min_alloc_size = cct->_conf->bluestore_min_alloc_size;
-  } else {
-    ceph_assert(bdev);
-    if (_use_rotational_settings()) {
-      min_alloc_size = cct->_conf->bluestore_min_alloc_size_hdd;
-    } else {
-      min_alloc_size = cct->_conf->bluestore_min_alloc_size_ssd;
-    }
-  }
+  min_alloc_size = _get_default_min_alloc_size();
   _validate_bdev();
 
   // make sure min_alloc_size is power of 2 aligned.
@@ -12646,6 +12667,54 @@ void BlueStore::_check_no_db_sharding_alert()
   no_db_sharding_alert = s;
 }
 
+uint64_t BlueStore::_get_default_min_alloc_size()
+{
+  // the allocation unit that mkfs() would select for a new OSD on
+  // this device with the current configuration
+  if (cct->_conf->bluestore_use_optimal_io_size_for_min_alloc_size &&
+      optimal_io_size != 0) {
+    return optimal_io_size;
+  } else if (cct->_conf->bluestore_min_alloc_size) {
+    return cct->_conf->bluestore_min_alloc_size;
+  } else {
+    ceph_assert(bdev);
+    if (_use_rotational_settings()) {
+      return cct->_conf->bluestore_min_alloc_size_hdd;
+    } else {
+      return cct->_conf->bluestore_min_alloc_size_ssd;
+    }
+  }
+}
+
+void BlueStore::_check_legacy_min_alloc_size_alert()
+{
+  // Warn if this OSD uses an allocation unit that differs from the
+  // one a newly deployed OSD would get on the same device with the
+  // current configuration, e.g. the legacy 64 KiB unit of HDD-backed
+  // OSDs deployed prior to Pacific (current default: 4 KiB), which
+  // causes increased space amplification. Deliberate choices (an
+  // explicitly configured bluestore_min_alloc_size or a value derived
+  // from the device optimal IO size, e.g. to align with the coarse
+  // indirection unit of some QLC NVMe devices) are part of the
+  // configuration the on-disk value is compared against and do not
+  // raise the alert.
+  string s;
+  if (bdev && cct->_conf->bluestore_warn_on_legacy_min_alloc_size) {
+    uint64_t default_min_alloc_size = _get_default_min_alloc_size();
+    if (default_min_alloc_size > 0 &&
+	min_alloc_size != default_min_alloc_size) {
+      ostringstream ss;
+      ss << "min_alloc_size " << byte_u_t(min_alloc_size)
+	 << " differs from the expected default "
+	 << byte_u_t(default_min_alloc_size)
+	 << ", suggest to redeploy this OSD";
+      s = ss.str();
+    }
+  }
+  std::lock_guard l(qlock);
+  legacy_min_alloc_size_alert = s;
+}
+
 // ---------------
 // cache
 
@@ -13343,6 +13412,9 @@ int BlueStore::_do_read(
   blobs2read_t blobs2read;
   _read_cache(o, offset, length, read_cache_policy, ready_regions, blobs2read);
 
+  bool is_miss = !blobs2read.empty();
+  ceph::mono_clock::time_point miss_start_time;
+
 
   // read raw blob data.
   start = mono_clock::now(); // for the sake of simplicity
@@ -13358,9 +13430,18 @@ int BlueStore::_do_read(
   int64_t num_ios = blobs2read.size();
   if (ioc.has_pending_aios()) {
     num_ios = ioc.get_num_ios();
+    
+    if (is_miss) {
+      miss_start_time = ceph::mono_clock::now();
+    }
+
     bdev->aio_submit(&ioc);
     dout(20) << __func__ << " waiting for aio" << dendl;
     ioc.aio_wait();
+    if (is_miss) {
+      logger->tinc(l_bluestore_buffer_miss_lat, ceph::mono_clock::now() - miss_start_time);
+    }
+
     r = ioc.get_return_value();
     if (r < 0) {
       ceph_assert(r == -EIO); // no other errors allowed
@@ -13771,9 +13852,13 @@ int BlueStore::_do_readv(
   auto num_ios = m.size();
   if (ioc.has_pending_aios()) {
     num_ios = ioc.get_num_ios();
+    ceph::mono_clock::time_point miss_start_time = ceph::mono_clock::now();
+
     bdev->aio_submit(&ioc);
     dout(20) << __func__ << " waiting for aio" << dendl;
     ioc.aio_wait();
+
+    logger->tinc(l_bluestore_buffer_miss_lat, ceph::mono_clock::now() - miss_start_time);
     r = ioc.get_return_value();
     if (r < 0) {
       ceph_assert(r == -EIO); // no other errors allowed
@@ -14601,6 +14686,7 @@ int BlueStore::_open_super_meta()
   }
 
   _check_no_db_sharding_alert();
+  _check_legacy_min_alloc_size_alert();
 
   _set_per_pool_omap();
 
@@ -19926,6 +20012,11 @@ void BlueStore::_log_alerts(osd_alert_list_t& alerts)
     alerts.emplace(
       "BLUESTORE_NO_DB_SHARDING",
       no_db_sharding_alert);
+  }
+  if (!legacy_min_alloc_size_alert.empty()) {
+    alerts.emplace(
+      "BLUESTORE_LEGACY_MIN_ALLOC_SIZE",
+      legacy_min_alloc_size_alert);
   }
   string s0(failed_cmode);
 
