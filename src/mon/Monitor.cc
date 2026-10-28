@@ -644,6 +644,7 @@ CompatSet Monitor::get_supported_features()
   compat.incompat.insert(CEPH_MON_FEATURE_INCOMPAT_SQUID);
   compat.incompat.insert(CEPH_MON_FEATURE_INCOMPAT_TENTACLE);
   compat.incompat.insert(CEPH_MON_FEATURE_INCOMPAT_UMBRELLA);
+  compat.incompat.insert(CEPH_MON_FEATURE_INCOMPAT_VAMPIRE);
 
   // Release-independent features
   compat.incompat.insert(CEPH_MON_FEATURE_INCOMPAT_CEPHX_AUTH_AES256K);
@@ -2759,6 +2760,13 @@ void Monitor::apply_monmap_to_compatset_features()
     ceph_assert(HAVE_FEATURE(quorum_con_features, SERVER_UMBRELLA));
     new_features.incompat.insert(CEPH_MON_FEATURE_INCOMPAT_UMBRELLA);
   }
+  if (monmap_features.contains_all(ceph::features::mon::FEATURE_VAMPIRE)) {
+    ceph_assert(ceph::features::mon::get_persistent().contains_all(
+           ceph::features::mon::FEATURE_VAMPIRE));
+    // this feature should only ever be set if the quorum supports it.
+    ceph_assert(HAVE_FEATURE(quorum_con_features, SERVER_VAMPIRE));
+    new_features.incompat.insert(CEPH_MON_FEATURE_INCOMPAT_VAMPIRE);
+  }
 
 
   // Release-independent features
@@ -2819,6 +2827,9 @@ void Monitor::calc_quorum_requirements()
   }
   if (features.incompat.contains(CEPH_MON_FEATURE_INCOMPAT_UMBRELLA)) {
     required_features |= CEPH_FEATUREMASK_SERVER_UMBRELLA;
+  }
+  if (features.incompat.contains(CEPH_MON_FEATURE_INCOMPAT_VAMPIRE)) {
+    required_features |= CEPH_FEATUREMASK_SERVER_VAMPIRE;
   }
 
   // monmap
@@ -6279,6 +6290,7 @@ void Monitor::tick()
   }
   backup_manager->tick();
 
+  g_ceph_context->check_debug_level_guard();
   mgr_client.update_daemon_health(get_health_metrics());
   new_tick();
 }
@@ -6312,6 +6324,12 @@ vector<DaemonHealthMetric> Monitor::get_health_metrics()
     metrics.emplace_back(daemon_metric::SLOW_OPS, slow, oldest_secs);
   } else {
     metrics.emplace_back(daemon_metric::SLOW_OPS, 0, 0);
+  }
+  {
+    auto threshold = g_conf().get_val<int64_t>("high_debug_level_threshold");
+    auto [count, max_level] = DebugLevelGuard::count_elevated(
+      g_conf()->subsys, threshold);
+    metrics.emplace_back(daemon_metric::HIGH_DEBUG_LEVEL, count, max_level);
   }
   return metrics;
 }
@@ -6936,6 +6954,7 @@ bool Monitor::ms_handle_fast_authentication(Connection *con)
   auto priv = con->get_priv();
   MonSession *s = static_cast<MonSession*>(priv.get());
   if (!s) {
+    std::lock_guard l(session_map_lock);
     // must be msgr2, otherwise dispatch would have set up the session.
     if (state == STATE_SHUTDOWN) {
       dout(10) << __func__ << " ignoring new con " << con << " (shutdown)" << dendl;

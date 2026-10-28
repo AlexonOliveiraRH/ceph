@@ -923,7 +923,7 @@ COMMAND("osd unset "
 	"notieragent|nosnaptrim|noautoscale",
 	"unset <key>", "osd", "rw")
 COMMAND("osd require-osd-release "\
-	"name=release,type=CephChoices,strings=octopus|pacific|quincy|reef|squid|tentacle|umbrella "
+	"name=release,type=CephChoices,strings=octopus|pacific|quincy|reef|squid|tentacle|umbrella|vampire "
         "name=yes_i_really_mean_it,type=CephBool,req=false",
 	"set the minimum allowed OSD release to participate in the cluster",
 	"osd", "rw")
@@ -1618,6 +1618,12 @@ COMMAND("nvme-gw listeners"
 	" name=pool,type=CephString"
 	" name=group,type=CephString",
 	" show all nvmeof gateways listeners within (pool, group)",
+	"mon", "r")
+
+COMMAND("nvme-gw ok-to-stop"
+	" name=pool,type=CephString"
+	" name=group,type=CephString",
+	" returns true if it is possible to stop one of gateways within (pool, group)",
 	"mon", "r")
 
 COMMAND("nvme-gw enable"

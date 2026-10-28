@@ -2,6 +2,7 @@
 
 import argparse
 import datetime
+import importlib
 import ipaddress
 import io
 import json
@@ -796,6 +797,12 @@ def create_daemon_dirs(
             data_dir_root = ident.data_dir(ctx.data_dir)
             config_dir = 'etc/node-exporter'
             makedirs(os.path.join(data_dir_root, config_dir), uid, gid, 0o755)
+            recursive_chown(os.path.join(data_dir_root, 'etc'), uid, gid)
+        elif daemon_type == 'pushgateway':
+            data_dir_root = ident.data_dir(ctx.data_dir)
+            config_dir = 'etc/pushgateway'
+            makedirs(os.path.join(data_dir_root, config_dir), uid, gid, 0o755)
+            makedirs(os.path.join(data_dir_root, 'data'), uid, gid, 0o755)
             recursive_chown(os.path.join(data_dir_root, 'etc'), uid, gid)
 
         # populate the config directory for the component from the config-json
@@ -1799,6 +1806,10 @@ class CephadmAgent(DaemonForm):
                 self.loop_interval = int(config['refresh_period'])
                 self.starting_port = int(config['listener_port'])
                 self.host = config['host']
+                # Older agent.json files do not contain this field. Keep the
+                # existing image inference fallback for upgrade compatibility.
+                if 'container_image' in config:
+                    self.ctx.image = config['container_image'] or None
                 use_lsm = config['device_enhanced_scan']
         except Exception as e:
             self.shutdown()
@@ -2110,26 +2121,25 @@ def command_agent(ctx: CephadmContext) -> None:
 @executes_early
 def command_version(ctx):
     # type: (CephadmContext) -> int
-    import importlib
     import zipimport
     import zipfile
     import types
+    from cephadmlib.agent import _load_version_module
 
     vmod: Optional[types.ModuleType]
     zmod: Optional[types.ModuleType]
+
+    # Use the shared helper to locate _cephadmmeta.version or _version.
+    vmod = _load_version_module()  # type: ignore[assignment]
+
+    # The zmod path is only needed for the verbose zipimport output below.
+    # Try _cephadmmeta.version first (already loaded by vmod if successful),
+    # then fall back to the outer _cephadmmeta package for the loader.
     try:
-        vmod = importlib.import_module('_cephadmmeta.version')
-        zmod = vmod
+        zmod = importlib.import_module('_cephadmmeta.version')
     except ImportError:
-        vmod = zmod = None
-    if vmod is None:
-        # fallback to earlier location
-        try:
-            vmod = importlib.import_module('_version')
-        except ImportError:
-            pass
+        zmod = None
     if zmod is None:
-        # fallback to outer package, for zip import module
         try:
             zmod = importlib.import_module('_cephadmmeta')
         except ImportError:

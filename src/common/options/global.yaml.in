@@ -527,6 +527,36 @@ options:
   daemon_default: 10000
   # default changed by common_preinit()
   with_legacy: true
+- name: high_debug_level_threshold
+  type: int
+  level: advanced
+  desc: Debug log level at or above which a subsystem is considered excessively high
+  long_desc: When any debug_* subsystem has its log level set at or above this
+    threshold, the daemon will issue a health warning and start a timer to
+    set it back to the level it had before it was raised, after
+    high_debug_level_reset_timeout seconds. Set to 0 to disable the guard.
+  default: 0
+  min: 0
+  max: 30
+  flags:
+  - runtime
+  see_also:
+  - high_debug_level_reset_timeout
+- name: high_debug_level_reset_timeout
+  type: secs
+  level: advanced
+  desc: Seconds before an excessively high debug level is auto-reverted
+  long_desc: When a debug subsystem is at or above high_debug_level_threshold,
+    the daemon sets it back to the level it had before it was raised, after
+    this many seconds. Set to 0 to disable the auto-revert while keeping the
+    health warning. This protects against accidental high debug levels causing
+    disk I/O floods and CPU overhead in production.
+  default: 300
+  min: 0
+  flags:
+  - runtime
+  see_also:
+  - high_debug_level_threshold
 - name: log_to_file
   type: bool
   level: basic
@@ -2059,19 +2089,19 @@ options:
   see_also:
   - mon_debug_dump_transactions
   with_legacy: true
-- name: mon_debug_no_require_tentacle
+- name: mon_debug_no_require_umbrella
   type: bool
   level: dev
-  desc: Do not require the Tentacle feature for new Monitor clusters
+  desc: Do not require the Umbrella feature for new Monitor clusters
   default: false
   services:
   - mon
   flags:
   - cluster_create
-- name: mon_debug_no_require_umbrella
+- name: mon_debug_no_require_vampire
   type: bool
   level: dev
-  desc: Do not require the Umbrella feature for new Monitor clusters
+  desc: Do not require the Vampire feature for new Monitor clusters
   default: false
   services:
   - mon
@@ -2463,6 +2493,14 @@ options:
   level: dev
   default: 32
   with_legacy: true
+- name: objecter_dispatch_to_session_strand
+  type: bool
+  level: advanced
+  desc: Offload OSD session message handlers to a per-session ASIO strand instead of running them on the messenger thread
+  long_desc: When false (default), OSD op replies, watch notifies, backoffs, and OSD command replies are handled directly on the messenger thread (pre-strand behavior). When true, handlers are posted to the per-OSDSession strand. Enable for NFS-Ganesha / FSAL_CEPH workloads that benefit from not blocking messenger dispatch; leave disabled for latency-sensitive small-IO clients such as librbd fio.
+  default: false
+  flags:
+  - startup
 # suppress watch pings
 - name: objecter_inject_no_watch_ping
   type: bool

@@ -6037,7 +6037,7 @@ def generate_random(size, part_size=5*1024*1024):
         if (x == size):
             return
 
-def _multipart_upload(bucket_name, key, size, part_size=5*1024*1024, client=None, content_type=None, metadata=None, resend_parts=[], tagging=None):
+def _multipart_upload(bucket_name, key, size, part_size=5*1024*1024, client=None, content_type=None, metadata=None, resend_parts=[], tagging=None, storage_class=None):
     """
     generate a multi-part upload for a random file of specifed size,
     if requested, generate a list of the parts
@@ -6046,14 +6046,17 @@ def _multipart_upload(bucket_name, key, size, part_size=5*1024*1024, client=None
     if client == None:
         client = get_client()
 
+    kwargs = {}
+    if storage_class is not None:
+        kwargs['StorageClass'] = storage_class
 
     if content_type == None and metadata == None:
       if tagging is not None:
-        response = client.create_multipart_upload(Bucket=bucket_name, Key=key, Tagging=tagging)
+        response = client.create_multipart_upload(Bucket=bucket_name, Key=key, Tagging=tagging, **kwargs)
       else:
-        response = client.create_multipart_upload(Bucket=bucket_name, Key=key)
+        response = client.create_multipart_upload(Bucket=bucket_name, Key=key, **kwargs)
     else:
-        response = client.create_multipart_upload(Bucket=bucket_name, Key=key, Metadata=metadata, ContentType=content_type)
+        response = client.create_multipart_upload(Bucket=bucket_name, Key=key, Metadata=metadata, ContentType=content_type, **kwargs)
 
     upload_id = response['UploadId']
     s = ''
@@ -6816,8 +6819,7 @@ def test_multipart_upload_incorrect_etag():
     assert status == 400
     assert error_code == 'InvalidPart'
 
-@pytest.mark.fails_on_dbstore
-def test_multipart_get_part():
+def _test_multipart_get_part(storage_class=None):
     bucket_name = get_new_bucket()
     client = get_client()
     key = "mymultipart"
@@ -6827,7 +6829,8 @@ def test_multipart_get_part():
     part_count = len(part_sizes)
     total_size = sum(part_sizes)
 
-    (upload_id, data, parts) = _multipart_upload(bucket_name, key, total_size, part_size, resend_parts=[2])
+    (upload_id, data, parts) = _multipart_upload(bucket_name, key, total_size, part_size, resend_parts=[2],
+                                                 storage_class=storage_class)
 
     # request part before complete
     e = assert_raises(ClientError, client.get_object, Bucket=bucket_name, Key=key, PartNumber=1)
@@ -6837,6 +6840,14 @@ def test_multipart_get_part():
 
     res = client.complete_multipart_upload(Bucket=bucket_name, Key=key, UploadId=upload_id, MultipartUpload={'Parts': parts})
     assert len(parts) == part_count
+
+    if storage_class is not None:
+        response = client.head_object(Bucket=bucket_name, Key=key)
+        assert response['StorageClass'] == storage_class
+
+        response = client.get_object_attributes(Bucket=bucket_name, Key=key, ObjectAttributes=['ObjectParts'])
+        check_parts_count(response['ObjectParts'], part_count)
+        assert [part['Size'] for part in response['ObjectParts']['Parts']] == part_sizes
 
     for part, size in zip(parts, part_sizes):
         response = client.head_object(Bucket=bucket_name, Key=key, PartNumber=part['PartNumber'])
@@ -6857,6 +6868,19 @@ def test_multipart_get_part():
     status, error_code = _get_status_and_error_code(e.response)
     assert status == 400
     assert error_code == 'InvalidPart'
+
+@pytest.mark.fails_on_dbstore
+def test_multipart_get_part():
+    _test_multipart_get_part()
+
+@pytest.mark.storage_class
+@pytest.mark.fails_on_dbstore
+def test_multipart_get_part_storage_class():
+    sc = configured_storage_classes()
+    if len(sc) < 2:
+        pytest.skip('requires a storage class other than STANDARD')
+
+    _test_multipart_get_part(storage_class=sc[1])
 
 @pytest.mark.encryption
 @pytest.mark.fails_on_dbstore
@@ -7160,15 +7184,15 @@ def test_cors_origin_response():
 
     _cors_request_and_check(requests.get, url, None, 200, None, None)
     _cors_request_and_check(requests.get, url, {'Origin': 'foo.suffix'}, 200, 'foo.suffix', 'GET')
-    _cors_request_and_check(requests.get, url, {'Origin': 'foo.bar'}, 200, None, None)
-    _cors_request_and_check(requests.get, url, {'Origin': 'foo.suffix.get'}, 200, None, None)
+    _cors_request_and_check(requests.get, url, {'Origin': 'foo.bar'}, 403, None, None)
+    _cors_request_and_check(requests.get, url, {'Origin': 'foo.get.suffix'}, 200, 'foo.get.suffix', 'GET')
     _cors_request_and_check(requests.get, url, {'Origin': 'startend'}, 200, 'startend', 'GET')
     _cors_request_and_check(requests.get, url, {'Origin': 'start1end'}, 200, 'start1end', 'GET')
     _cors_request_and_check(requests.get, url, {'Origin': 'start12end'}, 200, 'start12end', 'GET')
-    _cors_request_and_check(requests.get, url, {'Origin': '0start12end'}, 200, None, None)
+    _cors_request_and_check(requests.get, url, {'Origin': '0start12end'}, 403, None, None)
     _cors_request_and_check(requests.get, url, {'Origin': 'prefix'}, 200, 'prefix', 'GET')
     _cors_request_and_check(requests.get, url, {'Origin': 'prefix.suffix'}, 200, 'prefix.suffix', 'GET')
-    _cors_request_and_check(requests.get, url, {'Origin': 'bla.prefix'}, 200, None, None)
+    _cors_request_and_check(requests.get, url, {'Origin': 'bla.prefix'}, 403, None, None)
 
     obj_url = '{u}/{o}'.format(u=url, o='bar')
     _cors_request_and_check(requests.get, obj_url, {'Origin': 'foo.suffix'}, 404, 'foo.suffix', 'GET')
@@ -8462,6 +8486,68 @@ def test_versioning_multi_object_delete_with_marker():
     response = client.list_object_versions(Bucket=bucket_name)
     assert not 'Versions' in response
     assert not 'DeleteMarkers' in response
+
+@pytest.mark.versioning
+def test_versioning_multi_object_delete_last_missing():
+    bucket_name = get_new_bucket()
+    client = get_client()
+
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+
+    key = 'key'
+    num_versions = 2
+
+    (version_ids, contents) = create_multiple_versions(client, bucket_name, key, num_versions)
+    assert len(version_ids) == num_versions
+
+    # delete the current version, then a version that does not exist
+    objects = [{'Key': key, 'VersionId': version_ids[1]},
+               {'Key': key, 'VersionId': 'doesnotexist'}]
+    client.delete_objects(Bucket=bucket_name, Delete={'Objects': objects})
+
+    # check the deleted version before any read of the current version
+    e = assert_raises(ClientError, client.get_object, Bucket=bucket_name, Key=key, VersionId=version_ids[1])
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 404
+
+    response = client.list_object_versions(Bucket=bucket_name)
+    assert [v['VersionId'] for v in response['Versions']] == [version_ids[0]]
+
+    response = client.get_object(Bucket=bucket_name, Key=key)
+    assert _get_body(response) == contents[0]
+
+@pytest.mark.fails_on_aws # only supported for directory buckets
+@pytest.mark.conditional_write
+@pytest.mark.fails_on_dbstore
+@pytest.mark.versioning
+def test_versioning_multi_object_delete_last_precondition_failed():
+    bucket_name = get_new_bucket()
+    client = get_client()
+
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+
+    key = 'key'
+    num_versions = 2
+
+    (version_ids, contents) = create_multiple_versions(client, bucket_name, key, num_versions)
+    assert len(version_ids) == num_versions
+
+    # delete the current version, then fail the older one on its etag
+    objects = [{'Key': key, 'VersionId': version_ids[1]},
+               {'Key': key, 'VersionId': version_ids[0], 'ETag': 'badetag'}]
+    response = client.delete_objects(Bucket=bucket_name, Delete={'Objects': objects})
+    assert 'PreconditionFailed' == response['Errors'][0]['Code']
+
+    # check the deleted version before any read of the current version
+    e = assert_raises(ClientError, client.get_object, Bucket=bucket_name, Key=key, VersionId=version_ids[1])
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 404
+
+    response = client.list_object_versions(Bucket=bucket_name)
+    assert [v['VersionId'] for v in response['Versions']] == [version_ids[0]]
+
+    response = client.get_object(Bucket=bucket_name, Key=key)
+    assert _get_body(response) == contents[0]
 
 @pytest.mark.fails_on_dbstore
 @pytest.mark.versioning
@@ -18409,6 +18495,51 @@ def test_bucket_logging_put_concurrency():
     assert _verify_records(body, src_bucket_name, 'REST.PUT.OBJECT', src_keys, record_type, num_keys)
 
 
+@pytest.mark.bucket_logging
+@pytest.mark.fails_on_aws
+def test_bucket_logging_put_failure():
+    src_bucket_name = get_new_bucket()
+    log_bucket_name = get_new_bucket_name()
+    log_bucket = get_new_bucket_resource(name=log_bucket_name)
+    client = get_client()
+    alt_client = get_alt_client()
+    has_extensions = _has_bucket_logging_extension()
+    prefix = 'log/'
+    _set_log_bucket_policy(client, log_bucket_name, [src_bucket_name], [prefix])
+    key = 'test-put'
+
+    # minimal configuration
+    logging_enabled = {'TargetBucket': log_bucket_name, 'TargetPrefix': prefix}
+    if has_extensions:
+        logging_enabled['LoggingType'] = 'Standard'
+    response = client.put_bucket_logging(Bucket=src_bucket_name, BucketLoggingStatus={
+        'LoggingEnabled': logging_enabled,
+    })
+    assert response['ResponseMetadata']['HTTPStatusCode'] == 200
+
+    e = assert_raises(ClientError, alt_client.put_object, Bucket=src_bucket_name, Key=key, Body=randcontent())
+    assert (403, 'AccessDenied') == _get_status_and_error_code(e.response)
+
+    response = client.list_objects_v2(Bucket=src_bucket_name)
+    src_keys = _get_keys(response)
+
+    flushed_obj = _flush_logs(client, src_bucket_name)
+
+    response = client.list_objects_v2(Bucket=log_bucket_name)
+    keys = _get_keys(response)
+    assert len(keys) == 1
+
+    record_type = 'Standard' if not has_extensions else 'Journal'
+
+    if flushed_obj is not None:
+      assert keys[0] == flushed_obj
+
+    assert keys[0].startswith('log/')
+    response = client.get_object(Bucket=log_bucket_name, Key=keys[0])
+    body = _get_body(response)
+    assert _verify_records(body, src_bucket_name, 'REST.PUT.OBJECT', key, "Standard", 1)
+    assert _verify_record_field(body, src_bucket_name, 'REST.PUT.OBJECT', key, "Standard", "ErrorCode", "AccessDenied")
+
 def _bucket_logging_delete_objects(versioned):
     src_bucket_name = get_new_bucket()
     if versioned:
@@ -19369,6 +19500,9 @@ def _bucket_logging_cleanup(cleanup_type, logging_type, single_prefix, concurren
     else:
         if single_prefix and logging_type == 'Journal' and cleanup_type not in ['target', 'updating']:
             assert len(keys) == 1
+        elif single_prefix and logging_type == 'Standard' and cleanup_type == 'disabling':
+            # A single shared log record is committed but the PutLogging op is not logged
+            assert len(keys) == 1
         else:
             assert len(keys) == num_buckets
 
@@ -19627,7 +19761,7 @@ def _bucket_logging_partial_cleanup(cleanup_type, logging_type, concurrency):
     log_bucket = get_new_bucket_resource(name=log_bucket_name)
     client = get_client()
 
-    num_buckets = 3
+    num_buckets = 5
     buckets = []
     log_prefixes = []
     longer_time = expected_object_roll_time*10
@@ -19724,11 +19858,10 @@ def _bucket_logging_partial_cleanup(cleanup_type, logging_type, concurrency):
         assert len(keys) >= 1 and len(keys) <= num_buckets
     elif cleanup_type == 'updating':
         assert len(keys) == num_buckets
-    elif logging_type == 'Standard':
-        # 1st deleted/disabled source write the bucket_deletion/put_bucket_logging record
+    elif logging_type == 'Standard' and cleanup_type == 'deletion':
         assert len(keys) == num_buckets
     else:
-        assert len(keys) == num_buckets - 1
+        assert len(keys) == 2
 
 
     prefixes = []
@@ -21960,3 +22093,42 @@ def test_lifecycle_transition_encrypted(source_mode_key, source_storage_class, d
         f"Testing lifecycle transition of {source_mode_key} with storage class {source_storage_class} -> {dest_storage_class}"
     )
     _test_lifecycle_transition(source_mode_key, source_storage_class, dest_storage_class)
+
+
+def test_cors_presigned_url_non_preflight():
+    client = get_client()
+    bucket_name = _setup_bucket_acl(bucket_acl='public-read')
+    key = 'foo'
+    response = client.put_object(Bucket=bucket_name, Key=key, Body='str')
+    assert response['ResponseMetadata']['HTTPStatusCode'] == 200
+
+    # Generate the presigned URL
+    presigned_url = client.generate_presigned_url(
+        ClientMethod='get_object',
+        HttpMethod='GET',
+        Params={'Bucket': bucket_name, 'Key': key},
+    )
+
+    _cors_request_and_check(requests.get, presigned_url,
+                            {'Origin':'example1.com'},
+                            200, None, None)
+
+    cors_config ={
+        'CORSRules': [
+            {'AllowedMethods': ['GET'],
+             'AllowedOrigins': ['*'],
+            },
+        ]
+    }
+    client.put_bucket_cors(Bucket=bucket_name, CORSConfiguration=cors_config)
+
+    # Generate the presigned URL
+    presigned_url = client.generate_presigned_url(
+        ClientMethod='create_multipart_upload',
+        HttpMethod='POST',
+        Params={'Bucket': bucket_name, 'Key': key},
+    )
+
+    _cors_request_and_check(requests.post, presigned_url,
+                            {'Origin':'example1.com'},
+                            403, None, None)

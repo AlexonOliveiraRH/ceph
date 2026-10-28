@@ -84,7 +84,7 @@ int NVMeofGwMap::cfg_add_gw(
   const NvmeGwId &gw_id, const NvmeGroupKey& group_key, uint64_t features)
 {
   std::set<NvmeAnaGrpId> allocated;
-  if (HAVE_FEATURE(features, NVMEOFHAMAP)) {
+  {
     auto gw_epoch_it = gw_epoch.find(group_key);
     if (gw_epoch_it == gw_epoch.end()) {
       gw_epoch[group_key] = epoch;
@@ -170,15 +170,14 @@ int NVMeofGwMap::cfg_add_gw(
 int NVMeofGwMap::cfg_delete_gw(
   const NvmeGwId &gw_id, const NvmeGroupKey& group_key)
 {
-  if (HAVE_FEATURE(mon->get_quorum_con_features(), NVMEOFHA)) {
-    dout(10) << " has NVMEOFHA: 1" << dendl;
+  {
     for (auto& [created_gw_id, state]: created_gws[group_key]) {
       if (created_gw_id == gw_id) {
         if (state.availability == gw_availability_t::GW_AVAILABLE) {
 		   /*prevent failover because blocklisting right now cause IO errors */
 		   dout(4) << "Delete GW: set skip-failovers for group " << gw_id
 				   << " group " << group_key << dendl;
-		   skip_failovers_for_group(group_key, 5);
+		   skip_failovers_for_group(group_key, DELAY_FAILOVERS_INTERVAL_SEC);
 		}
         state.availability = gw_availability_t::GW_DELETING;
         dout(4) << " Deleting  GW :"<< gw_id  << " in state  "
@@ -189,8 +188,6 @@ int NVMeofGwMap::cfg_delete_gw(
         return 0;
       }
     }
-  } else {
-    return do_delete_gw(gw_id, group_key);
   }
   return -EINVAL;
 }
@@ -272,7 +269,6 @@ int NVMeofGwMap::cfg_admin_state_change(const NvmeGwId &gw_id,
         dout(4) << "GW-id set admin Disabled " << group_key
                 << " " << gw_id << dendl;
         if (st.availability == gw_availability_t::GW_AVAILABLE) {
-          skip_failovers_for_group(group_key, 5);
           process_gw_map_gw_down(gw_id, group_key, propose_pending);
         }
         st.gw_admin_state = state;
@@ -291,6 +287,39 @@ int NVMeofGwMap::cfg_admin_state_change(const NvmeGwId &gw_id,
      return -EINVAL;
   }
   return 0;
+}
+
+int NVMeofGwMap::is_ok_to_stop(const NvmeGroupKey& group_key)
+{
+  auto grp_it = created_gws.find(group_key);
+  if (grp_it == created_gws.end()) {
+    return -ENOENT;
+  }
+
+  const uint32_t num_gws = grp_it->second.size();
+  uint32_t num_down_gws = 0;
+  uint32_t num_avail_gws = 0;
+
+  for (const auto& [gw_id, state] : grp_it->second) {
+    if (state.availability != gw_availability_t::GW_AVAILABLE) {
+      num_down_gws++; // GWs passing redeploy process
+    } else {
+      num_avail_gws++;
+    }
+  }
+  const uint64_t max_down_gws =
+      g_conf().get_val<uint64_t>("mon_nvmeofgw_max_down_gws");
+
+  dout(10) << "num gws " << num_gws << " num down gws " << num_down_gws
+           << " configured max down " << max_down_gws << dendl;
+
+  if (num_avail_gws == 0) {
+    return -EBUSY;
+  } else if (max_down_gws == 0 || max_down_gws > num_down_gws) {
+    return 0;
+  } else {
+    return -EBUSY;
+  }
 }
 
 bool NVMeofGwMap::validate_number_locations(int num_gws, int num_locations)
@@ -575,7 +604,7 @@ void NVMeofGwMap::set_addr_vect(const NvmeGwId &gw_id,
 
 void NVMeofGwMap::increment_gw_epoch(const NvmeGroupKey& group_key)
 {
-  if (HAVE_FEATURE(mon->get_quorum_con_features(), NVMEOFHAMAP)) {
+  {
     if (gw_epoch.find(group_key) == gw_epoch.end()) {
       gw_epoch[group_key] = epoch;
       dout(4) << "recreated GW epoch of " << group_key

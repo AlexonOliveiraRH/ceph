@@ -16,6 +16,12 @@
 #      in descending order.
 
 releases:
+  umbrella:
+    target_eol: 2028-10-28
+    releases:
+      - version: 21.2.0
+        released: 2026-10-28
+
   tentacle:
     target_eol: 2027-06-01
     releases:
@@ -33,6 +39,8 @@ releases:
   squid:
     target_eol: 2026-10-31
     releases:
+      - version: 19.2.7
+        released: 2026-10-12
       - version: 19.2.6
         released: 2026-08-19
       - version: 19.2.5

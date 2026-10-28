@@ -48,7 +48,6 @@
                 [disabled]="tableActions.disableSelectionAction(action)"
                 [attr.aria-label]="action.name"
                 type="button"
-                i18n
               >
                 {{ action.name }}
               </button>
@@ -66,7 +65,9 @@
           <cds-table-toolbar-search
             [expandable]="false"
             [(ngModel)]="search"
-            aria-label="search"
+            [placeholder]="searchPlaceholder"
+            [label]="searchLabel"
+            [ariaLabel]="searchAriaLabel"
             (valueChange)="updateFilter($event)"
             (clear)="onClearSearch()"
           >
@@ -294,42 +295,45 @@
         }
         <!-- end refresh button -->
         <!-- show hide columns -->
-        <button
-          cdsButton="ghost"
-          class="toolbar-action"
-          type="button"
-          [cdsOverflowMenu]="showHideColumnsRef"
-          placement="bottom"
-          [flip]="true"
-          [offset]="{ x: 3, y: 0 }"
-        >
-          <svg
-            [cdsIcon]="icons.dataTable"
-            [size]="icons.size16"
-            class="cds--toolbar-action__icon"
-          ></svg>
-        </button>
-        <ng-template #showHideColumnsRef>
-          <div
-            class="vstack gap-3 p-3"
-            (click)="$event.stopPropagation()"
-            tabindex="0"
-            (keydown.enter)="$event.stopPropagation()"
-            [cdsTheme]="theme"
+        @if (showColumnToggle) {
+          <button
+            cdsButton="ghost"
+            class="toolbar-action"
+            type="button"
+            data-testid="column-toggle-button"
+            [cdsOverflowMenu]="showHideColumnsRef"
+            placement="bottom"
+            [flip]="true"
+            [offset]="{ x: 3, y: 0 }"
           >
-            @for (column of localColumns; track column) {
-              @if (!column?.isInvisible) {
-                <cds-checkbox
-                  id="{{ column.prop }}{{ tableName }}"
-                  name="{{ column.prop }}{{ tableName }}"
-                  [checked]="!column?.isHidden"
-                  (checkedChange)="toggleColumn(column)"
-                  >{{ column.name }}
-                </cds-checkbox>
+            <svg
+              [cdsIcon]="icons.dataTable"
+              [size]="icons.size16"
+              class="cds--toolbar-action__icon"
+            ></svg>
+          </button>
+          <ng-template #showHideColumnsRef>
+            <div
+              class="vstack gap-3 p-3"
+              (click)="$event.stopPropagation()"
+              tabindex="0"
+              (keydown.enter)="$event.stopPropagation()"
+              [cdsTheme]="theme"
+            >
+              @for (column of localColumns; track column) {
+                @if (!column?.isInvisible) {
+                  <cds-checkbox
+                    id="{{ column.prop }}{{ tableName }}"
+                    name="{{ column.prop }}{{ tableName }}"
+                    [checked]="!column?.isHidden"
+                    (checkedChange)="toggleColumn(column)"
+                    >{{ column.name }}
+                  </cds-checkbox>
+                }
               }
-            }
-          </div>
-        </ng-template>
+            </div>
+          </ng-template>
+        }
         <!-- end show hide columns -->
         <!-- actions -->
         <ng-content select=".table-actions"></ng-content>
@@ -492,9 +496,9 @@
                     />
                   </div>
                   <legend class="cds--type-body-compact-02">
-                    <ng-container>{{ emptyStateTitle }}</ng-container>
+                    <ng-container>{{ displayedEmptyStateTitle }}</ng-container>
                     <cd-help-text class="cds--type-label-01">
-                      {{ emptyStateMessage }}
+                      {{ displayedEmptyStateMessage }}
                     </cd-help-text>
                   </legend>
                 </div>

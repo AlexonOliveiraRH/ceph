@@ -59,6 +59,7 @@
 #include "osd/scrubber/pg_scrubber.h"
 #include "ECInject.h"
 
+#include "BloomHitSet.h"
 #include "OSD.h"
 #include "OpRequest.h"
 #include "PG.h"
@@ -2073,6 +2074,13 @@ void PrimaryLogPG::do_op_impl(OpRequestRef op)
     // This means "is in acting set"
     if (!(is_primary() || is_nonprimary())) {
       osd->handle_misdirected_op(this, op);
+      return;
+    }
+    // some requests such as watch/notify/notify_ack can only be handled by the primary,
+    // fail these with EAGAIN to get the client to retry against the primary.
+    if (!is_primary() && op->is_primary_only()) {
+      dout(10) << __func__ << " op must be processed by primary, returning EAGAIN" << dendl;
+      osd->reply_op_error(op, -EAGAIN);
       return;
     }
   } else {
@@ -5999,6 +6007,9 @@ int PrimaryLogPG::do_read(OpContext *ctx, OSDOp& osd_op) {
     if (ctx->op->ec_direct_read()) {
       int r = pgbackend->objects_read_local(
         soid, op.extent.offset, op.extent.length, op.flags, &osd_op.outdata);
+      if (r == -EIO) {
+        r = rep_repair_primary_object(soid, ctx);
+      }
       if (r >= 0) {
         bytes_read = r;
         // Don't update op.extent.length - causes issues with recursive
@@ -6693,10 +6704,22 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
       break;
 
     case CEPH_OSD_OP_GET_INTERNAL_VERSIONS: {
+      ++ctx->num_read;
       std::map<shard_id_t, eversion_t> out;
       result = get_internal_versions(soid, &out);
       if (result >= 0) {
         encode(out, osd_op.outdata);
+      }
+    }
+    break;
+
+    case CEPH_OSD_OP_GET_INTERNAL_VERSIONS_V2: {
+      ++ctx->num_read;
+      std::map<shard_id_t, eversion_t> out;
+      result = get_internal_versions_v2(soid, &out);
+      if (result >= 0) {
+        internal_versions_v2_response_t response{out};
+        encode(response, osd_op.outdata);
       }
     }
     break;
@@ -10323,6 +10346,10 @@ void PrimaryLogPG::finish_copyfrom(CopyFromCallback *cb)
     dout(20) << __func__ << ": exists, removing" << dendl;
     ctx->op_t->remove(obs.oi.soid);
     ctx->use_replace_op = true;
+    // If the source has no omap, has_omap is false and the omap won't be
+    // marked dirty below. But the existing target's omap was removed with
+    // the object; mark it dirty here so log-based recovery wipes it too.
+    ctx->clean_regions.mark_omap_dirty();
   } else {
     ctx->delta_stats.num_objects++;
     obs.exists = true;
@@ -15974,15 +16001,13 @@ bool PrimaryLogPG::_range_available_for_scrub(const hobject_t& begin,
 int PrimaryLogPG::rep_repair_primary_object(const hobject_t& soid, OpContext *ctx)
 {
   OpRequestRef op = ctx->op;
-  // Only supports replicated pools
-  ceph_assert(!pool.info.is_erasure());
 
-  if (!is_primary()) {
-    // Must be a balanced/localized read that has failed on a replica.
-    // Replicas cannot run recovery, so the request need to be
+  if (!is_primary() || pool.info.is_erasure()) {
+    // Must be a balanced/localized read that has failed on a replica, or
+    // an EC direct read. Neither can run recovery, so the request needs to be
     // failed with EAGAIN to the client which will then retry the
     // request to the primary
-    dout(10) << __func__ << " not primary, failing op with EAGAIN" << dendl;
+    dout(10) << __func__ << " not primary or EC direct, failing op with EAGAIN" << dendl;
     osd->reply_op_error(op, -EAGAIN);
     return -EAGAIN;
   }
@@ -16312,6 +16337,27 @@ int PrimaryLogPG::get_internal_versions(const hobject_t& soid,
     }
   } else {
     (*out)[pg_whoami.shard] = obc->obs.oi.version;
+  }
+  return 0;
+}
+
+int PrimaryLogPG::get_internal_versions_v2(const hobject_t& soid,
+                                           std::map<shard_id_t, eversion_t>* out) {
+  ObjectContextRef obc = get_object_context(soid, false);
+
+  if (!obc || !obc->obs.exists) {
+    return -ENOENT;
+  }
+
+  if (pool.info.is_erasure()) {
+    for (unsigned int i = 0; i < pool.info.get_size(); ++i) {
+      (*out)[shard_id_t(i)] = obc->obs.oi.version;
+    }
+    for (const auto& [shard, version] : obc->obs.oi.shard_versions) {
+      out->at(shard) = version;
+    }
+  } else {
+    (*out)[shard_id_t::NO_SHARD] = obc->obs.oi.version;
   }
   return 0;
 }
