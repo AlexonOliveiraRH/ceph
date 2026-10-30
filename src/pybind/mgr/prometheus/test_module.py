@@ -3,6 +3,7 @@ from unittest import TestCase, mock
 import errno
 
 from prometheus.module import Metric, LabelValues, Number, HealthHistory, ThreadSafeLRUCacheDict, Module
+import json
 import threading
 
 
@@ -120,6 +121,247 @@ class HealthHistoryTest(TestCase):
 
         self.assertFalse(t.is_alive(), "Deadlock detected: Thread is still hung!")
         self.mgr.set_store.assert_called()
+
+
+class HealthDetailTest(TestCase):
+    def setUp(self):
+        from prometheus.module import HEALTHCHECK_DETAIL
+        self.module = mock.MagicMock(spec=Module)
+        self.module.log = mock.MagicMock()
+        self.module.get_localized_module_option.return_value = 1000
+        self.module.get_store.return_value = "{}"
+        self.module.health_history = HealthHistory(self.module)
+        self.module.metrics = {
+            'health_status': Metric('gauge', 'health_status', ''),
+            'health_detail': Metric('untyped', 'health_detail', '', HEALTHCHECK_DETAIL),
+        }
+        self.module._process_health_checks_with_message = (
+            Module._process_health_checks_with_message.__get__(self.module)
+        )
+        self.module.get_health = Module.get_health.__get__(self.module)
+
+    def test_bluestore_free_fragmentation_summary_with_details(self):
+        health_data = {
+            'status': 'HEALTH_WARN',
+            'checks': {
+                'BLUESTORE_FREE_FRAGMENTATION': {
+                    'severity': 'HEALTH_WARN',
+                    'summary': {
+                        'message': '2 OSD(s) experiencing high free space fragmentation of BlueStore',
+                        'count': 2
+                    },
+                    'detail': [
+                        {'message': ' osd.4 0.301470'},
+                        {'message': ' osd.15 0.309722'}
+                    ]
+                }
+            }
+        }
+        self.module.get.return_value = {'json': json.dumps(health_data)}
+        self.module.get_health()
+
+        expected_labels = (
+            'BLUESTORE_FREE_FRAGMENTATION',
+            'HEALTH_WARN',
+            '2 OSD(s) experiencing high free space fragmentation of BlueStore. Affected OSDs: osd.4 0.301470, osd.15 0.309722'
+        )
+        self.assertEqual(
+            self.module.metrics['health_detail'].value.get(expected_labels),
+            1
+        )
+        self.assertNotIn(
+            ('BLUESTORE_FREE_FRAGMENTATION', 'HEALTH_WARN', 'osd.4 0.301470'),
+            self.module.metrics['health_detail'].value
+        )
+
+    def test_bluestore_free_fragmentation_summary_without_details(self):
+        health_data = {
+            'status': 'HEALTH_WARN',
+            'checks': {
+                'BLUESTORE_FREE_FRAGMENTATION': {
+                    'severity': 'HEALTH_WARN',
+                    'summary': {
+                        'message': '3 OSD(s) experiencing high free space fragmentation of BlueStore',
+                        'count': 3
+                    }
+                }
+            }
+        }
+        self.module.get.return_value = {'json': json.dumps(health_data)}
+        self.module.get_health()
+
+        expected_labels = (
+            'BLUESTORE_FREE_FRAGMENTATION',
+            'HEALTH_WARN',
+            '3 OSD(s) experiencing high free space fragmentation of BlueStore'
+        )
+        self.assertEqual(
+            self.module.metrics['health_detail'].value.get(expected_labels),
+            1
+        )
+
+    def test_bluestore_string_summary(self):
+        health_data = {
+            'status': 'HEALTH_WARN',
+            'checks': {
+                'BLUESTORE_FREE_FRAGMENTATION': {
+                    'severity': 'HEALTH_WARN',
+                    'summary': '3 OSD(s) experiencing high free space fragmentation of BlueStore',
+                    'detail': [
+                        {'message': 'osd.0 0.000089'}
+                    ]
+                }
+            }
+        }
+        self.module.get.return_value = {'json': json.dumps(health_data)}
+        self.module.get_health()
+
+        expected_labels = (
+            'BLUESTORE_FREE_FRAGMENTATION',
+            'HEALTH_WARN',
+            '3 OSD(s) experiencing high free space fragmentation of BlueStore. Affected OSDs: osd.0 0.000089'
+        )
+        self.assertEqual(
+            self.module.metrics['health_detail'].value.get(expected_labels),
+            1
+        )
+
+    def test_bluestore_empty_or_missing_summary(self):
+        health_data = {
+            'status': 'HEALTH_WARN',
+            'checks': {
+                'BLUESTORE_FREE_FRAGMENTATION': {
+                    'severity': 'HEALTH_WARN',
+                    'summary': {}
+                }
+            }
+        }
+        self.module.get.return_value = {'json': json.dumps(health_data)}
+        self.module.get_health()
+
+        self.assertNotIn(
+            ('BLUESTORE_FREE_FRAGMENTATION', 'HEALTH_WARN', ''),
+            self.module.metrics['health_detail'].value
+        )
+
+    def test_generic_health_check_without_message(self):
+        health_data = {
+            'status': 'HEALTH_WARN',
+            'checks': {
+                'OSD_DOWN': {
+                    'severity': 'HEALTH_WARN',
+                    'summary': {
+                        'message': '1 osds down',
+                        'count': 1
+                    }
+                }
+            }
+        }
+        self.module.get.return_value = {'json': json.dumps(health_data)}
+        self.module.get_health()
+
+        expected_labels = ('OSD_DOWN', 'HEALTH_WARN', '')
+        self.assertEqual(
+            self.module.metrics['health_detail'].value.get(expected_labels),
+            1
+        )
+
+    def test_string_summary(self):
+        health_data = {
+            'status': 'HEALTH_WARN',
+            'checks': {
+                'MON_CLOCK_SKEW': {
+                    'severity': 'HEALTH_WARN',
+                    'summary': 'clock skew detected'
+                }
+            }
+        }
+        self.module.get.return_value = {'json': json.dumps(health_data)}
+        self.module.get_health()
+
+        expected_labels = ('MON_CLOCK_SKEW', 'HEALTH_WARN', '')
+        self.assertEqual(
+            self.module.metrics['health_detail'].value.get(expected_labels),
+            1
+        )
+
+    def test_empty_or_missing_summary(self):
+        health_data = {
+            'status': 'HEALTH_WARN',
+            'checks': {
+                'CHECK_EMPTY_SUMMARY': {
+                    'severity': 'HEALTH_WARN',
+                    'summary': {}
+                },
+                'CHECK_NO_SUMMARY': {
+                    'severity': 'HEALTH_WARN'
+                }
+            }
+        }
+        self.module.get.return_value = {'json': json.dumps(health_data)}
+        self.module.get_health()
+
+        self.assertEqual(
+            self.module.metrics['health_detail'].value.get(('CHECK_EMPTY_SUMMARY', 'HEALTH_WARN', '')),
+            1
+        )
+        self.assertEqual(
+            self.module.metrics['health_detail'].value.get(('CHECK_NO_SUMMARY', 'HEALTH_WARN', '')),
+            1
+        )
+
+    def test_inactive_health_check(self):
+        # First active
+        active_health = {
+            'status': 'HEALTH_WARN',
+            'checks': {
+                'OSD_DOWN': {
+                    'severity': 'HEALTH_WARN',
+                    'summary': {'message': '1 osds down'}
+                }
+            }
+        }
+        self.module.get.return_value = {'json': json.dumps(active_health)}
+        self.module.get_health()
+
+        # Then recovered / OK
+        recovered_health = {
+            'status': 'HEALTH_OK',
+            'checks': {}
+        }
+        self.module.get.return_value = {'json': json.dumps(recovered_health)}
+        self.module.get_health()
+
+        self.assertEqual(
+            self.module.metrics['health_detail'].value.get(('OSD_DOWN', 'HEALTH_WARN', '')),
+            0
+        )
+
+    def test_cert_checks_preserved(self):
+        health_data = {
+            'status': 'HEALTH_ERR',
+            'checks': {
+                'CEPHADM_CERT_ERROR': {
+                    'severity': 'HEALTH_ERR',
+                    'summary': {'message': 'cert expired'},
+                    'detail': [
+                        {'message': 'Certificate expired on host1'},
+                        {'message': 'Certificate expired on host2'}
+                    ]
+                }
+            }
+        }
+        self.module.get.return_value = {'json': json.dumps(health_data)}
+        self.module.get_health()
+
+        self.assertEqual(
+            self.module.metrics['health_detail'].value.get(('CEPHADM_CERT_ERROR', 'HEALTH_ERR', 'Certificate expired on host1')),
+            1
+        )
+        self.assertEqual(
+            self.module.metrics['health_detail'].value.get(('CEPHADM_CERT_ERROR', 'HEALTH_ERR', 'Certificate expired on host2')),
+            1
+        )
 
 
 class ThreadSafeLRUCacheDictTest(TestCase):
@@ -279,7 +521,7 @@ class HardwareMetricsTest(TestCase):
     def setUp(self):
         from prometheus.module import (
             Module, HW_STORAGE_LABELS, HW_CPU_LABELS, HW_MEMORY_LABELS,
-            HW_HEALTH_LABELS, HW_TEMP_LABELS, HW_FAN_LABELS, HW_FIRMWARE_LABELS,
+            HW_STATUS_LABELS, HW_TEMP_LABELS, HW_FAN_LABELS, HW_FIRMWARE_LABELS,
         )
         self.module = mock.MagicMock(spec=Module)
         self.module.log = mock.MagicMock()
@@ -290,8 +532,8 @@ class HardwareMetricsTest(TestCase):
                 'gauge', 'hardware_cpu_cores', '', HW_CPU_LABELS),
             'hardware_memory_capacity_bytes': Metric(
                 'gauge', 'hardware_memory_capacity_bytes', '', HW_MEMORY_LABELS),
-            'hardware_health': Metric(
-                'gauge', 'hardware_health', '', HW_HEALTH_LABELS),
+            'hardware_status': Metric(
+                'gauge', 'hardware_status', '', HW_STATUS_LABELS),
             'hardware_temperature_celsius': Metric(
                 'gauge', 'hardware_temperature_celsius', '', HW_TEMP_LABELS),
             'hardware_fan_rpm': Metric(
@@ -302,6 +544,7 @@ class HardwareMetricsTest(TestCase):
         self.hostname = 'host.example.com'
         self.data = MOCK_HW_FULLREPORT[self.hostname]
         self.status = self.data['status']
+        self.module._hw_status_value = Module._hw_status_value
         self.module._hw_get_health_value = Module._hw_get_health_value.__get__(self.module)
         self.module._hw_set_health_metric = Module._hw_set_health_metric.__get__(self.module)
         self.module._hw_iter_components = Module._hw_iter_components.__get__(self.module)
@@ -331,6 +574,10 @@ class HardwareMetricsTest(TestCase):
         val = self.module._hw_get_health_value('OK')
         self.assertEqual(val, 0)
 
+    def test_health_value_not_reported(self):
+        self.assertEqual(self.module._hw_get_health_value({'health': 'unknown'}), -1)
+        self.assertEqual(self.module._hw_get_health_value({}), -1)
+
     def test_health_value_unknown_logs_warning(self):
         val = self.module._hw_get_health_value(
             {'health': 'Exploded'}, 'host1', 'comp1', 'storage')
@@ -340,7 +587,24 @@ class HardwareMetricsTest(TestCase):
     def test_health_value_unknown_skips_metric(self):
         self.module._hw_set_health_metric(
             {'health': 'Exploded'}, 'host1', 'comp1', 'storage')
-        self.assertEqual(self.module.metrics['hardware_health'].value, {})
+        self.assertEqual(self.module.metrics['hardware_status'].value, {})
+
+    # --- state label ---
+
+    def test_status_metric_state_label(self):
+        cases = [
+            ({'health': 'Warning', 'state': 'Enabled'}, 'Enabled', 1),
+            ({'health': 'unknown', 'state': 'Disabled'}, 'Disabled', -1),
+            ({'health': 'OK'}, 'unknown', 0),
+            # node-proxy turns a null Redfish Status into the string 'unknown'
+            ('unknown', 'unknown', -1),
+        ]
+        for status, state, value in cases:
+            with self.subTest(status=status):
+                self.module.metrics['hardware_status'].clear()
+                self.module._hw_set_health_metric(status, 'host1', 'FAN1', 'fans')
+                self.assertEqual(self.module.metrics['hardware_status'].value,
+                                 {('host1', 'FAN1', 'fans', state): value})
 
     # --- _process_storage ---
 
@@ -357,9 +621,9 @@ class HardwareMetricsTest(TestCase):
 
     def test_storage_sets_health(self):
         self.module._process_storage(self.status, self.hostname)
-        health_labels = (self.hostname, 'nvme_device0_nsid1', 'storage')
+        health_labels = (self.hostname, 'nvme_device0_nsid1', 'storage', 'Enabled')
         self.assertEqual(
-            self.module.metrics['hardware_health'].value[health_labels], 0)
+            self.module.metrics['hardware_status'].value[health_labels], 0)
 
     # --- _process_processors ---
 
@@ -387,20 +651,20 @@ class HardwareMetricsTest(TestCase):
     def test_power_uses_name_not_numeric_id(self):
         """Power components use human-readable name (PSU1_PIN) not dict key (38)."""
         self.module._process_power_network(self.status, self.hostname)
-        health = self.module.metrics['hardware_health'].value
-        self.assertIn((self.hostname, 'PSU1_PIN', 'power'), health)
-        self.assertIn((self.hostname, 'PSU1_POUT', 'power'), health)
-        self.assertNotIn((self.hostname, '38', 'power'), health)
-        self.assertNotIn((self.hostname, '39', 'power'), health)
+        health = self.module.metrics['hardware_status'].value
+        self.assertIn((self.hostname, 'PSU1_PIN', 'power', 'Enabled'), health)
+        self.assertIn((self.hostname, 'PSU1_POUT', 'power', 'Enabled'), health)
+        self.assertNotIn((self.hostname, '38', 'power', 'Enabled'), health)
+        self.assertNotIn((self.hostname, '39', 'power', 'Enabled'), health)
 
     def test_network_uses_comp_id_not_generic_name(self):
         """Network uses descriptive comp_id, not generic 'NetworkAdapter_0'."""
         self.module._process_power_network(self.status, self.hostname)
-        health = self.module.metrics['hardware_health'].value
+        health = self.module.metrics['hardware_status'].value
         self.assertIn(
-            (self.hostname, 'networkinterfaces_devtype7_nic0', 'network'), health)
+            (self.hostname, 'networkinterfaces_devtype7_nic0', 'network', 'Enabled'), health)
         self.assertNotIn(
-            (self.hostname, 'NetworkAdapter_0', 'network'), health)
+            (self.hostname, 'NetworkAdapter_0', 'network', 'Enabled'), health)
 
     # --- _process_sensors ---
 
@@ -415,11 +679,11 @@ class HardwareMetricsTest(TestCase):
     def test_temperature_health_uses_sensor_name(self):
         """Health metric for temperatures also uses sensor name, not numeric key."""
         self.module._process_sensors(self.status, self.hostname)
-        health = self.module.metrics['hardware_health'].value
-        self.assertIn((self.hostname, 'C1_DCSCM_TEMP', 'temperatures'), health)
-        self.assertIn((self.hostname, 'C1_CPU_TEMP', 'temperatures'), health)
-        self.assertNotIn((self.hostname, '0', 'temperatures'), health)
-        self.assertNotIn((self.hostname, '6', 'temperatures'), health)
+        health = self.module.metrics['hardware_status'].value
+        self.assertIn((self.hostname, 'C1_DCSCM_TEMP', 'temperatures', 'Enabled'), health)
+        self.assertIn((self.hostname, 'C1_CPU_TEMP', 'temperatures', 'Enabled'), health)
+        self.assertNotIn((self.hostname, '0', 'temperatures', 'Enabled'), health)
+        self.assertNotIn((self.hostname, '6', 'temperatures', 'Enabled'), health)
 
     def test_fan_uses_fan_name(self):
         """Fan reading uses 'FAN1_TACH_IN' not numeric key '0'."""
@@ -442,8 +706,8 @@ class HardwareMetricsTest(TestCase):
             (self.hostname, 'GHOST_TEMP'),
             self.module.metrics['hardware_temperature_celsius'].value)
         self.assertIn(
-            (self.hostname, 'GHOST_TEMP', 'temperatures'),
-            self.module.metrics['hardware_health'].value)
+            (self.hostname, 'GHOST_TEMP', 'temperatures', 'Enabled'),
+            self.module.metrics['hardware_status'].value)
 
     # --- _process_firmware ---
 

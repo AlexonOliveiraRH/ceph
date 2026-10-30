@@ -50,6 +50,7 @@ from ceph.deployment.service_spec import (
     TunedProfileSpec,
     MgmtGatewaySpec,
     NvmeofServiceSpec,
+    NFSServiceSpec,
     CertificateSource
 )
 from ceph.deployment.drive_group import DeviceSelection
@@ -60,7 +61,7 @@ from cephadm.services.cephadmservice import CephadmDaemonDeploySpec, DaemonDeplo
 from cephadm.http_server import CephadmHttpServer
 from cephadm.agent import CephadmAgentHelpers
 from cephadm.services.service_registry import service_registry
-
+from .utils import build_ceph_volume_cmd
 
 from mgr_module import (
     MgrModule,
@@ -628,6 +629,14 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule):
             min=0,
             max=3,  # 3 is the maximum level for asyncssh
         ),
+        Option(
+            'ceph_volume_log_level',
+            type='str',
+            default='info',
+            enum_allowed=['debug', 'info', 'warning', 'error', 'critical'],
+            desc='Change log level for ceph-volume commands '
+            'executed by cephadm',
+        ),
     ]
     for image in DefaultImages:
         MODULE_OPTIONS.append(Option(image.key, default=image.image_ref, desc=image.desc))
@@ -737,6 +746,7 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule):
             self.default_cephadm_command_timeout = 0
             self.cephadm_log_destination = ''
             self.oob_default_addr = ''
+            self.ceph_volume_log_level = 'info'
             self.ssh_keepalive_interval = 0
             self.ssh_keepalive_count_max = 0
             self.sudo_hardening = False
@@ -3166,6 +3176,15 @@ Then run the following:
                         dd.name(),
                         f"{dd.daemon_type}_memory_target"
                     ))
+                if dd.daemon_type == 'rgw':
+                    # Report the ports the daemon really listens on, the same
+                    # ones `ceph orch ls` shows for the service: besides the
+                    # ports cephadm deployed, those given in
+                    # rgw_frontend_extra_args. dd is a copy, so the cache is
+                    # not altered.
+                    rgw_ports = self.rgw_service.get_daemon_ports(dd.name())
+                    if rgw_ports:
+                        dd.ports = sorted(set(dd.ports or []) | rgw_ports)
                 result.append(dd)
         return result
 
@@ -3632,7 +3651,8 @@ Then run the following:
                     f"OSD{'s' if len(active_osds) > 1 else ''}"
                     f" ({', '.join(active_osds)}). Use 'ceph orch osd rm' first.")
 
-        cv_args = ['--', 'lvm', 'zap', '--destroy', path]
+        cv_args = build_ceph_volume_cmd(
+            self.ceph_volume_log_level, ['lvm', 'zap', '--destroy', path])
         with self.async_timeout_handler(host, f'cephadm ceph-volume {" ".join(cv_args)}'):
             out, err, code = self.wait_async(CephadmServe(self)._run_cephadm(
                 host, 'osd', 'ceph-volume', cv_args, error_ok=True))
@@ -4899,6 +4919,9 @@ Then run the following:
             raise OrchestratorError('cannot scale %s service below 1' % (
                 spec.service_type))
 
+        if spec.service_type == 'nfs':
+            self._check_nfs_clients_per_pool(cast(NFSServiceSpec, spec))
+
         host_count = len(self.inventory.keys())
         max_count = self.max_count_per_host
 
@@ -5022,6 +5045,37 @@ Then run the following:
     @handle_orch_error
     def apply_rbd_mirror(self, spec: ServiceSpec) -> str:
         return self._apply(spec)
+
+    def _check_nfs_clients_per_pool(self, spec: NFSServiceSpec) -> None:
+        """clients_per_pool may be enabled or grown, never shrunk or removed.
+
+        Growing a pool only adds CephX users, so the exports keep working
+        through it. Shrinking one would have to retire users that a running
+        Ganesha still holds handles for, so it stays a recreate.
+        """
+        name = spec.service_name()
+        if name not in self.spec_store:
+            return
+        existing_desc = self.spec_store[name]
+        if existing_desc.deleted:
+            # The cluster is on its way out, so this is a re-creation rather
+            # than a change: the new value wins.
+            return
+        existing = existing_desc.spec
+        old_n = getattr(existing, 'clients_per_pool', None)
+        new_n = getattr(spec, 'clients_per_pool', None)
+        if new_n is None:
+            # An apply that stays silent about the pool leaves it as it is
+            # rather than turning it off.
+            spec.clients_per_pool = old_n
+            return
+        if old_n is not None and new_n < old_n:
+            raise OrchestratorError(
+                f"clients_per_pool cannot be lowered from {old_n} to {new_n}. "
+                "It can be set on an NFS cluster that does not use a CephFS "
+                "client pool yet, or raised on one that does, but lowering it "
+                "requires deleting the cluster and creating a new one."
+            )
 
     @handle_orch_error
     def apply_nfs(self, spec: ServiceSpec) -> str:
